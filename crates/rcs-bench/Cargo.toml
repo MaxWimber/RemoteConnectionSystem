@@ -5,7 +5,13 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+rcs-capture.workspace = true
+rcs-encode.workspace = true
 rcs-protocol.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+windows.workspace = true
 
 [lints]
 workspace = true

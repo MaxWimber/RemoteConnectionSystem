@@ -1,0 +1,729 @@
+// Probe of the AMD AMF runtime: versions, components, capabilities and a short encode with every usage.
+// The runtime is loaded from System32 at run time, so the program also starts on machines without AMD.
+
+#include "amf_shim.h"
+
+#include <windows.h>
+#include <d3d11.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <exception>
+#include <string>
+#include <vector>
+
+#include "components/ColorSpace.h"
+#include "components/VideoConverter.h"
+#include "components/VideoEncoderAV1.h"
+#include "components/VideoEncoderHEVC.h"
+#include "components/VideoEncoderVCE.h"
+#include "core/Factory.h"
+#include "core/Trace.h"
+
+#pragma comment(lib, "version.lib")
+
+namespace {
+
+constexpr int kSourceFrames = 8;
+constexpr double kConvertTimeoutMs = 100.0;
+constexpr double kOutputWaitMs = 40.0;
+constexpr double kDrainTimeoutMs = 500.0;
+
+amf::AMFTrace* g_trace = nullptr;
+
+std::string utf8(const wchar_t* text) {
+    if (!text) return {};
+    int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 1) return {};
+    std::string out(static_cast<size_t>(size - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), size, nullptr, nullptr);
+    return out;
+}
+
+double now_ms() {
+    static const double frequency = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<double>(f.QuadPart);
+    }();
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return static_cast<double>(counter.QuadPart) * 1000.0 / frequency;
+}
+
+class Json {
+public:
+    std::string text;
+
+    void begin_object(const char* key = nullptr) { open(key, '{'); }
+    void end_object() { close('}'); }
+    void begin_array(const char* key = nullptr) { open(key, '['); }
+    void end_array() { close(']'); }
+    void string(const char* key, const std::string& value) { prefix(key); quote(value); }
+    void wstring(const char* key, const wchar_t* value) { string(key, utf8(value)); }
+    void integer(const char* key, int64_t value) { prefix(key); text += std::to_string(value); }
+    void boolean(const char* key, bool value) { prefix(key); text += value ? "true" : "false"; }
+    void null(const char* key) { prefix(key); text += "null"; }
+    void number(const char* key, double value) {
+        char buffer[32];
+        snprintf(buffer, sizeof buffer, "%.4f", value);
+        prefix(key);
+        text += buffer;
+    }
+
+private:
+    std::vector<bool> first_;
+
+    void open(const char* key, char bracket) {
+        prefix(key);
+        text += bracket;
+        first_.push_back(true);
+    }
+    void close(char bracket) {
+        text += bracket;
+        first_.pop_back();
+    }
+    void prefix(const char* key) {
+        if (!first_.empty()) {
+            if (!first_.back()) text += ',';
+            first_.back() = false;
+        }
+        if (key) {
+            quote(key);
+            text += ':';
+        }
+    }
+    void quote(const std::string& value) {
+        text += '"';
+        for (unsigned char c : value) {
+            switch (c) {
+            case '"': text += "\\\""; break;
+            case '\\': text += "\\\\"; break;
+            case '\n': text += "\\n"; break;
+            case '\r': text += "\\r"; break;
+            case '\t': text += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buffer[8];
+                    snprintf(buffer, sizeof buffer, "\\u%04x", c);
+                    text += buffer;
+                } else {
+                    text += static_cast<char>(c);
+                }
+            }
+        }
+        text += '"';
+    }
+};
+
+std::string version_text(amf_uint64 v) {
+    char buffer[64];
+    snprintf(buffer, sizeof buffer, "%llu.%llu.%llu.%llu", AMF_GET_MAJOR_VERSION(v), AMF_GET_MINOR_VERSION(v),
+             AMF_GET_SUBMINOR_VERSION(v), AMF_GET_BUILD_VERSION(v));
+    return buffer;
+}
+
+std::string file_version(const wchar_t* path) {
+    DWORD handle = 0;
+    DWORD size = GetFileVersionInfoSizeW(path, &handle);
+    if (size == 0) return {};
+    std::vector<BYTE> data(size);
+    if (!GetFileVersionInfoW(path, 0, size, data.data())) return {};
+    VS_FIXEDFILEINFO* info = nullptr;
+    UINT length = 0;
+    if (!VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info), &length) || !info) return {};
+    char buffer[64];
+    snprintf(buffer, sizeof buffer, "%u.%u.%u.%u", HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
+             HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS));
+    return buffer;
+}
+
+void result(Json& j, const char* key, AMF_RESULT r) {
+    j.begin_object(key);
+    j.integer("code", r);
+    if (g_trace) j.wstring("text", g_trace->GetResultText(r));
+    j.end_object();
+}
+
+void variant(Json& j, const char* key, const amf::AMFVariantStruct& v) {
+    char buffer[96];
+    switch (v.type) {
+    case amf::AMF_VARIANT_EMPTY: j.null(key); return;
+    case amf::AMF_VARIANT_BOOL: j.boolean(key, v.boolValue != 0); return;
+    case amf::AMF_VARIANT_INT64: j.integer(key, v.int64Value); return;
+    case amf::AMF_VARIANT_DOUBLE: j.number(key, v.doubleValue); return;
+    case amf::AMF_VARIANT_FLOAT: j.number(key, v.floatValue); return;
+    case amf::AMF_VARIANT_STRING: j.string(key, v.stringValue ? v.stringValue : ""); return;
+    case amf::AMF_VARIANT_WSTRING: j.wstring(key, v.wstringValue); return;
+    case amf::AMF_VARIANT_SIZE:
+        snprintf(buffer, sizeof buffer, "%dx%d", v.sizeValue.width, v.sizeValue.height);
+        break;
+    case amf::AMF_VARIANT_RATE:
+        snprintf(buffer, sizeof buffer, "%u/%u", v.rateValue.num, v.rateValue.den);
+        break;
+    case amf::AMF_VARIANT_RATIO:
+        snprintf(buffer, sizeof buffer, "%u:%u", v.ratioValue.num, v.ratioValue.den);
+        break;
+    case amf::AMF_VARIANT_RECT:
+        snprintf(buffer, sizeof buffer, "%d,%d,%d,%d", v.rectValue.left, v.rectValue.top, v.rectValue.right,
+                 v.rectValue.bottom);
+        break;
+    case amf::AMF_VARIANT_POINT:
+        snprintf(buffer, sizeof buffer, "%d,%d", v.pointValue.x, v.pointValue.y);
+        break;
+    default:
+        snprintf(buffer, sizeof buffer, "<variant type %d>", static_cast<int>(v.type));
+        break;
+    }
+    j.string(key, buffer);
+}
+
+void io_caps(Json& j, const char* key, amf::AMFIOCaps* caps) {
+    j.begin_object(key);
+    amf_int32 low = 0, high = 0;
+    caps->GetWidthRange(&low, &high);
+    j.integer("width_min", low);
+    j.integer("width_max", high);
+    caps->GetHeightRange(&low, &high);
+    j.integer("height_min", low);
+    j.integer("height_max", high);
+    j.integer("vert_align", caps->GetVertAlign());
+    j.begin_array("formats");
+    for (amf_int32 i = 0; i < caps->GetNumOfFormats(); ++i) {
+        amf::AMF_SURFACE_FORMAT format{};
+        amf_bool native = false;
+        if (caps->GetFormatAt(i, &format, &native) != AMF_OK) continue;
+        j.begin_object();
+        j.integer("format", format);
+        j.boolean("native", native != 0);
+        j.end_object();
+    }
+    j.end_array();
+    j.begin_array("memory_types");
+    for (amf_int32 i = 0; i < caps->GetNumOfMemoryTypes(); ++i) {
+        amf::AMF_MEMORY_TYPE type{};
+        amf_bool native = false;
+        if (caps->GetMemoryTypeAt(i, &type, &native) != AMF_OK) continue;
+        j.begin_object();
+        j.integer("memory", type);
+        j.boolean("native", native != 0);
+        j.end_object();
+    }
+    j.end_array();
+    j.boolean("interlaced", caps->IsInterlacedSupported() != 0);
+    j.end_object();
+}
+
+void property_catalog(Json& j, amf::AMFComponent* component) {
+    j.begin_array("properties");
+    amf_size count = component->GetPropertiesInfoCount();
+    for (amf_size i = 0; i < count; ++i) {
+        const amf::AMFPropertyInfo* info = nullptr;
+        if (component->GetPropertyInfo(i, &info) != AMF_OK || !info) continue;
+        j.begin_object();
+        j.wstring("name", info->name);
+        j.integer("type", info->type);
+        j.integer("access", info->accessType);
+        variant(j, "default", info->defaultValue);
+        variant(j, "min", info->minValue);
+        variant(j, "max", info->maxValue);
+        amf::AMFVariant current;
+        if (component->GetProperty(info->name, &current) == AMF_OK) variant(j, "current", current);
+        if (info->pEnumDescription) {
+            j.begin_array("enum");
+            for (const amf::AMFEnumDescriptionEntry* e = info->pEnumDescription; e->name; ++e) {
+                j.begin_object();
+                j.integer("value", e->value);
+                j.wstring("name", e->name);
+                j.end_object();
+            }
+            j.end_array();
+        }
+        j.end_object();
+    }
+    j.end_array();
+}
+
+void describe_component(Json& j, amf::AMFFactory* factory, amf::AMFContext* context, const wchar_t* id) {
+    j.begin_object();
+    j.wstring("id", id);
+    amf::AMFComponentPtr component;
+    AMF_RESULT r = factory->CreateComponent(context, id, &component);
+    result(j, "create", r);
+    if (r == AMF_OK && component) {
+        amf::AMFCapsPtr caps;
+        r = component->GetCaps(&caps);
+        result(j, "get_caps", r);
+        if (r == AMF_OK && caps) {
+            j.integer("acceleration", caps->GetAccelerationType());
+            j.begin_object("caps");
+            for (amf_size i = 0; i < caps->GetPropertyCount(); ++i) {
+                wchar_t name[256] = {};
+                amf::AMFVariant value;
+                if (caps->GetPropertyAt(i, name, 256, &value) == AMF_OK) variant(j, utf8(name).c_str(), value);
+            }
+            j.end_object();
+            amf::AMFIOCapsPtr input;
+            if (caps->GetInputCaps(&input) == AMF_OK && input) io_caps(j, "input", input);
+            amf::AMFIOCapsPtr output;
+            if (caps->GetOutputCaps(&output) == AMF_OK && output) io_caps(j, "output", output);
+        }
+        property_catalog(j, component);
+        component->Terminate();
+    }
+    j.end_object();
+}
+
+// A gradient that moves between frames plus a block of noise, so the encoder sees both flat and detailed areas.
+void fill_pattern(std::vector<uint32_t>& pixels, int width, int height, int index) {
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            uint32_t r = static_cast<uint32_t>(x + index * 24) & 255;
+            uint32_t g = static_cast<uint32_t>(y + index * 12) & 255;
+            uint32_t b = static_cast<uint32_t>((x ^ y) + index * 8) & 255;
+            pixels[static_cast<size_t>(y) * width + x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+    int box_w = width / 4, box_h = height / 4;
+    int box_x = (index * 97) % (width - box_w), box_y = (index * 53) % (height - box_h);
+    uint32_t seed = 0x9E3779B9u * static_cast<uint32_t>(index + 1);
+    for (int y = box_y; y < box_y + box_h; ++y) {
+        for (int x = box_x; x < box_x + box_w; ++x) {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            pixels[static_cast<size_t>(y) * width + x] = 0xFF000000u | (seed & 0xFFFFFFu);
+        }
+    }
+}
+
+void nal_summary(Json& j, const uint8_t* data, size_t size) {
+    j.boolean("annex_b", size >= 4 && data[0] == 0 && data[1] == 0 && (data[2] == 1 || (data[2] == 0 && data[3] == 1)));
+    int sps_profile = -1, sps_constraints = -1, sps_level = -1, count = 0;
+    j.begin_array("nal_types");
+    for (size_t i = 0; i + 3 < size && count < 32; ++i) {
+        if (data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1) continue;
+        int type = data[i + 3] & 0x1F;
+        j.integer(nullptr, type);
+        ++count;
+        if (type == 7 && i + 6 < size && sps_profile < 0) {
+            sps_profile = data[i + 4];
+            sps_constraints = data[i + 5];
+            sps_level = data[i + 6];
+        }
+        i += 2;
+    }
+    j.end_array();
+    if (sps_profile >= 0) {
+        j.integer("sps_profile_idc", sps_profile);
+        j.integer("sps_constraint_flags", sps_constraints);
+        j.integer("sps_level_idc", sps_level);
+    }
+}
+
+template <typename T>
+void set_property(Json& j, amf::AMFComponent* component, const char* key, const wchar_t* name, const T& value) {
+    result(j, key, component->SetProperty(name, value));
+}
+
+struct Readback {
+    const char* key;
+    const wchar_t* name;
+};
+
+const Readback kReadback[] = {
+    {"usage", AMF_VIDEO_ENCODER_USAGE},
+    {"profile", AMF_VIDEO_ENCODER_PROFILE},
+    {"profile_level", AMF_VIDEO_ENCODER_PROFILE_LEVEL},
+    {"quality_preset", AMF_VIDEO_ENCODER_QUALITY_PRESET},
+    {"rate_control_method", AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD},
+    {"target_bitrate", AMF_VIDEO_ENCODER_TARGET_BITRATE},
+    {"peak_bitrate", AMF_VIDEO_ENCODER_PEAK_BITRATE},
+    {"vbv_buffer_size", AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE},
+    {"frame_rate", AMF_VIDEO_ENCODER_FRAMERATE},
+    {"b_pic_pattern", AMF_VIDEO_ENCODER_B_PIC_PATTERN},
+    {"idr_period", AMF_VIDEO_ENCODER_IDR_PERIOD},
+    {"header_insertion_spacing", AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING},
+    {"low_latency_mode", AMF_VIDEO_ENCODER_LOWLATENCY_MODE},
+    {"max_num_ref_frames", AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES},
+    {"cabac", AMF_VIDEO_ENCODER_CABAC_ENABLE},
+    {"enforce_hrd", AMF_VIDEO_ENCODER_ENFORCE_HRD},
+    {"filler_data", AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE},
+    {"preencode", AMF_VIDEO_ENCODER_PREENCODE_ENABLE},
+    {"intra_refresh_mbs_per_slot", AMF_VIDEO_ENCODER_INTRA_REFRESH_NUM_MBS_PER_SLOT},
+    {"query_timeout", AMF_VIDEO_ENCODER_QUERY_TIMEOUT},
+    {"deblocking_filter", AMF_VIDEO_ENCODER_DE_BLOCKING_FILTER},
+    {"output_color_profile", AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE},
+};
+
+struct EncodeStats {
+    std::vector<double> convert_ms;
+    std::vector<double> encode_ms;
+    std::deque<double> pending;
+    int64_t bytes = 0;
+    int outputs = 0;
+    int idr = 0;
+    int i_frames = 0;
+    int p_frames = 0;
+    int b_frames = 0;
+    int input_full = 0;
+    int largest = 0;
+    bool first_described = false;
+};
+
+void take_output(Json& j, EncodeStats& stats, amf::AMFData* data) {
+    double done = now_ms();
+    if (!stats.pending.empty()) {
+        stats.encode_ms.push_back(done - stats.pending.front());
+        stats.pending.pop_front();
+    }
+    amf::AMFBufferPtr buffer(data);
+    if (!buffer) return;
+    ++stats.outputs;
+    auto size = static_cast<int>(buffer->GetSize());
+    stats.bytes += size;
+    if (size > stats.largest) stats.largest = size;
+    amf::AMFVariant type;
+    if (buffer->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &type) == AMF_OK) {
+        switch (type.int64Value) {
+        case AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR: ++stats.idr; break;
+        case AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_I: ++stats.i_frames; break;
+        case AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_P: ++stats.p_frames; break;
+        case AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_B: ++stats.b_frames; break;
+        default: break;
+        }
+    }
+    if (!stats.first_described) {
+        stats.first_described = true;
+        j.begin_object("first_output");
+        j.integer("bytes", size);
+        nal_summary(j, static_cast<const uint8_t*>(buffer->GetNative()), static_cast<size_t>(size));
+        j.end_object();
+    }
+}
+
+// Pulls every output that is ready, waiting at most `wait_ms` for the first one.
+AMF_RESULT collect_outputs(Json& j, EncodeStats& stats, amf::AMFComponent* encoder, double wait_ms) {
+    double deadline = now_ms() + wait_ms;
+    for (;;) {
+        amf::AMFDataPtr data;
+        AMF_RESULT r = encoder->QueryOutput(&data);
+        if (data) {
+            take_output(j, stats, data);
+            continue;
+        }
+        if (r != AMF_OK && r != AMF_REPEAT) return r;
+        if (stats.pending.empty() || now_ms() >= deadline) return AMF_OK;
+        SwitchToThread();
+    }
+}
+
+void write_series(Json& j, const char* key, const std::vector<double>& values) {
+    j.begin_array(key);
+    for (double v : values) j.number(nullptr, v);
+    j.end_array();
+}
+
+void encode_run(Json& j, amf::AMFFactory* factory, amf::AMFContext* context,
+                const std::vector<amf::AMFSurfacePtr>& sources, const RcsAmfProbeOptions& o, int usage,
+                bool low_latency) {
+    j.begin_object();
+    j.integer("usage", usage);
+    j.boolean("low_latency_mode_set", low_latency);
+
+    amf::AMFComponentPtr converter;
+    AMF_RESULT r = factory->CreateComponent(context, AMFVideoConverter, &converter);
+    result(j, "converter_create", r);
+    if (r != AMF_OK) {
+        j.end_object();
+        return;
+    }
+    converter->SetProperty(AMF_VIDEO_CONVERTER_MEMORY_TYPE, static_cast<amf_int64>(amf::AMF_MEMORY_DX11));
+    converter->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_FORMAT, static_cast<amf_int64>(amf::AMF_SURFACE_NV12));
+    converter->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_SIZE, ::AMFConstructSize(o.width, o.height));
+    converter->SetProperty(AMF_VIDEO_CONVERTER_COLOR_PROFILE,
+                           static_cast<amf_int64>(AMF_VIDEO_CONVERTER_COLOR_PROFILE_709));
+    converter->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_COLOR_RANGE, static_cast<amf_int64>(AMF_COLOR_RANGE_STUDIO));
+    r = converter->Init(amf::AMF_SURFACE_BGRA, o.width, o.height);
+    result(j, "converter_init", r);
+    if (r != AMF_OK) {
+        j.end_object();
+        return;
+    }
+
+    amf::AMFComponentPtr encoder;
+    r = factory->CreateComponent(context, AMFVideoEncoderVCE_AVC, &encoder);
+    result(j, "encoder_create", r);
+    if (r != AMF_OK) {
+        converter->Terminate();
+        j.end_object();
+        return;
+    }
+    j.begin_object("set");
+    set_property(j, encoder, "usage", AMF_VIDEO_ENCODER_USAGE, static_cast<amf_int64>(usage));
+    if (low_latency) set_property(j, encoder, "low_latency_mode", AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true);
+    set_property(j, encoder, "profile", AMF_VIDEO_ENCODER_PROFILE,
+                 static_cast<amf_int64>(AMF_VIDEO_ENCODER_PROFILE_HIGH));
+    set_property(j, encoder, "rate_control_method", AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
+                 static_cast<amf_int64>(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR));
+    set_property(j, encoder, "target_bitrate", AMF_VIDEO_ENCODER_TARGET_BITRATE, static_cast<amf_int64>(o.bitrate));
+    set_property(j, encoder, "peak_bitrate", AMF_VIDEO_ENCODER_PEAK_BITRATE, static_cast<amf_int64>(o.bitrate));
+    set_property(j, encoder, "frame_rate", AMF_VIDEO_ENCODER_FRAMERATE,
+                 ::AMFConstructRate(static_cast<amf_uint32>(o.fps), 1));
+    set_property(j, encoder, "b_pic_pattern", AMF_VIDEO_ENCODER_B_PIC_PATTERN, static_cast<amf_int64>(0));
+    set_property(j, encoder, "idr_period", AMF_VIDEO_ENCODER_IDR_PERIOD, static_cast<amf_int64>(o.fps * 10));
+    set_property(j, encoder, "output_color_profile", AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE,
+                 static_cast<amf_int64>(AMF_VIDEO_CONVERTER_COLOR_PROFILE_709));
+    set_property(j, encoder, "full_range", AMF_VIDEO_ENCODER_FULL_RANGE_COLOR, false);
+    j.end_object();
+
+    double init_started = now_ms();
+    r = encoder->Init(amf::AMF_SURFACE_NV12, o.width, o.height);
+    j.number("init_ms", now_ms() - init_started);
+    result(j, "init", r);
+    if (r != AMF_OK) {
+        converter->Terminate();
+        j.end_object();
+        return;
+    }
+
+    j.begin_object("readback");
+    for (const Readback& item : kReadback) {
+        amf::AMFVariant value;
+        if (encoder->GetProperty(item.name, &value) == AMF_OK) variant(j, item.key, value);
+    }
+    j.end_object();
+
+    EncodeStats stats;
+    const char* failure = nullptr;
+    AMF_RESULT failure_code = AMF_OK;
+    double started = now_ms();
+    for (int frame = 0; frame < o.frames && !failure; ++frame) {
+        double t0 = now_ms();
+        r = converter->SubmitInput(sources[static_cast<size_t>(frame) % sources.size()]);
+        if (r != AMF_OK) {
+            failure = "converter_submit";
+            failure_code = r;
+            break;
+        }
+        amf::AMFDataPtr nv12;
+        for (;;) {
+            r = converter->QueryOutput(&nv12);
+            if (nv12) break;
+            if (r != AMF_OK && r != AMF_REPEAT) break;
+            if (now_ms() - t0 > kConvertTimeoutMs) break;
+            SwitchToThread();
+        }
+        if (!nv12) {
+            failure = "converter_output";
+            failure_code = r;
+            break;
+        }
+        double t1 = now_ms();
+        stats.convert_ms.push_back(t1 - t0);
+
+        for (;;) {
+            r = encoder->SubmitInput(nv12);
+            if (r != AMF_INPUT_FULL) break;
+            ++stats.input_full;
+            AMF_RESULT q = collect_outputs(j, stats, encoder, 5.0);
+            if (q != AMF_OK) {
+                r = q;
+                break;
+            }
+            if (now_ms() - t1 > kDrainTimeoutMs) break;
+        }
+        if (r != AMF_OK) {
+            failure = "encoder_submit";
+            failure_code = r;
+            break;
+        }
+        stats.pending.push_back(t1);
+        r = collect_outputs(j, stats, encoder, kOutputWaitMs);
+        if (r != AMF_OK) {
+            failure = "encoder_output";
+            failure_code = r;
+        }
+    }
+    double submitted = now_ms();
+    encoder->Drain();
+    while (!stats.pending.empty() && now_ms() - submitted < kDrainTimeoutMs) {
+        amf::AMFDataPtr data;
+        r = encoder->QueryOutput(&data);
+        if (data) {
+            take_output(j, stats, data);
+        } else if (r == AMF_EOF) {
+            break;
+        } else {
+            SwitchToThread();
+        }
+    }
+
+    if (failure) {
+        j.string("failure", failure);
+        result(j, "failure_result", failure_code);
+    }
+    j.integer("frames_submitted", static_cast<int64_t>(stats.convert_ms.size()));
+    j.integer("outputs", stats.outputs);
+    j.integer("lost_outputs", static_cast<int64_t>(stats.pending.size()));
+    j.integer("idr", stats.idr);
+    j.integer("i_frames", stats.i_frames);
+    j.integer("p_frames", stats.p_frames);
+    j.integer("b_frames", stats.b_frames);
+    j.integer("input_full", stats.input_full);
+    j.integer("bytes", stats.bytes);
+    j.integer("largest_frame", stats.largest);
+    j.number("wall_ms", submitted - started);
+    write_series(j, "convert_ms", stats.convert_ms);
+    write_series(j, "encode_ms", stats.encode_ms);
+
+    encoder->Terminate();
+    converter->Terminate();
+    j.end_object();
+}
+
+void upload_sources(Json& j, ID3D11Device* device, amf::AMFContext* context, const RcsAmfProbeOptions& o,
+                    std::vector<amf::AMFSurfacePtr>& sources) {
+    ID3D11DeviceContext* immediate = nullptr;
+    device->GetImmediateContext(&immediate);
+    std::vector<uint32_t> pixels(static_cast<size_t>(o.width) * o.height);
+    j.begin_object("sources");
+    for (int i = 0; i < kSourceFrames; ++i) {
+        amf::AMFSurfacePtr surface;
+        AMF_RESULT r = context->AllocSurface(amf::AMF_MEMORY_DX11, amf::AMF_SURFACE_BGRA, o.width, o.height, &surface);
+        if (r != AMF_OK) {
+            result(j, "alloc", r);
+            break;
+        }
+        auto texture = static_cast<ID3D11Texture2D*>(surface->GetPlaneAt(0)->GetNative());
+        if (i == 0) {
+            D3D11_TEXTURE2D_DESC desc{};
+            texture->GetDesc(&desc);
+            j.integer("array_size", desc.ArraySize);
+            j.integer("usage", desc.Usage);
+            j.integer("bind_flags", desc.BindFlags);
+            j.integer("misc_flags", desc.MiscFlags);
+        }
+        fill_pattern(pixels, o.width, o.height, i);
+        immediate->UpdateSubresource(texture, 0, nullptr, pixels.data(), static_cast<UINT>(o.width) * 4, 0);
+        sources.push_back(surface);
+    }
+    immediate->Flush();
+    immediate->Release();
+    j.integer("count", static_cast<int64_t>(sources.size()));
+    j.end_object();
+}
+
+void probe(Json& j, ID3D11Device* device, const RcsAmfProbeOptions& o) {
+    j.begin_object();
+    j.string("header_version", version_text(AMF_FULL_VERSION));
+
+    // System32 only: the runtime comes with the driver, and the search must not pick up a planted copy.
+    HMODULE dll = LoadLibraryExW(AMF_DLL_NAME, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    j.begin_object("dll");
+    j.boolean("loaded", dll != nullptr);
+    if (!dll) {
+        j.integer("win32_error", GetLastError());
+    } else {
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(dll, path, MAX_PATH);
+        j.wstring("path", path);
+        j.string("file_version", file_version(path));
+    }
+    j.end_object();
+    if (!dll) {
+        j.end_object();
+        return;
+    }
+
+    auto query_version = reinterpret_cast<AMFQueryVersion_Fn>(GetProcAddress(dll, AMF_QUERY_VERSION_FUNCTION_NAME));
+    auto init = reinterpret_cast<AMFInit_Fn>(GetProcAddress(dll, AMF_INIT_FUNCTION_NAME));
+    amf_uint64 runtime = 0;
+    if (query_version) result(j, "query_version", query_version(&runtime));
+    j.string("runtime_version", version_text(runtime));
+    if (!init) {
+        j.string("error", "AMFInit not exported");
+        j.end_object();
+        return;
+    }
+    amf::AMFFactory* factory = nullptr;
+    AMF_RESULT r = init(AMF_FULL_VERSION, &factory);
+    result(j, "init", r);
+    if ((r != AMF_OK || !factory) && runtime != 0) {
+        factory = nullptr;
+        r = init(runtime, &factory);
+        result(j, "init_with_runtime_version", r);
+    }
+    if (r != AMF_OK || !factory) {
+        j.end_object();
+        return;
+    }
+    factory->GetTrace(&g_trace);
+
+    amf::AMFContextPtr context;
+    r = factory->CreateContext(&context);
+    result(j, "create_context", r);
+    if (r != AMF_OK) {
+        j.end_object();
+        return;
+    }
+    r = context->InitDX11(device, amf::AMF_DX11_1);
+    result(j, "init_dx11_1", r);
+    if (r != AMF_OK) {
+        r = context->InitDX11(device, amf::AMF_DX11_0);
+        result(j, "init_dx11_0", r);
+    }
+    if (r != AMF_OK) {
+        j.end_object();
+        return;
+    }
+
+    j.begin_array("components");
+    for (const wchar_t* id : {AMFVideoEncoderVCE_AVC, AMFVideoEncoder_HEVC, AMFVideoEncoder_AV1, AMFVideoConverter}) {
+        describe_component(j, factory, context, id);
+    }
+    j.end_array();
+
+    std::vector<amf::AMFSurfacePtr> sources;
+    upload_sources(j, device, context, o, sources);
+    if (!sources.empty()) {
+        j.begin_array("encode_runs");
+        for (int usage : {AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY, AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY,
+                          AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY_HIGH_QUALITY, AMF_VIDEO_ENCODER_USAGE_WEBCAM,
+                          AMF_VIDEO_ENCODER_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_USAGE_HIGH_QUALITY}) {
+            for (bool low_latency : {false, true}) encode_run(j, factory, context, sources, o, usage, low_latency);
+        }
+        j.end_array();
+    }
+    sources.clear();
+    context->Terminate();
+    j.end_object();
+}
+
+char* copy_out(const std::string& text) {
+    auto out = static_cast<char*>(malloc(text.size() + 1));
+    if (out) memcpy(out, text.c_str(), text.size() + 1);
+    return out;
+}
+
+}  // namespace
+
+extern "C" char* rcs_amf_probe(void* d3d11_device, const RcsAmfProbeOptions* options) {
+    try {
+        Json j;
+        probe(j, static_cast<ID3D11Device*>(d3d11_device), *options);
+        return copy_out(j.text);
+    } catch (const std::exception& e) {
+        Json j;
+        j.begin_object();
+        j.string("error", e.what());
+        j.end_object();
+        return copy_out(j.text);
+    } catch (...) {
+        return copy_out("{\"error\":\"unknown C++ exception\"}");
+    }
+}
+
+extern "C" void rcs_amf_free(char* text) { free(text); }

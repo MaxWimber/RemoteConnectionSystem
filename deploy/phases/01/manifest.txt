@@ -1,0 +1,6 @@
+# Phase 1, first package: rcs-bench probe answers Q-01 before the AMF encoder is written.
+bin: rcs-bench
+file: deploy\phases\01\test-phase.ps1 => test-phase.ps1
+file: deploy\phases\01\README.txt => README.txt
+file: scripts\server-probe.ps1 => scripts\server-probe.ps1
+file: scripts\collect-logs.ps1 => scripts\collect-logs.ps1
