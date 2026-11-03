@@ -1,0 +1,11 @@
+[package]
+name = "rcs-supervisor"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rcs-protocol.workspace = true
+
+[lints]
+workspace = true

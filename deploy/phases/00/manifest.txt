@@ -1,0 +1,12 @@
+# Phase 0 package: server facts, HTTPS stub, UDP check, smoke test of a release binary.
+bin: rcs-bench
+file: deploy\phases\00\test-phase.ps1 => test-phase.ps1
+file: deploy\phases\00\README.txt => README.txt
+file: docs\SETUP-SERVER.md => SETUP-SERVER.md
+file: deploy\Caddyfile => deploy\Caddyfile
+file: deploy\install-caddy.ps1 => deploy\install-caddy.ps1
+file: deploy\uninstall-caddy.ps1 => deploy\uninstall-caddy.ps1
+file: deploy\stub\index.html => www\index.html
+file: scripts\server-probe.ps1 => scripts\server-probe.ps1
+file: scripts\collect-logs.ps1 => scripts\collect-logs.ps1
+file: scripts\udp-listen.ps1 => scripts\udp-listen.ps1

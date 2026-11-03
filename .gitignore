@@ -1,0 +1,40 @@
+# Rust
+/target/
+
+# Node
+node_modules/
+/web/dist/
+/web/coverage/
+
+# C++
+*.obj
+*.lib
+*.pdb
+*.ilk
+
+# Локальная настройка и секреты
+/config.toml
+/deploy/config.local.toml
+secrets/
+*.key
+*.pem
+*.pfx
+.env
+.env.*
+
+# Журналы, результаты замеров и пакеты
+logs/
+*.log
+*.h264
+/measurements/raw/
+/server-logs/
+/dist/
+
+# Редакторы и система
+.claude/settings.local.json
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,46 @@
+# Phase 0: static stub only. rcs-web is not proxied until the Phase 3 security checklist passes.
+# HSTS is enabled in Phase 3, once the certificate has been proven stable.
+{
+	admin off
+	# HTTP/3 would need UDP 8444, which is not forwarded.
+	servers {
+		protocols h1 h2
+	}
+	storage file_system C:/ProgramData/RCS/caddy
+	log {
+		output file C:/ProgramData/RCS/logs/caddy-system.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}
+
+# External TCP 443 is closed for this connection, see D-013. The port belongs in the site address: with a global
+# https_port Caddy assumes a forward from 443 and leaves the port out of the HTTP redirect.
+# Port 80 stays open for that redirect and for certificate renewal.
+https://maxwimber.ru:8444 {
+	log {
+		output file C:/ProgramData/RCS/logs/caddy.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		X-Frame-Options DENY
+		-Server
+	}
+
+	redir /RemoteConnectionSystem /RemoteConnectionSystem/ 308
+
+	handle_path /RemoteConnectionSystem/* {
+		root * C:/ProgramData/RCS/www
+		file_server
+	}
+
+	handle {
+		respond "Not Found" 404
+	}
+}
