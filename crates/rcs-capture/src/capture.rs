@@ -104,6 +104,7 @@ pub struct DxgiCapture {
     pool: Vec<ID3D11Texture2D>,
     pool_key: (u32, u32, DXGI_FORMAT),
     mode: (u32, u32),
+    refresh: (u32, u32),
     next: usize,
     last: Option<usize>,
     last_acquired: Option<Instant>,
@@ -139,6 +140,7 @@ impl DxgiCapture {
             pool: Vec::with_capacity(POOL_SIZE),
             pool_key: (0, 0, DXGI_FORMAT(0)),
             mode: (0, 0),
+            refresh: (0, 0),
             next: 0,
             last: None,
             last_acquired: None,
@@ -154,6 +156,14 @@ impl DxgiCapture {
         &self.device
     }
 
+    /// Refresh rate of the duplicated output in Hz, 0 when the mode does not report one.
+    pub fn refresh_hz(&self) -> f64 {
+        match self.refresh {
+            (n, d) if n > 0 && d > 0 => f64::from(n) / f64::from(d),
+            _ => 0.0,
+        }
+    }
+
     fn reopen(&mut self) -> Result<(), CaptureError> {
         self.duplication = None;
         let duplication =
@@ -162,6 +172,10 @@ impl DxgiCapture {
         let desc = unsafe { duplication.GetDesc() };
         self.memory.desktop_in_system_memory = desc.DesktopImageInSystemMemory.as_bool();
         self.mode = (desc.ModeDesc.Width, desc.ModeDesc.Height);
+        self.refresh = (
+            desc.ModeDesc.RefreshRate.Numerator,
+            desc.ModeDesc.RefreshRate.Denominator,
+        );
         self.duplication = Some(duplication);
         Ok(())
     }

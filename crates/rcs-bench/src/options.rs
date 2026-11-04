@@ -15,6 +15,12 @@ pub struct Options {
     pub repeat_fps: u32,
     pub vbv_kbit: Option<i64>,
     pub query_timeout_ms: Option<i32>,
+    /// Load: `still` or `window`.
+    pub kind: Option<String>,
+    /// Scenarios: which ones to run, all when empty.
+    pub scenarios: Vec<String>,
+    /// Folder with ffmpeg.exe and ffplay.exe when they are not on PATH.
+    pub ffmpeg_dir: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -34,6 +40,9 @@ impl Default for Options {
             repeat_fps: 15,
             vbv_kbit: None,
             query_timeout_ms: None,
+            kind: None,
+            scenarios: Vec::new(),
+            ffmpeg_dir: None,
         }
     }
 }
@@ -63,6 +72,16 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             "--query-timeout-ms" => {
                 options.query_timeout_ms = Some(positive(flag, number()?)?.min(1000) as i32)
             }
+            "--kind" => options.kind = Some(value.clone()),
+            "--scenarios" => {
+                options.scenarios = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            }
+            "--ffmpeg-dir" => options.ffmpeg_dir = Some(PathBuf::from(value)),
             _ => return Err(format!("Unknown option: {flag}")),
         }
     }
@@ -125,6 +144,19 @@ mod tests {
         assert_eq!(options.adapter, Some(1));
         assert_eq!(options.encode.frames, 10);
         assert_eq!(options.encode.bitrate, 8_000_000);
+    }
+
+    #[test]
+    fn reads_scenario_list() {
+        let options = parse(&args(&[
+            "--scenarios",
+            "static, video,,window",
+            "--kind",
+            "still",
+        ]))
+        .unwrap();
+        assert_eq!(options.scenarios, ["static", "video", "window"]);
+        assert_eq!(options.kind.as_deref(), Some("still"));
     }
 
     #[test]

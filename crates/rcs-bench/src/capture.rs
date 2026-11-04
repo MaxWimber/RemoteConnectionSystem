@@ -27,6 +27,8 @@ const STREAM_FILE: &str = "capture.h264";
 const WRITER_BUFFERS: usize = 8;
 const WRITER_BUFFER_BYTES: usize = 1 << 20;
 const OUTPUT_TIMEOUT: Duration = Duration::from_millis(200);
+/// A frame that `AcquireNextFrame` returns faster than this was already waiting: the loop was busy when it came.
+const PENDING_FRAME_MS: f64 = 1.0;
 
 /// Per-frame stage times in milliseconds.
 #[derive(Default)]
@@ -91,7 +93,15 @@ struct Counters {
     late_frames: u64,
     writer_stalls: u64,
     encoders_created: u64,
+    /// Desktop presents merged into one captured frame while the loop was busy: frames the pipeline missed.
+    merged_while_busy: u64,
+    /// Presents merged although the loop was waiting: the source presented twice within one composition.
+    merged_while_waiting: u64,
+    /// The first frames with any merge: captured frame number, merged presents, wait in milliseconds.
+    merges: Vec<(u64, u32, f64)>,
 }
+
+const MERGES_KEPT: usize = 64;
 
 /// Packets go to disk on this thread; the loop takes empty buffers back from it.
 struct Writer {
@@ -323,10 +333,27 @@ pub fn run(options: &Options) -> Result<(), String> {
         .map_err(|e| format!("cannot create {}: {e}", options.out.display()))?;
     logging::init(&options.out.join("rcs-bench.jsonl"))?;
     let _span = info_span!("rcs", build = BUILD_ID, tool = "capture").entered();
-    info!(?options, "capture started");
+    set_dpi_awareness();
+    let report = measure(options)?;
+    match report["failure"].as_str() {
+        Some(failure) => Err(failure.to_string()),
+        None => Ok(()),
+    }
+}
+
+/// Real pixel coordinates for the whole process. Call once: a second call fails with access denied.
+pub fn set_dpi_awareness() {
     if let Err(error) = dxgi::set_dpi_awareness() {
         warn!(error = %dxgi::describe(&error), "dpi awareness");
     }
+}
+
+/// One capture run into `options.out`. A failure during the run is recorded in the report's `failure`;
+/// `Err` means the run could not start or the report could not be written.
+pub fn measure(options: &Options) -> Result<Value, String> {
+    fs::create_dir_all(&options.out)
+        .map_err(|e| format!("cannot create {}: {e}", options.out.display()))?;
+    info!(?options, "capture started");
 
     let adapters = dxgi::enumerate_adapters().map_err(|e| dxgi::describe(&e))?;
     let adapter = probe::encoder_adapter(&adapters).ok_or("no hardware adapter")?;
@@ -398,6 +425,19 @@ pub fn run(options: &Options) -> Result<(), String> {
             Ok(CaptureEvent::Frame(frame)) => {
                 let wait_ms = (frame.acquired - wait_started).as_secs_f64() * 1000.0;
                 session.counters.captured += 1;
+                let merged = frame.accumulated_frames.saturating_sub(1);
+                // The first frame carries everything presented before the duplication started.
+                if merged > 0 && session.counters.captured > 1 {
+                    if wait_ms < PENDING_FRAME_MS {
+                        session.counters.merged_while_busy += u64::from(merged);
+                    } else {
+                        session.counters.merged_while_waiting += u64::from(merged);
+                    }
+                    if session.counters.merges.len() < MERGES_KEPT {
+                        let at = session.counters.captured;
+                        session.counters.merges.push((at, merged, wait_ms));
+                    }
+                }
                 last_submit = Instant::now();
                 if let Err(e) = session.submit(&frame, Some(wait_ms)) {
                     failure = Some(e);
@@ -471,6 +511,7 @@ pub fn run(options: &Options) -> Result<(), String> {
             "query_timeout_ms": options.query_timeout_ms,
         },
         "input": { "width": input_size.0, "height": input_size.1 },
+        "display": { "refresh_hz": (capture.refresh_hz() * 1000.0).round() / 1000.0 },
         "encoder_settings": settings,
         "timer_resolution_ms": timer.as_ref().map(TimerResolution::period_ms),
         "elapsed_s": (elapsed * 1000.0).round() / 1000.0,
@@ -481,6 +522,11 @@ pub fn run(options: &Options) -> Result<(), String> {
             "encoded": c.encoded,
             "encoded_fps": (encoded_fps * 100.0).round() / 100.0,
             "desktop_presents_merged": capture.counters.accumulated_extra,
+            "merged_while_busy": c.merged_while_busy,
+            "merged_while_waiting": c.merged_while_waiting,
+            "merges": c.merges.iter().map(|&(at, n, wait)| json!({
+                "frame": at, "merged": n, "wait_ms": (wait * 1000.0).round() / 1000.0,
+            })).collect::<Vec<_>>(),
             "late_frames": c.late_frames,
             "lost_outputs": c.lost_outputs,
             "pts_mismatch": c.pts_mismatch,
@@ -532,10 +578,7 @@ pub fn run(options: &Options) -> Result<(), String> {
 
     print_summary(&report);
     println!("Отчёт: {}", path.display());
-    match failure {
-        Some(f) => Err(f),
-        None => Ok(()),
-    }
+    Ok(report)
 }
 
 fn print_summary(r: &Value) {

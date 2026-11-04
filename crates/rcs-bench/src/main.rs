@@ -1,9 +1,11 @@
 //! Capture and encoder measurements.
 
 mod capture;
+mod load;
 mod logging;
 mod options;
 mod probe;
+mod scenarios;
 mod stats;
 mod ull;
 
@@ -15,6 +17,8 @@ Usage:
   rcs-bench probe --out DIR [--frames N] [--width W] [--height H] [--fps F] [--bitrate-mbps B]
   rcs-bench ull --out DIR [same options]       which settings Ultra Low Latency accepts
   rcs-bench capture --out DIR [--seconds S] [--display N] [--repeat-fps F] [--vbv-kbit K] [same options]
+  rcs-bench scenarios --out DIR [--seconds 300] [--scenarios static,window,video] [--ffmpeg-dir D] [capture options]
+  rcs-bench load --out DIR --kind still|window --seconds S   screen load, started by scenarios
   rcs-bench amf-probe|amf-ull --out DIR --adapter N [same options]   child processes of probe and ull";
 
 fn main() -> ExitCode {
@@ -34,6 +38,8 @@ fn main() -> ExitCode {
         "probe" => probe::run(&options),
         "ull" => ull::run(&options),
         "capture" => capture::run(&options),
+        "scenarios" => scenarios::run(&options),
+        "load" => load::run(&options),
         "amf-probe" => probe::run_amf(&options, probe::AmfProbe::Full),
         "amf-ull" => probe::run_amf(&options, probe::AmfProbe::UltraLowLatency),
         other => Err(format!("Unknown command: {other}\n{USAGE}")),
