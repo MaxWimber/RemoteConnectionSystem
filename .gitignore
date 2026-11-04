@@ -29,6 +29,7 @@ logs/
 /measurements/raw/
 /server-logs/
 /dist/
+/out/
 
 # Редакторы и система
 .claude/settings.local.json

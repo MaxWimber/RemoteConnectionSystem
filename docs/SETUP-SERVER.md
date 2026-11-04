@@ -27,8 +27,20 @@
 
 ## 4. Инструменты
 
-На сервере не нужны Rust, Node.js, Visual Studio и Claude Code. Создайте папку `C:\RCS` для пакетов и подумайте,
-как будете переносить файлы между ПК: флешка, облако или сетевая папка.
+С 4 ноября 2026 года разработка идёт на сервере (D-015). В PowerShell **от имени администратора**:
+
+```powershell
+winget install --id Git.Git -e
+winget install --id Rustlang.Rustup -e
+winget install --id OpenJS.NodeJS.LTS -e
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+Build Tools ставятся долго, 10–20 минут. После установки откройте новое окно PowerShell, чтобы обновились пути.
+Версию Rust и компоненты `clippy`, `rustfmt` при первом запуске `cargo` подтянет `rust-toolchain.toml`.
+
+Проект лежит в `C:\RCS\src`, пакеты и их логи в `C:\RCS`. Claude Code работает в приложении Claude, вкладка Code,
+в папке `C:\RCS\src`.
 
 ## 5. Роутер
 
@@ -73,6 +85,6 @@ $u = New-Object System.Net.Sockets.UdpClient; $b = [Text.Encoding]::ASCII.GetByt
 
 ## Дальше
 
-1. Claude выдаёт пакет фазы, а вы запускаете его по [TESTING.md](TESTING.md) и возвращаете логи.
+1. Claude работает прямо на сервере. Пакеты по [TESTING.md](TESTING.md) нужны для проверки чистой установки.
 2. Следующая фаза начинается только после закрытия `Gate` текущей в [ROADMAP.md](ROADMAP.md).
 3. Фаза 3 обязательно завершается до постоянного открытия `8443/UDP`.
