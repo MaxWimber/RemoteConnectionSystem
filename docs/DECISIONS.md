@@ -151,11 +151,25 @@ HTTP/3 отключён, потому что UDP 8444 не пробрасыва�
 устанавливаются на этой же машине, поэтому каждое такое действие подтверждает пользователь (D-011 теперь относится к серверу
 в этом смысле). Сессия работает от пользователя Windows сервера, права администратора запрашиваются отдельно.
 
+## D-016: Low Latency вместо Ultra Low Latency в AMF
+
+Дата: 2026-11-04. Статус: принято, закрывает Q-01.
+
+Решение: кодировщик AVC работает с `Usage` Low Latency. Ultra Low Latency на текущей среде AMF не используется.
+Причина: проба `rcs-bench ull` 4 ноября 2026 года, среда AMF `1.4.31`, драйвер `31.0.21925.1001`. `Init` с Ultra Low
+Latency возвращает `AMF_ACCESS_DENIED` даже с одним `Usage`, на 1920×1080, 1280×720 и 640×360, и с любым одним
+дополнительным свойством из 16. По трассировке AMF этот режим закрывает свойство `RateControlPreanalysisEnable`
+(доступ 0), а `Init` сам читает его в `GetCaps()` и завершается ошибкой `unable to get preencode mode`. Установка
+свойства до смены `Usage` и переход с Low Latency на Ultra Low Latency не помогают. Это ошибка среды, а не наших настроек.
+Последствия: низкая задержка достигается настройками Low Latency: CBR, малый VBV, `LowLatencyInternal` уже включён.
+Значения Ultra Low Latency по умолчанию служат ориентиром для `rcs-bench matrix`: VBV 735 000 бит, `EnforceHRD`
+включён, `EncodeLatency` 1000. После обновления драйвера режим перепроверяется командой `rcs-bench ull`.
+
 ## Открытые вопросы
 
 | ID | Вопрос | Когда закрыть | Запасной вариант |
 |---|---|---|---|
-| Q-01 | Режим AMF Ultra Low Latency на VCE 3.4 с текущим драйвером. Проба 3 ноября: `Init` возвращает `AMF_ACCESS_DENIED`, `RateControlMethod` и `PeakBitrate` в этом режиме закрыты. Low Latency работает, p95 9,4 мс на 1080p. Осталось проверить ULL с минимальным набором свойств | Фаза 1 | Low Latency |
+| Q-01 | Закрыт, D-016. Ultra Low Latency не проходит `Init` из-за ошибки среды AMF 1.4.31: режим закрывает `RateControlPreanalysisEnable`, а `Init` его читает. Используется Low Latency, p95 9,4 мс на 1080p | Фаза 1 | Low Latency |
 | Q-02 | Режимы intra-refresh и профиль H.264 в браузерах. Кодировщик: High 4.2 работает, есть `IntraRefreshMode` (выключен, по GOP, непрерывный) и `IntraRefreshMBsNumberPerSlot` | Фазы 1–2 | IDR по запросу, Constrained Baseline |
 | Q-03 | `str0m` против `webrtc-rs`: текущая зрелость и задержка | Фаза 2 | `webrtc-rs` |
 | Q-04 | Поддержка `playout-delay` в выбранной библиотеке | Фаза 2 | `jitterBufferTarget` |

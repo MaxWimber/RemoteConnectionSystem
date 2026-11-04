@@ -16,17 +16,19 @@ pub struct ProbeOptions {
     pub bitrate: i64,
 }
 
+type ProbeFn = unsafe extern "C" fn(*mut c_void, *const ProbeOptions) -> *mut c_char;
+
 unsafe extern "C" {
     fn rcs_amf_probe(device: *mut c_void, options: *const ProbeOptions) -> *mut c_char;
+    fn rcs_amf_ull_probe(device: *mut c_void, options: *const ProbeOptions) -> *mut c_char;
     fn rcs_amf_free(text: *mut c_char);
 }
 
-/// Runs the AMF probe on `device` and returns its JSON report, or `None` if the shim ran out of memory.
-pub fn probe(device: &ID3D11Device, options: &ProbeOptions) -> Option<String> {
+fn call(probe: ProbeFn, device: &ID3D11Device, options: &ProbeOptions) -> Option<String> {
     // SAFETY: the device and the options outlive the call. The shim returns a NUL-terminated string allocated
     // by itself or null, and the string is freed by the shim exactly once.
     unsafe {
-        let text = rcs_amf_probe(device.as_raw(), options);
+        let text = probe(device.as_raw(), options);
         if text.is_null() {
             return None;
         }
@@ -34,4 +36,14 @@ pub fn probe(device: &ID3D11Device, options: &ProbeOptions) -> Option<String> {
         rcs_amf_free(text);
         Some(report)
     }
+}
+
+/// Runs the AMF probe on `device` and returns its JSON report, or `None` if the shim ran out of memory.
+pub fn probe(device: &ID3D11Device, options: &ProbeOptions) -> Option<String> {
+    call(rcs_amf_probe, device, options)
+}
+
+/// Runs the Ultra Low Latency probe on `device` and returns its JSON report.
+pub fn ull_probe(device: &ID3D11Device, options: &ProbeOptions) -> Option<String> {
+    call(rcs_amf_ull_probe, device, options)
 }

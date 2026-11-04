@@ -11,6 +11,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -328,6 +329,176 @@ void set_property(Json& j, amf::AMFComponent* component, const char* key, const 
     result(j, key, component->SetProperty(name, value));
 }
 
+// Encoder settings that the probes switch on one at a time. Usage is always set first, outside this list,
+// because setting it resets the other properties to the defaults of that usage.
+enum class Prop {
+    LowLatency,
+    ProfileHigh,
+    ProfileConstrainedBaseline,
+    RateControlCbr,
+    TargetBitrate,
+    PeakBitrate,
+    FrameRate,
+    BPicNone,
+    IdrPeriod,
+    Color709,
+    LimitedRange,
+    VuiBt709,
+    QualitySpeed,
+    VbvTwoFrames,
+    EnforceHrd,
+    FillerData,
+    PreencodeOff,
+};
+
+const char* prop_key(Prop p) {
+    switch (p) {
+    case Prop::LowLatency: return "low_latency_mode";
+    case Prop::ProfileHigh: return "profile";
+    case Prop::ProfileConstrainedBaseline: return "profile_constrained_baseline";
+    case Prop::RateControlCbr: return "rate_control_method";
+    case Prop::TargetBitrate: return "target_bitrate";
+    case Prop::PeakBitrate: return "peak_bitrate";
+    case Prop::FrameRate: return "frame_rate";
+    case Prop::BPicNone: return "b_pic_pattern";
+    case Prop::IdrPeriod: return "idr_period";
+    case Prop::Color709: return "output_color_profile";
+    case Prop::LimitedRange: return "full_range";
+    case Prop::VuiBt709: return "vui_bt709";
+    case Prop::QualitySpeed: return "quality_preset_speed";
+    case Prop::VbvTwoFrames: return "vbv_two_frames";
+    case Prop::EnforceHrd: return "enforce_hrd";
+    case Prop::FillerData: return "filler_data";
+    case Prop::PreencodeOff: return "preencode_off";
+    }
+    return "unknown";
+}
+
+void apply_prop(Json& j, amf::AMFComponent* e, Prop p, const RcsAmfProbeOptions& o) {
+    const char* key = prop_key(p);
+    switch (p) {
+    case Prop::LowLatency: set_property(j, e, key, AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true); break;
+    case Prop::ProfileHigh:
+        set_property(j, e, key, AMF_VIDEO_ENCODER_PROFILE, static_cast<amf_int64>(AMF_VIDEO_ENCODER_PROFILE_HIGH));
+        break;
+    case Prop::ProfileConstrainedBaseline:
+        set_property(j, e, key, AMF_VIDEO_ENCODER_PROFILE,
+                     static_cast<amf_int64>(AMF_VIDEO_ENCODER_PROFILE_CONSTRAINED_BASELINE));
+        break;
+    case Prop::RateControlCbr:
+        set_property(j, e, key, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
+                     static_cast<amf_int64>(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR));
+        break;
+    case Prop::TargetBitrate:
+        set_property(j, e, key, AMF_VIDEO_ENCODER_TARGET_BITRATE, static_cast<amf_int64>(o.bitrate));
+        break;
+    case Prop::PeakBitrate:
+        set_property(j, e, key, AMF_VIDEO_ENCODER_PEAK_BITRATE, static_cast<amf_int64>(o.bitrate));
+        break;
+    case Prop::FrameRate:
+        set_property(j, e, key, AMF_VIDEO_ENCODER_FRAMERATE, ::AMFConstructRate(static_cast<amf_uint32>(o.fps), 1));
+        break;
+    case Prop::BPicNone: set_property(j, e, key, AMF_VIDEO_ENCODER_B_PIC_PATTERN, static_cast<amf_int64>(0)); break;
+    case Prop::IdrPeriod:
+        set_property(j, e, key, AMF_VIDEO_ENCODER_IDR_PERIOD, static_cast<amf_int64>(o.fps * 10));
+        break;
+    case Prop::Color709:
+        set_property(j, e, key, AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE,
+                     static_cast<amf_int64>(AMF_VIDEO_CONVERTER_COLOR_PROFILE_709));
+        break;
+    case Prop::LimitedRange: set_property(j, e, key, AMF_VIDEO_ENCODER_FULL_RANGE_COLOR, false); break;
+    case Prop::VuiBt709:
+        j.begin_object(key);
+        set_property(j, e, "transfer", AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC,
+                     static_cast<amf_int64>(AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709));
+        set_property(j, e, "primaries", AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES,
+                     static_cast<amf_int64>(AMF_COLOR_PRIMARIES_BT709));
+        j.end_object();
+        break;
+    case Prop::QualitySpeed:
+        set_property(j, e, key, AMF_VIDEO_ENCODER_QUALITY_PRESET,
+                     static_cast<amf_int64>(AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED));
+        break;
+    case Prop::VbvTwoFrames:
+        set_property(j, e, key, AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE, static_cast<amf_int64>(o.bitrate * 2 / o.fps));
+        break;
+    case Prop::EnforceHrd: set_property(j, e, key, AMF_VIDEO_ENCODER_ENFORCE_HRD, true); break;
+    case Prop::FillerData: set_property(j, e, key, AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE, true); break;
+    case Prop::PreencodeOff:
+        set_property(j, e, key, AMF_VIDEO_ENCODER_PREENCODE_ENABLE,
+                     static_cast<amf_int64>(AMF_VIDEO_ENCODER_PREENCODE_DISABLED));
+        break;
+    }
+}
+
+// The settings of the first probe, kept so its results stay comparable.
+const std::vector<Prop> kProbeProps = {Prop::ProfileHigh, Prop::RateControlCbr, Prop::TargetBitrate,
+                                       Prop::PeakBitrate,  Prop::FrameRate,      Prop::BPicNone,
+                                       Prop::IdrPeriod,    Prop::Color709,       Prop::LimitedRange};
+
+// Collects AMF trace lines, so a failed Init comes with the runtime's own explanation.
+class TraceCollector : public amf::AMFTraceWriter {
+public:
+    static constexpr size_t kMaxLines = 200;
+
+    void AMF_CDECL_CALL Write(const wchar_t* scope, const wchar_t* message) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::string line = utf8(scope);
+        line += ": ";
+        line += utf8(message);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+        lines_.push_back(std::move(line));
+        if (lines_.size() > kMaxLines) {
+            lines_.pop_front();
+            ++dropped_;
+        }
+    }
+    void AMF_CDECL_CALL Flush() override {}
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        lines_.clear();
+        dropped_ = 0;
+    }
+    void write(Json& j, const char* key) {
+        if (g_trace) g_trace->TraceFlush();
+        std::lock_guard<std::mutex> lock(mutex_);
+        j.begin_array(key);
+        for (const std::string& line : lines_) j.string(nullptr, line);
+        j.end_array();
+        if (dropped_) j.integer("trace_dropped", static_cast<int64_t>(dropped_));
+    }
+
+private:
+    std::mutex mutex_;
+    std::deque<std::string> lines_;  // the last lines: the error comes at the end of Init
+    size_t dropped_ = 0;
+};
+
+constexpr const wchar_t* kTraceWriterId = L"RcsCollector";
+
+// Registers the collector at debug level for the scope and restores the previous level, also on exceptions.
+class TraceScope {
+public:
+    explicit TraceScope(TraceCollector* collector) {
+        if (!g_trace) return;
+        previous_level_ = g_trace->GetGlobalLevel();
+        g_trace->RegisterWriter(kTraceWriterId, collector, true);
+        g_trace->SetWriterLevel(kTraceWriterId, AMF_TRACE_DEBUG);
+        g_trace->SetGlobalLevel(AMF_TRACE_DEBUG);
+    }
+    ~TraceScope() {
+        if (!g_trace) return;
+        g_trace->SetGlobalLevel(previous_level_);
+        g_trace->UnregisterWriter(kTraceWriterId);
+    }
+    TraceScope(const TraceScope&) = delete;
+    TraceScope& operator=(const TraceScope&) = delete;
+
+private:
+    amf_int32 previous_level_ = AMF_TRACE_INFO;
+};
+
 struct Readback {
     const char* key;
     const wchar_t* name;
@@ -426,23 +597,45 @@ void write_series(Json& j, const char* key, const std::vector<double>& values) {
     j.end_array();
 }
 
-void encode_run(Json& j, amf::AMFFactory* factory, amf::AMFContext* context,
-                const std::vector<amf::AMFSurfacePtr>& sources, const RcsAmfProbeOptions& o, int usage,
-                bool low_latency) {
+struct RunConfig {
+    int usage = AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY;
+    int first_usage = -1;             // set before `usage` when not negative
+    std::vector<Prop> before_usage;  // applied before `usage`
+    std::vector<Prop> props;
+    int width = 0;   // encoded size, the converter scales the sources to it
+    int height = 0;
+    int frames = 0;  // 0 stops after Init
+    TraceCollector* trace = nullptr;
+};
+
+bool has_prop(const std::vector<Prop>& props, Prop p) {
+    for (Prop q : props)
+        if (q == p) return true;
+    return false;
+}
+
+AMF_RESULT encode_run(Json& j, amf::AMFFactory* factory, amf::AMFContext* context,
+                const std::vector<amf::AMFSurfacePtr>& sources, const RcsAmfProbeOptions& o, const RunConfig& c) {
     j.begin_object();
-    j.integer("usage", usage);
-    j.boolean("low_latency_mode_set", low_latency);
+    j.integer("usage", c.usage);
+    j.boolean("low_latency_mode_set", has_prop(c.props, Prop::LowLatency));
+    j.begin_array("props");
+    for (Prop p : c.props) j.string(nullptr, prop_key(p));
+    j.end_array();
+    j.integer("width", c.width);
+    j.integer("height", c.height);
+    if (c.trace) c.trace->clear();
 
     amf::AMFComponentPtr converter;
     AMF_RESULT r = factory->CreateComponent(context, AMFVideoConverter, &converter);
     result(j, "converter_create", r);
     if (r != AMF_OK) {
         j.end_object();
-        return;
+        return r;
     }
     converter->SetProperty(AMF_VIDEO_CONVERTER_MEMORY_TYPE, static_cast<amf_int64>(amf::AMF_MEMORY_DX11));
     converter->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_FORMAT, static_cast<amf_int64>(amf::AMF_SURFACE_NV12));
-    converter->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_SIZE, ::AMFConstructSize(o.width, o.height));
+    converter->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_SIZE, ::AMFConstructSize(c.width, c.height));
     converter->SetProperty(AMF_VIDEO_CONVERTER_COLOR_PROFILE,
                            static_cast<amf_int64>(AMF_VIDEO_CONVERTER_COLOR_PROFILE_709));
     converter->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_COLOR_RANGE, static_cast<amf_int64>(AMF_COLOR_RANGE_STUDIO));
@@ -450,7 +643,7 @@ void encode_run(Json& j, amf::AMFFactory* factory, amf::AMFContext* context,
     result(j, "converter_init", r);
     if (r != AMF_OK) {
         j.end_object();
-        return;
+        return r;
     }
 
     amf::AMFComponentPtr encoder;
@@ -459,34 +652,30 @@ void encode_run(Json& j, amf::AMFFactory* factory, amf::AMFContext* context,
     if (r != AMF_OK) {
         converter->Terminate();
         j.end_object();
-        return;
+        return r;
     }
     j.begin_object("set");
-    set_property(j, encoder, "usage", AMF_VIDEO_ENCODER_USAGE, static_cast<amf_int64>(usage));
-    if (low_latency) set_property(j, encoder, "low_latency_mode", AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true);
-    set_property(j, encoder, "profile", AMF_VIDEO_ENCODER_PROFILE,
-                 static_cast<amf_int64>(AMF_VIDEO_ENCODER_PROFILE_HIGH));
-    set_property(j, encoder, "rate_control_method", AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
-                 static_cast<amf_int64>(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR));
-    set_property(j, encoder, "target_bitrate", AMF_VIDEO_ENCODER_TARGET_BITRATE, static_cast<amf_int64>(o.bitrate));
-    set_property(j, encoder, "peak_bitrate", AMF_VIDEO_ENCODER_PEAK_BITRATE, static_cast<amf_int64>(o.bitrate));
-    set_property(j, encoder, "frame_rate", AMF_VIDEO_ENCODER_FRAMERATE,
-                 ::AMFConstructRate(static_cast<amf_uint32>(o.fps), 1));
-    set_property(j, encoder, "b_pic_pattern", AMF_VIDEO_ENCODER_B_PIC_PATTERN, static_cast<amf_int64>(0));
-    set_property(j, encoder, "idr_period", AMF_VIDEO_ENCODER_IDR_PERIOD, static_cast<amf_int64>(o.fps * 10));
-    set_property(j, encoder, "output_color_profile", AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE,
-                 static_cast<amf_int64>(AMF_VIDEO_CONVERTER_COLOR_PROFILE_709));
-    set_property(j, encoder, "full_range", AMF_VIDEO_ENCODER_FULL_RANGE_COLOR, false);
+    if (c.first_usage >= 0)
+        set_property(j, encoder, "first_usage", AMF_VIDEO_ENCODER_USAGE, static_cast<amf_int64>(c.first_usage));
+    if (!c.before_usage.empty()) {
+        j.begin_object("before_usage");
+        for (Prop p : c.before_usage) apply_prop(j, encoder, p, o);
+        j.end_object();
+    }
+    set_property(j, encoder, "usage", AMF_VIDEO_ENCODER_USAGE, static_cast<amf_int64>(c.usage));
+    for (Prop p : c.props) apply_prop(j, encoder, p, o);
     j.end_object();
 
     double init_started = now_ms();
-    r = encoder->Init(amf::AMF_SURFACE_NV12, o.width, o.height);
+    r = encoder->Init(amf::AMF_SURFACE_NV12, c.width, c.height);
     j.number("init_ms", now_ms() - init_started);
     result(j, "init", r);
-    if (r != AMF_OK) {
+    if (r != AMF_OK || c.frames == 0) {
+        if (c.trace) c.trace->write(j, "trace");
+        if (r == AMF_OK) encoder->Terminate();
         converter->Terminate();
         j.end_object();
-        return;
+        return r;
     }
 
     j.begin_object("readback");
@@ -500,7 +689,7 @@ void encode_run(Json& j, amf::AMFFactory* factory, amf::AMFContext* context,
     const char* failure = nullptr;
     AMF_RESULT failure_code = AMF_OK;
     double started = now_ms();
-    for (int frame = 0; frame < o.frames && !failure; ++frame) {
+    for (int frame = 0; frame < c.frames && !failure; ++frame) {
         double t0 = now_ms();
         r = converter->SubmitInput(sources[static_cast<size_t>(frame) % sources.size()]);
         if (r != AMF_OK) {
@@ -578,10 +767,12 @@ void encode_run(Json& j, amf::AMFFactory* factory, amf::AMFContext* context,
     j.number("wall_ms", submitted - started);
     write_series(j, "convert_ms", stats.convert_ms);
     write_series(j, "encode_ms", stats.encode_ms);
+    if (c.trace && failure) c.trace->write(j, "trace");
 
     encoder->Terminate();
     converter->Terminate();
     j.end_object();
+    return AMF_OK;
 }
 
 void upload_sources(Json& j, ID3D11Device* device, amf::AMFContext* context, const RcsAmfProbeOptions& o,
@@ -616,8 +807,13 @@ void upload_sources(Json& j, ID3D11Device* device, amf::AMFContext* context, con
     j.end_object();
 }
 
-void probe(Json& j, ID3D11Device* device, const RcsAmfProbeOptions& o) {
-    j.begin_object();
+struct Runtime {
+    amf::AMFFactory* factory = nullptr;
+    amf::AMFContextPtr context;
+};
+
+// Loads amfrt64.dll, starts AMF and binds a context to the device. Writes every step into the open object.
+bool open_runtime(Json& j, ID3D11Device* device, Runtime& rt) {
     j.string("header_version", version_text(AMF_FULL_VERSION));
 
     // System32 only: the runtime comes with the driver, and the search must not pick up a planted copy.
@@ -633,10 +829,7 @@ void probe(Json& j, ID3D11Device* device, const RcsAmfProbeOptions& o) {
         j.string("file_version", file_version(path));
     }
     j.end_object();
-    if (!dll) {
-        j.end_object();
-        return;
-    }
+    if (!dll) return false;
 
     auto query_version = reinterpret_cast<AMFQueryVersion_Fn>(GetProcAddress(dll, AMF_QUERY_VERSION_FUNCTION_NAME));
     auto init = reinterpret_cast<AMFInit_Fn>(GetProcAddress(dll, AMF_INIT_FUNCTION_NAME));
@@ -645,60 +838,201 @@ void probe(Json& j, ID3D11Device* device, const RcsAmfProbeOptions& o) {
     j.string("runtime_version", version_text(runtime));
     if (!init) {
         j.string("error", "AMFInit not exported");
-        j.end_object();
-        return;
+        return false;
     }
-    amf::AMFFactory* factory = nullptr;
-    AMF_RESULT r = init(AMF_FULL_VERSION, &factory);
+    AMF_RESULT r = init(AMF_FULL_VERSION, &rt.factory);
     result(j, "init", r);
-    if ((r != AMF_OK || !factory) && runtime != 0) {
-        factory = nullptr;
-        r = init(runtime, &factory);
+    if ((r != AMF_OK || !rt.factory) && runtime != 0) {
+        rt.factory = nullptr;
+        r = init(runtime, &rt.factory);
         result(j, "init_with_runtime_version", r);
     }
-    if (r != AMF_OK || !factory) {
-        j.end_object();
-        return;
-    }
-    factory->GetTrace(&g_trace);
+    if (r != AMF_OK || !rt.factory) return false;
+    rt.factory->GetTrace(&g_trace);
 
-    amf::AMFContextPtr context;
-    r = factory->CreateContext(&context);
+    r = rt.factory->CreateContext(&rt.context);
     result(j, "create_context", r);
-    if (r != AMF_OK) {
-        j.end_object();
-        return;
-    }
-    r = context->InitDX11(device, amf::AMF_DX11_1);
+    if (r != AMF_OK) return false;
+    r = rt.context->InitDX11(device, amf::AMF_DX11_1);
     result(j, "init_dx11_1", r);
     if (r != AMF_OK) {
-        r = context->InitDX11(device, amf::AMF_DX11_0);
+        r = rt.context->InitDX11(device, amf::AMF_DX11_0);
         result(j, "init_dx11_0", r);
     }
-    if (r != AMF_OK) {
+    return r == AMF_OK;
+}
+
+void probe(Json& j, ID3D11Device* device, const RcsAmfProbeOptions& o) {
+    j.begin_object();
+    Runtime rt;
+    if (!open_runtime(j, device, rt)) {
         j.end_object();
         return;
     }
 
     j.begin_array("components");
     for (const wchar_t* id : {AMFVideoEncoderVCE_AVC, AMFVideoEncoder_HEVC, AMFVideoEncoder_AV1, AMFVideoConverter}) {
-        describe_component(j, factory, context, id);
+        describe_component(j, rt.factory, rt.context, id);
     }
     j.end_array();
 
     std::vector<amf::AMFSurfacePtr> sources;
-    upload_sources(j, device, context, o, sources);
+    upload_sources(j, device, rt.context, o, sources);
     if (!sources.empty()) {
         j.begin_array("encode_runs");
         for (int usage : {AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY, AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY,
                           AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY_HIGH_QUALITY, AMF_VIDEO_ENCODER_USAGE_WEBCAM,
                           AMF_VIDEO_ENCODER_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_USAGE_HIGH_QUALITY}) {
-            for (bool low_latency : {false, true}) encode_run(j, factory, context, sources, o, usage, low_latency);
+            for (bool low_latency : {false, true}) {
+                RunConfig c;
+                c.usage = usage;
+                if (low_latency) c.props.push_back(Prop::LowLatency);
+                c.props.insert(c.props.end(), kProbeProps.begin(), kProbeProps.end());
+                c.width = o.width;
+                c.height = o.height;
+                c.frames = o.frames;
+                encode_run(j, rt.factory, rt.context, sources, o, c);
+            }
         }
         j.end_array();
     }
     sources.clear();
-    context->Terminate();
+    rt.context->Terminate();
+    j.end_object();
+}
+
+// Name, access and value of every property right after Usage is set, before Init.
+void usage_catalog(Json& j, const char* key, const Runtime& rt, int usage) {
+    j.begin_object(key);
+    amf::AMFComponentPtr encoder;
+    AMF_RESULT r = rt.factory->CreateComponent(rt.context, AMFVideoEncoderVCE_AVC, &encoder);
+    result(j, "create", r);
+    if (r == AMF_OK) {
+        result(j, "set_usage", encoder->SetProperty(AMF_VIDEO_ENCODER_USAGE, static_cast<amf_int64>(usage)));
+        j.begin_object("properties");
+        for (amf_size i = 0; i < encoder->GetPropertiesInfoCount(); ++i) {
+            const amf::AMFPropertyInfo* info = nullptr;
+            if (encoder->GetPropertyInfo(i, &info) != AMF_OK || !info || !info->name) continue;
+            std::string name = utf8(info->name);
+            if (name.rfind("TL", 0) == 0) continue;  // per-layer copies of the rate control settings
+            j.begin_object(name.c_str());
+            j.integer("access", info->accessType);
+            amf::AMFVariant current;
+            if (encoder->GetProperty(info->name, &current) == AMF_OK) variant(j, "current", current);
+            j.end_object();
+        }
+        j.end_object();
+        encoder->Terminate();
+    }
+    j.end_object();
+}
+
+// Finds which settings stop Ultra Low Latency from initialising, see Q-01.
+void ull_probe(Json& j, ID3D11Device* device, const RcsAmfProbeOptions& o) {
+    j.begin_object();
+    Runtime rt;
+    if (!open_runtime(j, device, rt)) {
+        j.end_object();
+        return;
+    }
+
+    TraceCollector trace;
+    TraceScope trace_scope(&trace);
+
+    usage_catalog(j, "catalog_ultra_low_latency", rt, AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY);
+    usage_catalog(j, "catalog_low_latency", rt, AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY);
+
+    std::vector<amf::AMFSurfacePtr> sources;
+    upload_sources(j, device, rt.context, o, sources);
+    if (!sources.empty()) {
+        auto config = [&](int usage, std::vector<Prop> props, int frames, int width = 0, int height = 0) {
+            RunConfig c;
+            c.usage = usage;
+            c.props = std::move(props);
+            c.width = width ? width : o.width;
+            c.height = height ? height : o.height;
+            c.frames = frames;
+            c.trace = &trace;
+            return c;
+        };
+        const int ull = AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY;
+        const int ll = AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY;
+
+        j.begin_array("baseline");
+        encode_run(j, rt.factory, rt.context, sources, o, config(ull, {}, o.frames));
+        encode_run(j, rt.factory, rt.context, sources, o, config(ll, {}, o.frames));
+        j.end_array();
+
+        // Usage plus one property, Init only.
+        const std::vector<Prop> candidates = {
+            Prop::TargetBitrate, Prop::FrameRate,     Prop::ProfileHigh,  Prop::ProfileConstrainedBaseline,
+            Prop::IdrPeriod,     Prop::BPicNone,      Prop::Color709,     Prop::LimitedRange,
+            Prop::VuiBt709,      Prop::LowLatency,    Prop::QualitySpeed, Prop::VbvTwoFrames,
+            Prop::RateControlCbr, Prop::PeakBitrate,  Prop::EnforceHrd,   Prop::FillerData,
+        };
+        j.begin_array("single");
+        for (Prop p : candidates) encode_run(j, rt.factory, rt.context, sources, o, config(ull, {p}, 0));
+        j.end_array();
+
+        // Adds the properties in the order of the target settings and keeps each one Init accepts.
+        const std::vector<Prop> order = {
+            Prop::TargetBitrate, Prop::FrameRate,      Prop::ProfileHigh, Prop::IdrPeriod,
+            Prop::BPicNone,      Prop::Color709,       Prop::LimitedRange, Prop::VuiBt709,
+            Prop::LowLatency,    Prop::QualitySpeed,   Prop::VbvTwoFrames, Prop::RateControlCbr,
+            Prop::PeakBitrate,   Prop::EnforceHrd,     Prop::FillerData,
+        };
+        std::vector<Prop> accepted;
+        j.begin_array("greedy");
+        for (Prop p : order) {
+            std::vector<Prop> attempt = accepted;
+            attempt.push_back(p);
+            if (encode_run(j, rt.factory, rt.context, sources, o, config(ull, attempt, 0)) == AMF_OK) {
+                accepted = std::move(attempt);
+            }
+        }
+        j.end_array();
+        j.begin_array("accepted");
+        for (Prop p : accepted) j.string(nullptr, prop_key(p));
+        j.end_array();
+
+        // The accepted set with frames, and the same set on Low Latency for comparison.
+        j.begin_array("final");
+        encode_run(j, rt.factory, rt.context, sources, o, config(ull, accepted, o.frames));
+        encode_run(j, rt.factory, rt.context, sources, o, config(ll, accepted, o.frames));
+        j.end_array();
+
+        // Smaller sizes with Usage only, in case the mode is limited by resolution.
+        j.begin_array("sizes");
+        for (auto size : {std::pair<int, int>{1280, 720}, std::pair<int, int>{640, 360}}) {
+            encode_run(j, rt.factory, rt.context, sources, o, config(ull, {}, 0, size.first, size.second));
+        }
+        j.end_array();
+
+        // Init of Ultra Low Latency reads RateControlPreanalysisEnable, which that usage makes inaccessible.
+        // Tries to give the property a value before the usage switch, or to switch from Low Latency.
+        j.begin_array("workarounds");
+        {
+            RunConfig c = config(ull, {}, o.frames);
+            c.before_usage = {Prop::PreencodeOff};
+            encode_run(j, rt.factory, rt.context, sources, o, c);
+        }
+        {
+            RunConfig c = config(ull, {}, o.frames);
+            c.first_usage = ll;
+            encode_run(j, rt.factory, rt.context, sources, o, c);
+        }
+        {
+            RunConfig c = config(ull, {}, o.frames);
+            c.first_usage = ll;
+            c.before_usage = {Prop::PreencodeOff};
+            encode_run(j, rt.factory, rt.context, sources, o, c);
+        }
+        encode_run(j, rt.factory, rt.context, sources, o, config(ull, {Prop::PreencodeOff}, o.frames));
+        j.end_array();
+    }
+
+    sources.clear();
+    rt.context->Terminate();
     j.end_object();
 }
 
@@ -708,12 +1042,11 @@ char* copy_out(const std::string& text) {
     return out;
 }
 
-}  // namespace
-
-extern "C" char* rcs_amf_probe(void* d3d11_device, const RcsAmfProbeOptions* options) {
+template <typename F>
+char* run_guarded(F&& body) {
     try {
         Json j;
-        probe(j, static_cast<ID3D11Device*>(d3d11_device), *options);
+        body(j);
         return copy_out(j.text);
     } catch (const std::exception& e) {
         Json j;
@@ -724,6 +1057,16 @@ extern "C" char* rcs_amf_probe(void* d3d11_device, const RcsAmfProbeOptions* opt
     } catch (...) {
         return copy_out("{\"error\":\"unknown C++ exception\"}");
     }
+}
+
+}  // namespace
+
+extern "C" char* rcs_amf_probe(void* d3d11_device, const RcsAmfProbeOptions* options) {
+    return run_guarded([&](Json& j) { probe(j, static_cast<ID3D11Device*>(d3d11_device), *options); });
+}
+
+extern "C" char* rcs_amf_ull_probe(void* d3d11_device, const RcsAmfProbeOptions* options) {
+    return run_guarded([&](Json& j) { ull_probe(j, static_cast<ID3D11Device*>(d3d11_device), *options); });
 }
 
 extern "C" void rcs_amf_free(char* text) { free(text); }

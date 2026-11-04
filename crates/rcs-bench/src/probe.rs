@@ -80,14 +80,14 @@ pub fn run(options: &Options) -> Result<(), String> {
     report["media_foundation"] = media_foundation_report();
     save(&path, &report)?;
 
-    let target = adapters
-        .iter()
-        .find(|a| a.info.vendor_id == AMD_VENDOR_ID && !a.info.software)
-        .or_else(|| adapters.iter().find(|a| !a.info.software));
-    report["amf"] = match target {
+    report["amf"] = match encoder_adapter(&adapters) {
         Some(adapter) => {
             println!("AMF на адаптере {}, около минуты...", adapter.info.name);
-            amf_report(options, adapter)
+            let mut result = run_amf_child(options, adapter, AmfProbe::Full);
+            if let Some(probe) = result.get_mut("report") {
+                add_run_summaries(probe, "encode_runs", options.encode.fps);
+            }
+            result
         }
         None => json!({ "skipped": "no hardware adapter" }),
     };
@@ -99,10 +99,37 @@ pub fn run(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
-/// Child process: one adapter, one device, the AMF shim.
-pub fn run_amf(options: &Options) -> Result<(), String> {
-    logging::init(&options.out.join("rcs-bench-amf.jsonl"))?;
-    let _span = info_span!("rcs", build = BUILD_ID, tool = "amf-probe").entered();
+/// Which shim probe a child process runs.
+#[derive(Debug, Clone, Copy)]
+pub enum AmfProbe {
+    Full,
+    UltraLowLatency,
+}
+
+impl AmfProbe {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Full => "amf-probe",
+            Self::UltraLowLatency => "amf-ull",
+        }
+    }
+
+    fn file(self) -> &'static str {
+        match self {
+            Self::Full => AMF_FILE,
+            Self::UltraLowLatency => "ull-amf.json",
+        }
+    }
+}
+
+/// Child process: one adapter, one device, one shim probe.
+pub fn run_amf(options: &Options, kind: AmfProbe) -> Result<(), String> {
+    logging::init(
+        &options
+            .out
+            .join(format!("rcs-bench-{}.jsonl", kind.command())),
+    )?;
+    let _span = info_span!("rcs", build = BUILD_ID, tool = kind.command()).entered();
     if let Err(error) = dxgi::set_dpi_awareness() {
         warn!(error = %dxgi::describe(&error), "dpi awareness");
     }
@@ -114,10 +141,22 @@ pub fn run_amf(options: &Options) -> Result<(), String> {
         .ok_or(format!("no adapter {index}"))?;
     let (device, _) = dxgi::create_device(&adapter.adapter).map_err(|e| dxgi::describe(&e))?;
     info!(adapter = %adapter.info.name, "amf probe started");
-    let text = amf::probe(&device, &options.encode).ok_or("the AMF shim returned no report")?;
-    fs::write(options.out.join(AMF_FILE), text).map_err(|e| e.to_string())?;
+    let text = match kind {
+        AmfProbe::Full => amf::probe(&device, &options.encode),
+        AmfProbe::UltraLowLatency => amf::ull_probe(&device, &options.encode),
+    }
+    .ok_or("the AMF shim returned no report")?;
+    fs::write(options.out.join(kind.file()), text).map_err(|e| e.to_string())?;
     info!("amf probe finished");
     Ok(())
+}
+
+/// The AMD adapter if there is one, otherwise the first hardware adapter.
+pub fn encoder_adapter(adapters: &[Adapter]) -> Option<&Adapter> {
+    adapters
+        .iter()
+        .find(|a| a.info.vendor_id == AMD_VENDOR_ID && !a.info.software)
+        .or_else(|| adapters.iter().find(|a| !a.info.software))
 }
 
 fn save(path: &Path, report: &Value) -> Result<(), String> {
@@ -228,8 +267,9 @@ fn media_foundation_report() -> Value {
     }
 }
 
-fn amf_report(options: &Options, adapter: &Adapter) -> Value {
-    let file = options.out.join(AMF_FILE);
+/// Runs a shim probe in a child process and returns its outcome with the parsed report under `report`.
+pub fn run_amf_child(options: &Options, adapter: &Adapter, kind: AmfProbe) -> Value {
+    let file = options.out.join(kind.file());
     let _ = fs::remove_file(&file);
     let mut result = json!({ "adapter": adapter.info.index, "adapter_name": adapter.info.name });
     let exe = match std::env::current_exe() {
@@ -241,7 +281,7 @@ fn amf_report(options: &Options, adapter: &Adapter) -> Value {
     };
     let e = &options.encode;
     let spawned = Command::new(exe)
-        .arg("amf-probe")
+        .arg(kind.command())
         .arg("--out")
         .arg(&options.out)
         .args(["--adapter", &adapter.info.index.to_string()])
@@ -296,8 +336,7 @@ fn amf_report(options: &Options, adapter: &Adapter) -> Value {
 
     match fs::read_to_string(&file) {
         Ok(text) => match serde_json::from_str::<Value>(&text) {
-            Ok(mut probe) => {
-                add_run_summaries(&mut probe, options.encode.fps);
+            Ok(probe) => {
                 result["report"] = probe;
                 let _ = fs::remove_file(&file);
             }
@@ -315,8 +354,9 @@ fn series(value: &Value) -> Vec<f64> {
         .unwrap_or_default()
 }
 
-fn add_run_summaries(probe: &mut Value, fps: i32) {
-    let Some(runs) = probe.get_mut("encode_runs").and_then(Value::as_array_mut) else {
+/// Adds the usage name, timing summaries and bitrate to every run in `probe[key]`.
+pub fn add_run_summaries(probe: &mut Value, key: &str, fps: i32) {
+    let Some(runs) = probe.get_mut(key).and_then(Value::as_array_mut) else {
         return;
     };
     for run in runs {
@@ -338,7 +378,7 @@ fn add_run_summaries(probe: &mut Value, fps: i32) {
     }
 }
 
-fn result_text(value: &Value) -> String {
+pub fn result_text(value: &Value) -> String {
     match value["code"].as_i64() {
         Some(0) => "OK".to_string(),
         Some(code) => format!("{code} {}", value["text"].as_str().unwrap_or("")),

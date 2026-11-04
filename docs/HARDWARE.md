@@ -43,8 +43,9 @@
 - Кодирование: H.264 и HEVC, максимум 4096×4096. Один аппаратный блок кодирования.
 - AV1 не поддерживается, компонент не создаётся.
 - B-кадров в H.264 нет, для низкой задержки они всё равно не нужны.
-- `Usage` принимает Transcoding, Ultra Low Latency, Low Latency и Webcam. Ultra Low Latency с нашими настройками не
-  проходит `Init` (`AMF_ACCESS_DENIED`). Low Latency на 1080p кодирует кадр за 7,8 мс (p50) и 9,4 мс (p95).
+- `Usage` принимает Transcoding, Ultra Low Latency, Low Latency и Webcam. Ultra Low Latency не
+  проходит `Init` (`AMF_ACCESS_DENIED`) из-за ошибки среды и не используется, см. D-016.
+  Low Latency на 1080p кодирует кадр за 7,8 мс (p50) и 9,4 мс (p95).
 - Кодировщик принимает только NV12 в видеопамяти DX11. BGRA преобразуется на GPU компонентом `AMFVideoConverter`,
   около 0,15 мс на кадр.
 - Старт: H.264 1080p60. Режим 1440p60 пробуется только после стабильного результата.
@@ -55,7 +56,7 @@
 
 | Свойство | Значение |
 |---|---|
-| `AMF_VIDEO_ENCODER_USAGE` | `ULTRA_LOW_LATENCY`, запасной вариант `LOW_LATENCY` |
+| `AMF_VIDEO_ENCODER_USAGE` | `LOW_LATENCY`, Ultra Low Latency не работает в среде 1.4.31, см. D-016 |
 | `AMF_VIDEO_ENCODER_PROFILE` | Вначале `HIGH`, при проблемах `CONSTRAINED_BASELINE` |
 | `AMF_VIDEO_ENCODER_B_PIC_PATTERN` | 0 |
 | `AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD` | `CBR` |

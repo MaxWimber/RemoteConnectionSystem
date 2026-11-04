@@ -4,6 +4,7 @@ mod logging;
 mod options;
 mod probe;
 mod stats;
+mod ull;
 
 use std::process::ExitCode;
 
@@ -11,7 +12,8 @@ const USAGE: &str = "\
 Usage:
   rcs-bench                 print the build
   rcs-bench probe --out DIR [--frames N] [--width W] [--height H] [--fps F] [--bitrate-mbps B]
-  rcs-bench amf-probe --out DIR --adapter N [same options]   used by probe in a child process";
+  rcs-bench ull --out DIR [same options]       which settings Ultra Low Latency accepts
+  rcs-bench amf-probe|amf-ull --out DIR --adapter N [same options]   child processes of probe and ull";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -28,7 +30,9 @@ fn main() -> ExitCode {
     };
     let outcome = match command.as_str() {
         "probe" => probe::run(&options),
-        "amf-probe" => probe::run_amf(&options),
+        "ull" => ull::run(&options),
+        "amf-probe" => probe::run_amf(&options, probe::AmfProbe::Full),
+        "amf-ull" => probe::run_amf(&options, probe::AmfProbe::UltraLowLatency),
         other => Err(format!("Unknown command: {other}\n{USAGE}")),
     };
     match outcome {
