@@ -1,5 +1,6 @@
 //! Capture and encoder measurements.
 
+mod capture;
 mod logging;
 mod options;
 mod probe;
@@ -13,6 +14,7 @@ Usage:
   rcs-bench                 print the build
   rcs-bench probe --out DIR [--frames N] [--width W] [--height H] [--fps F] [--bitrate-mbps B]
   rcs-bench ull --out DIR [same options]       which settings Ultra Low Latency accepts
+  rcs-bench capture --out DIR [--seconds S] [--display N] [--repeat-fps F] [--vbv-kbit K] [same options]
   rcs-bench amf-probe|amf-ull --out DIR --adapter N [same options]   child processes of probe and ull";
 
 fn main() -> ExitCode {
@@ -31,6 +33,7 @@ fn main() -> ExitCode {
     let outcome = match command.as_str() {
         "probe" => probe::run(&options),
         "ull" => ull::run(&options),
+        "capture" => capture::run(&options),
         "amf-probe" => probe::run_amf(&options, probe::AmfProbe::Full),
         "amf-ull" => probe::run_amf(&options, probe::AmfProbe::UltraLowLatency),
         other => Err(format!("Unknown command: {other}\n{USAGE}")),

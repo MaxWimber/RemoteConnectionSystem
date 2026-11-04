@@ -9,6 +9,12 @@ pub struct Options {
     pub out: PathBuf,
     pub adapter: Option<u32>,
     pub encode: ProbeOptions,
+    /// Capture: run time, display output, minimum frame rate on a static screen, VBV size.
+    pub seconds: u32,
+    pub display: u32,
+    pub repeat_fps: u32,
+    pub vbv_kbit: Option<i64>,
+    pub query_timeout_ms: Option<i32>,
 }
 
 impl Default for Options {
@@ -23,6 +29,11 @@ impl Default for Options {
                 frames: 120,
                 bitrate: 30_000_000,
             },
+            seconds: 10,
+            display: 0,
+            repeat_fps: 15,
+            vbv_kbit: None,
+            query_timeout_ms: None,
         }
     }
 }
@@ -45,6 +56,13 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             "--height" => options.encode.height = even(flag, number()?)? as i32,
             "--fps" => options.encode.fps = positive(flag, number()?)? as i32,
             "--bitrate-mbps" => options.encode.bitrate = positive(flag, number()?)? * 1_000_000,
+            "--seconds" => options.seconds = positive(flag, number()?)? as u32,
+            "--display" => options.display = positive(flag, number()?)? as u32,
+            "--repeat-fps" => options.repeat_fps = positive(flag, number()?)? as u32,
+            "--vbv-kbit" => options.vbv_kbit = Some(positive(flag, number()?)?),
+            "--query-timeout-ms" => {
+                options.query_timeout_ms = Some(positive(flag, number()?)?.min(1000) as i32)
+            }
             _ => return Err(format!("Unknown option: {flag}")),
         }
     }

@@ -138,6 +138,7 @@ name = "rcs-encode"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "rcs-capture",
  "windows",
 ]
 

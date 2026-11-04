@@ -215,7 +215,7 @@ pub fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, D3D_FEATU
     Ok((device, level))
 }
 
-fn duplicate(
+pub(crate) fn duplicate(
     adapter: &IDXGIAdapter1,
     device: &ID3D11Device,
     output_index: u32,

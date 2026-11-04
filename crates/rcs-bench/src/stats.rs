@@ -49,3 +49,46 @@ mod tests {
         assert_eq!(summarize(&[]), Value::Null);
     }
 }
+
+/// Upper bounds of the histogram buckets in milliseconds; the last bucket takes everything above.
+pub const HISTOGRAM_MS: [f64; 15] = [
+    0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.7, 20.0, 25.0, 33.4, 50.0, 100.0,
+];
+
+pub fn histogram(values: &[f64]) -> Value {
+    let mut counts = [0u64; HISTOGRAM_MS.len() + 1];
+    for &v in values {
+        let bucket = HISTOGRAM_MS
+            .iter()
+            .position(|&edge| v <= edge)
+            .unwrap_or(HISTOGRAM_MS.len());
+        counts[bucket] += 1;
+    }
+    Value::Array(
+        counts
+            .iter()
+            .enumerate()
+            .map(|(i, &count)| {
+                let le = HISTOGRAM_MS
+                    .get(i)
+                    .map_or(Value::from("inf"), |&e| Value::from(e));
+                json!({ "le_ms": le, "count": count })
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod histogram_tests {
+    use super::*;
+
+    #[test]
+    fn buckets_by_upper_bound() {
+        let h = histogram(&[0.1, 0.5, 0.6, 9.0, 500.0]);
+        assert_eq!(h[0]["count"], 2);
+        assert_eq!(h[1]["count"], 1);
+        assert_eq!(h[6]["count"], 1);
+        assert_eq!(h[HISTOGRAM_MS.len()]["le_ms"], "inf");
+        assert_eq!(h[HISTOGRAM_MS.len()]["count"], 1);
+    }
+}

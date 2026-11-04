@@ -39,9 +39,11 @@
 ```text
 AcquireNextFrame            текстура BGRA на GPU
   ▼
+CopyResource                в пул из 4 текстур GPU, кадр Desktop Duplication сразу освобождается
+  ▼
 AMF VideoConverter          BGRA → NV12, BT.709, limited range, на GPU
   ▼
-AMF VideoEncoder            H.264, Annex B
+AMF VideoEncoder            H.264, Annex B, сервер дописывает цвет в VUI (D-017)
   ▼
 Bounded-очередь             ёмкость 2, поток захвата не ждёт
   ▼
@@ -56,6 +58,7 @@ UDP
 
 - Устройство D3D11 создаётся на адаптере RX 560. Захват и AMF используют одно устройство.
 - У потока захвата и кодирования приоритет MMCSS `Games`. Пробуждение таймера настраивается замером.
+- На время захвата разрешение таймера 1 мс (`timeBeginPeriod`), иначе короткие тайм-ауты просыпаются с шагом 15,6 мс.
 - `AcquireNextFrame` сообщает о кадре только при изменении экрана. Повтор последнего кадра выполняется
   с минимальной частотой 15 FPS, значение уточняется в фазе 1.
 - Смена режима экрана, `DXGI_ERROR_ACCESS_LOST` и `DXGI_ERROR_DEVICE_REMOVED` приводят к пересозданию конвейера.
@@ -156,8 +159,9 @@ pub enum CaptureEvent<'a> {
 }
 
 pub trait Encoder {
-    fn encode(&mut self, frame: &CapturedFrame<'_>, force_idr: bool) -> Result<(), EncodeError>;
-    fn poll(&mut self, timeout: Duration) -> Result<Option<EncodedFrame>, EncodeError>;
+    // pts растёт с каждым вызовом, в том числе для повторов. Буфер `out` переиспользуется между кадрами.
+    fn encode(&mut self, frame: &CapturedFrame<'_>, pts: i64, force_idr: bool) -> Result<SubmitStats, EncodeError>;
+    fn poll(&mut self, out: &mut EncodedFrame) -> Result<bool, EncodeError>;
     fn set_bitrate(&mut self, bits_per_second: u32) -> Result<(), EncodeError>;
 }
 

@@ -14,6 +14,7 @@ fn main() {
     cc::Build::new()
         .cpp(true)
         .file(shim.join("amf_shim.cpp"))
+        .file(shim.join("amf_encoder.cpp"))
         .include(&shim)
         .include(root.join("third_party/amf/include"))
         .define("UNICODE", None)
