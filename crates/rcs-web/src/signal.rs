@@ -54,39 +54,82 @@ async fn serve_socket(
     let mut ended = auth.ended.clone();
     let mut check = tokio::time::interval(CHECK);
     let mut signed_in = !*ended.borrow();
+    let opened = Instant::now();
+    let mut heard = opened;
+    let mut pinged = opened;
+    // Why the socket ended, for the log: a lost connection and a closed tab look the same to the browser (1006).
+    let mut why = String::from("session ended");
     info!(socket = id, "signaling connected");
     while signed_in {
         tokio::select! {
             incoming = socket.recv() => {
-                let Some(Ok(frame)) = incoming else { break };
+                let frame = match incoming {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(e)) => {
+                        why = format!("connection lost: {e}");
+                        break;
+                    }
+                    None => {
+                        why = "connection lost".into();
+                        break;
+                    }
+                };
+                heard = Instant::now();
                 let text = match frame {
                     Message::Text(t) => t,
-                    Message::Close(_) => break,
+                    Message::Close(c) => {
+                        why = match c {
+                            Some(c) => format!("closed by the browser ({})", c.code),
+                            None => "closed by the browser".into(),
+                        };
+                        break;
+                    }
                     _ => continue,
                 };
                 let reply = handle(&state, id, &text, &notify, &mut session, ip).await;
                 if let Some(reply) = reply
-                    && socket.send(Message::Text(reply.to_string().into())).await.is_err()
+                    && let Err(e) = socket.send(Message::Text(reply.to_string().into())).await
                 {
+                    why = format!("send failed: {e}");
                     break;
                 }
             }
             Some(notice) = notices.recv() => {
                 // Another browser took the media session; this one keeps the socket but has no media.
                 session = None;
-                if socket.send(Message::Text(notice.to_string().into())).await.is_err() {
+                if let Err(e) = socket.send(Message::Text(notice.to_string().into())).await {
+                    why = format!("send failed: {e}");
                     break;
                 }
             }
             _ = ended.changed() => signed_in = false,
-            _ = check.tick() => match state.sessions.alive(&auth.key, session.is_some(), Instant::now()) {
-                Liveness::Alive => {}
-                Liveness::Expired => {
-                    state.audit.event("session_expired", Some(ip), json!({}));
-                    signed_in = false;
+            _ = check.tick() => {
+                let now = Instant::now();
+                match state.sessions.alive(&auth.key, session.is_some(), now) {
+                    Liveness::Alive => {}
+                    Liveness::Expired => {
+                        state.audit.event("session_expired", Some(ip), json!({}));
+                        signed_in = false;
+                        continue;
+                    }
+                    Liveness::Gone => {
+                        signed_in = false;
+                        continue;
+                    }
                 }
-                Liveness::Gone => signed_in = false,
-            },
+                if now.duration_since(heard) >= state.policy.socket_silence {
+                    why = "no answer to ping".into();
+                    break;
+                }
+                let ping = state.policy.socket_ping;
+                if now.duration_since(heard) >= ping && now.duration_since(pinged) >= ping {
+                    pinged = now;
+                    if let Err(e) = socket.send(Message::Ping(Vec::new().into())).await {
+                        why = format!("send failed: {e}");
+                        break;
+                    }
+                }
+            }
         }
     }
     if !signed_in {
@@ -112,7 +155,8 @@ async fn serve_socket(
             state.audit.event("stream_stopped", Some(ip), json!({}));
         }
     }
-    info!(socket = id, "signaling closed");
+    let seconds = opened.elapsed().as_secs_f64();
+    info!(socket = id, why, seconds, "signaling closed");
 }
 
 async fn handle(

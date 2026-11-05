@@ -2,6 +2,7 @@
 
 import { ClockSync, sampleFromPong } from './clock';
 import { me } from '../api/auth';
+import { watchNetwork } from './network';
 import { CLOSE_SESSION_ENDED, Signaling, signalUrl, type ServerMessage } from './signaling';
 
 export type SessionState = 'idle' | 'connecting' | 'playing' | 'reconnecting' | 'replaced' | 'stopped';
@@ -48,6 +49,7 @@ export class StreamSession {
   private disconnectTimer: number | undefined;
   private pingTimer: number | undefined;
   private clockSync: ClockSync | null = null;
+  private unwatch: (() => void) | undefined;
 
   constructor(
     private readonly base: string,
@@ -66,13 +68,22 @@ export class StreamSession {
   start(): void {
     this.stopped = false;
     this.attempt = 0;
+    this.unwatch?.();
+    this.unwatch = watchNetwork((m) => this.events.log(m));
     void this.connect();
   }
 
   stop(): void {
     this.stopped = true;
-    this.teardown();
+    this.finish();
     this.events.state('stopped');
+  }
+
+  /** Stops for good: no media, no reconnects, no network watching. */
+  private finish(): void {
+    this.teardown();
+    this.unwatch?.();
+    this.unwatch = undefined;
   }
 
   private teardown(): void {
@@ -89,7 +100,7 @@ export class StreamSession {
   private endSignedOut(): void {
     if (this.stopped) return;
     this.stopped = true;
-    this.teardown();
+    this.finish();
     this.events.log('сессия входа завершена');
     this.events.signedOut();
   }
@@ -238,7 +249,7 @@ export class StreamSession {
         return;
       case 'session-replaced':
         this.stopped = true;
-        this.teardown();
+        this.finish();
         this.events.state('replaced');
         this.events.log('сеанс занят другим окном');
         return;

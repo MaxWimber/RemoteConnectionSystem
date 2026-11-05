@@ -35,6 +35,11 @@ pub struct Policy {
     pub global_failures: usize,
     pub global_window: Duration,
     pub global_block: Duration,
+    /// The signaling socket is pinged after this much quiet: the reply shows the path works, and the traffic keeps
+    /// NAT entries of mobile networks open.
+    pub socket_ping: Duration,
+    /// A signaling socket that hears nothing, not even a pong, for this long is dead and ends like a closed one.
+    pub socket_silence: Duration,
 }
 
 impl Default for Policy {
@@ -49,6 +54,8 @@ impl Default for Policy {
             global_failures: 20,
             global_window: Duration::from_secs(60 * 60),
             global_block: Duration::from_secs(15 * 60),
+            socket_ping: Duration::from_secs(15),
+            socket_silence: Duration::from_secs(45),
         }
     }
 }

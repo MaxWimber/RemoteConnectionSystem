@@ -820,6 +820,37 @@ async fn websocket_needs_a_session_and_the_origin() {
 }
 
 #[tokio::test]
+async fn quiet_websocket_is_pinged_and_a_silent_one_is_dropped() {
+    let policy = Policy {
+        socket_ping: Duration::from_millis(500),
+        socket_silence: Duration::from_millis(2500),
+        ..Policy::default()
+    };
+    let f = fixture(policy);
+    let addr = serve(&f).await;
+    let session = sign_in(&f, "192.0.2.1", 0).await;
+
+    // A browser answers pings by itself (tungstenite does the same while it reads): the socket stays open.
+    let mut socket = connect(addr, Some(&session), ORIGIN).await.unwrap();
+    let mut pings = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    while let Ok(frame) = tokio::time::timeout_at(deadline, socket.next()).await {
+        match frame {
+            Some(Ok(Message::Ping(_))) => pings += 1,
+            other => panic!("the socket ended: {other:?}"),
+        }
+    }
+    assert!(pings >= 2, "{pings} pings");
+
+    // A peer that has gone away answers nothing: the server drops the socket.
+    let mut silent = connect(addr, Some(&session), ORIGIN).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    let (errors, close) = until_closed(&mut silent, Duration::from_secs(2)).await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(close, None);
+}
+
+#[tokio::test]
 async fn websocket_closes_when_the_session_runs_out_or_is_replaced() {
     let policy = Policy {
         absolute_ttl: Duration::from_millis(1500),
