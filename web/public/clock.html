@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Секундомер для замера задержки</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #fff;
+        color: #000;
+        font-family: ui-monospace, Consolas, monospace;
+        overflow: hidden;
+      }
+      main {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 2vh;
+      }
+      #ms {
+        font-size: 22vw;
+        font-weight: 700;
+        line-height: 1;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.02em;
+      }
+      #frame {
+        font-size: 6vw;
+        font-variant-numeric: tabular-nums;
+      }
+      #bar {
+        width: 90vw;
+        height: 4vh;
+        border: 2px solid #000;
+        position: relative;
+      }
+      #fill {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        width: 10%;
+        background: #000;
+      }
+      #hint {
+        position: fixed;
+        bottom: 1vh;
+        font-size: 14px;
+        color: #666;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div id="ms">00000</div>
+      <div id="frame">кадр 0</div>
+      <div id="bar"><div id="fill"></div></div>
+    </main>
+    <div id="hint">F11 — полный экран. Миллисекунды по часам этого компьютера, обновление на каждом кадре экрана.</div>
+    <script>
+      // Server side of the screen-to-screen measurement (docs/HARDWARE.md): a millisecond counter drawn on every
+      // display refresh. A camera films this screen and the client screen together; the difference of the two
+      // readings is the delay. The bar moves one tenth of its width per 100 ms, so blurred digits can be checked.
+      const ms = document.getElementById('ms');
+      const frame = document.getElementById('frame');
+      const fill = document.getElementById('fill');
+      let n = 0;
+      function draw(now) {
+        const t = Math.floor(now) % 100000;
+        ms.textContent = String(t).padStart(5, '0');
+        frame.textContent = 'кадр ' + n++;
+        fill.style.left = ((Math.floor(now / 100) % 10) * 10) + '%';
+        requestAnimationFrame(draw);
+      }
+      requestAnimationFrame(draw);
+    </script>
+  </body>
+</html>
