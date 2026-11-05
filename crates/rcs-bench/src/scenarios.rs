@@ -62,12 +62,12 @@ impl Scenario {
     }
 }
 
-struct Tools {
-    ffmpeg: PathBuf,
-    ffplay: PathBuf,
+pub(crate) struct Tools {
+    pub ffmpeg: PathBuf,
+    pub ffplay: PathBuf,
 }
 
-fn find_tools(options: &Options) -> Result<Tools, String> {
+pub(crate) fn find_tools(options: &Options) -> Result<Tools, String> {
     let dirs: Vec<PathBuf> = match &options.ffmpeg_dir {
         Some(dir) => vec![dir.clone()],
         None => std::env::var_os("PATH")

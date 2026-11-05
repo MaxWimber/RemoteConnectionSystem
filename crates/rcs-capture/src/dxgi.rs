@@ -7,8 +7,8 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11CreateDevice,
-    ID3D11Device, ID3D11Multithread, ID3D11Texture2D,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11CreateDevice, ID3D11Device, ID3D11Multithread, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND,
@@ -187,7 +187,7 @@ fn enumerate_outputs(adapter: &IDXGIAdapter1) -> Vec<OutputInfo> {
 }
 
 /// Creates a D3D11 device on the adapter. Capture and the encoder share it from several threads,
-/// so multithread protection is switched on.
+/// so multithread protection is switched on. Video support lets the `mf` backend use the video processor.
 pub fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, D3D_FEATURE_LEVEL)> {
     let mut device = None;
     let mut level = D3D_FEATURE_LEVEL::default();
@@ -197,7 +197,7 @@ pub fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, D3D_FEATU
             adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
             HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
             D3D11_SDK_VERSION,
             Some(&mut device),

@@ -40,10 +40,13 @@ typedef struct RcsAmfEncoderConfig {
     int32_t profile;       // AMF_VIDEO_ENCODER_PROFILE_ENUM: 66, 77, 100, 256 constrained baseline, 257 constrained high
     int32_t quality_preset;     // -1 keeps the default, otherwise AMF_VIDEO_ENCODER_QUALITY_PRESET_ENUM
     int32_t idr_period;         // frames between IDR frames
-    int32_t intra_refresh_mbs;  // 0 off, otherwise macroblocks per slot
+    int32_t intra_refresh_mbs;  // -1 keeps the default, 0 off, otherwise macroblocks per slot
     int32_t query_timeout_ms;   // 0 means QueryOutput never waits
     int32_t enforce_hrd;        // -1 keeps the default, otherwise bool
     int32_t filler_data;        // -1 keeps the default, otherwise bool
+    int32_t rate_control;       // AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_ENUM; target and peak are both bitrate
+    int32_t vbaq;               // -1 keeps the default, otherwise bool
+    int64_t max_au_bits;        // 0 keeps the default, otherwise the largest access unit in bits
 } RcsAmfEncoderConfig;
 
 typedef struct RcsAmfSubmitInfo {

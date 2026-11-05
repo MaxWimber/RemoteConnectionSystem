@@ -3,6 +3,7 @@
 mod capture;
 mod load;
 mod logging;
+mod matrix;
 mod options;
 mod probe;
 mod scenarios;
@@ -19,6 +20,8 @@ Usage:
   rcs-bench capture --out DIR [--seconds S] [--display N] [--repeat-fps F] [--vbv-kbit K] [same options]
   rcs-bench scenarios --out DIR [--seconds 300] [--scenarios static,window,video] [--ffmpeg-dir D] [capture options]
   rcs-bench load --out DIR --kind still|window --seconds S   screen load, started by scenarios
+  rcs-bench matrix --out DIR [--seconds 10] [--scenarios baseline,vbv_1_frame,...] [--ffmpeg-dir D]
+                            AMF settings against fixed clips: timings, frame sizes, SSIM and PSNR
   rcs-bench amf-probe|amf-ull --out DIR --adapter N [same options]   child processes of probe and ull";
 
 fn main() -> ExitCode {
@@ -40,6 +43,7 @@ fn main() -> ExitCode {
         "capture" => capture::run(&options),
         "scenarios" => scenarios::run(&options),
         "load" => load::run(&options),
+        "matrix" => matrix::run(&options),
         "amf-probe" => probe::run_amf(&options, probe::AmfProbe::Full),
         "amf-ull" => probe::run_amf(&options, probe::AmfProbe::UltraLowLatency),
         other => Err(format!("Unknown command: {other}\n{USAGE}")),

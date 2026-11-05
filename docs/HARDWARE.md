@@ -59,9 +59,11 @@
 | `AMF_VIDEO_ENCODER_USAGE` | `LOW_LATENCY`, Ultra Low Latency не работает в среде 1.4.31, см. D-016 |
 | `AMF_VIDEO_ENCODER_PROFILE` | Вначале `HIGH`, при проблемах `CONSTRAINED_BASELINE` |
 | `AMF_VIDEO_ENCODER_B_PIC_PATTERN` | 0 |
-| `AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD` | `CBR` |
+| `AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD` | `LATENCY_CONSTRAINED_VBR`, пик равен цели, см. D-018 |
+| `AMF_VIDEO_ENCODER_QUALITY_PRESET` | Speed, по умолчанию Low Latency. Balanced и Quality медленнее при том же SSIM |
+| `AMF_VIDEO_ENCODER_ENABLE_VBAQ` | Выключен: с CBR битрейт уходит вчетверо выше цели, с LCVBR пользы нет |
 | `AMF_VIDEO_ENCODER_TARGET_BITRATE` | 30 Мбит/с, далее адаптивно 8–50 Мбит/с |
-| `AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE` | Примерно 1–2 кадра |
+| `AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE` | По умолчанию: без `EnforceHRD` размер не влияет, LCVBR сам держит кадр в 1 целевом |
 | `AMF_VIDEO_ENCODER_IDR_PERIOD` | Большой, IDR по запросу; intra-refresh при поддержке |
 | `AMF_VIDEO_ENCODER_QUERY_TIMEOUT` | Подбирается замером |
 | `AMF_VIDEO_ENCODER_LOWLATENCY_MODE` | Включён, если поддержан |

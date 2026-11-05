@@ -15,6 +15,10 @@ pub struct Options {
     pub repeat_fps: u32,
     pub vbv_kbit: Option<i64>,
     pub query_timeout_ms: Option<i32>,
+    /// `cbr` or `lcvbr` (latency constrained VBR); the default of `EncoderConfig` when absent.
+    pub rate_control: Option<i32>,
+    /// Capture and scenarios: `auto`, `amf` or `mf`, as `media.encoder`.
+    pub backend: rcs_encode::Backend,
     /// Load: `still` or `window`.
     pub kind: Option<String>,
     /// Scenarios: which ones to run, all when empty.
@@ -40,6 +44,8 @@ impl Default for Options {
             repeat_fps: 15,
             vbv_kbit: None,
             query_timeout_ms: None,
+            rate_control: None,
+            backend: rcs_encode::Backend::Auto,
             kind: None,
             scenarios: Vec::new(),
             ffmpeg_dir: None,
@@ -71,6 +77,17 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             "--vbv-kbit" => options.vbv_kbit = Some(positive(flag, number()?)?),
             "--query-timeout-ms" => {
                 options.query_timeout_ms = Some(positive(flag, number()?)?.min(1000) as i32)
+            }
+            "--rate-control" => {
+                options.rate_control = Some(match value.as_str() {
+                    "cbr" => rcs_encode::amf::RATE_CONTROL_CBR,
+                    "lcvbr" => rcs_encode::amf::RATE_CONTROL_LATENCY_CONSTRAINED_VBR,
+                    _ => return Err(format!("{flag}: cbr or lcvbr")),
+                })
+            }
+            "--encoder" => {
+                options.backend = rcs_encode::Backend::parse(value)
+                    .ok_or_else(|| format!("{flag}: auto, amf or mf"))?
             }
             "--kind" => options.kind = Some(value.clone()),
             "--scenarios" => {
@@ -157,6 +174,19 @@ mod tests {
         .unwrap();
         assert_eq!(options.scenarios, ["static", "video", "window"]);
         assert_eq!(options.kind.as_deref(), Some("still"));
+    }
+
+    #[test]
+    fn reads_encoder_and_rate_control() {
+        let options = parse(&args(&["--encoder", "mf", "--rate-control", "cbr"])).unwrap();
+        assert_eq!(options.backend, rcs_encode::Backend::Mf);
+        assert_eq!(
+            options.rate_control,
+            Some(rcs_encode::amf::RATE_CONTROL_CBR)
+        );
+        assert_eq!(parse(&[]).unwrap().backend, rcs_encode::Backend::Auto);
+        assert!(parse(&args(&["--encoder", "nvenc"])).is_err());
+        assert!(parse(&args(&["--rate-control", "vbr"])).is_err());
     }
 
     #[test]

@@ -71,17 +71,28 @@ pub struct EncoderConfig {
     pub query_timeout_ms: i32,
     pub enforce_hrd: i32,
     pub filler_data: i32,
+    pub rate_control: i32,
+    pub vbaq: i32,
+    pub max_au_bits: i64,
 }
 
+pub const USAGE_TRANSCODING: i32 = 0;
 pub const USAGE_LOW_LATENCY: i32 = 2;
+pub const USAGE_WEBCAM: i32 = 3;
 pub const PROFILE_HIGH: i32 = 100;
 pub const PROFILE_CONSTRAINED_BASELINE: i32 = 256;
+pub const RATE_CONTROL_CBR: i32 = 1;
+pub const RATE_CONTROL_PEAK_CONSTRAINED_VBR: i32 = 2;
+pub const RATE_CONTROL_LATENCY_CONSTRAINED_VBR: i32 = 3;
+pub const QUALITY_PRESET_BALANCED: i32 = 0;
+pub const QUALITY_PRESET_SPEED: i32 = 1;
+pub const QUALITY_PRESET_QUALITY: i32 = 2;
 /// AMF memory types that appear in reports.
 pub const MEMORY_HOST: i32 = 1;
 pub const MEMORY_DX11: i32 = 3;
 
 impl EncoderConfig {
-    /// Low Latency usage (D-016), CBR, High profile, defaults of the usage for everything else.
+    /// Low Latency usage (D-016), latency constrained VBR (D-018), High profile, defaults of the usage for the rest.
     pub fn low_latency(width: i32, height: i32, fps: i32, bitrate: i64) -> Self {
         Self {
             input_width: width,
@@ -95,10 +106,14 @@ impl EncoderConfig {
             profile: PROFILE_HIGH,
             quality_preset: -1,
             idr_period: fps * 10,
-            intra_refresh_mbs: 0,
+            intra_refresh_mbs: -1,
             query_timeout_ms: 50,
             enforce_hrd: -1,
             filler_data: -1,
+            // D-018: no frame larger than one frame interval of the bitrate, at the same mean quality as CBR.
+            rate_control: RATE_CONTROL_LATENCY_CONSTRAINED_VBR,
+            vbaq: -1,
+            max_au_bits: 0,
         }
     }
 }
@@ -185,29 +200,10 @@ impl AmfEncoder {
         &self.config
     }
 
-    /// SPS units that got the BT.709 colour description, see `poll`.
-    pub fn sps_rewritten(&self) -> u64 {
-        self.sps_rewritten
-    }
-
     fn error(&self) -> EncodeError {
         // SAFETY: the encoder is alive; the string is owned by it and copied before the next call.
         let text = unsafe { CStr::from_ptr(rcs_amf_encoder_error(self.raw)) };
         EncodeError(text.to_string_lossy().into_owned())
-    }
-
-    /// Settings read back from AMF after Init, as JSON.
-    pub fn settings(&self) -> Option<String> {
-        // SAFETY: the encoder is alive; the returned string is freed by the shim exactly once.
-        unsafe {
-            let text = rcs_amf_encoder_settings(self.raw);
-            if text.is_null() {
-                return None;
-            }
-            let json = CStr::from_ptr(text).to_string_lossy().into_owned();
-            rcs_amf_free(text);
-            Some(json)
-        }
     }
 }
 
@@ -289,5 +285,28 @@ impl Encoder for AmfEncoder {
         }
         self.config.bitrate = i64::from(bits_per_second);
         Ok(())
+    }
+
+    fn backend(&self) -> &'static str {
+        "amf"
+    }
+
+    /// Settings read back from AMF after Init, as JSON.
+    fn settings(&self) -> Option<String> {
+        // SAFETY: the encoder is alive; the returned string is freed by the shim exactly once.
+        unsafe {
+            let text = rcs_amf_encoder_settings(self.raw);
+            if text.is_null() {
+                return None;
+            }
+            let json = CStr::from_ptr(text).to_string_lossy().into_owned();
+            rcs_amf_free(text);
+            Some(json)
+        }
+    }
+
+    /// SPS units that got the BT.709 colour description, see `poll`.
+    fn sps_rewritten(&self) -> u64 {
+        self.sps_rewritten
     }
 }

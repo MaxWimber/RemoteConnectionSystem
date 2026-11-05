@@ -103,6 +103,10 @@ GamepadBackend: ViGEmBus
 - AMF загружается во время работы через `LoadLibrary("amfrt64.dll")`. Поэтому код собирается и запускается на ПК без AMD.
 - Если `amf` указан явно, но недоступен, агент завершается с понятной ошибкой, а не переключается молча.
 - В журнал и статистику всегда пишется фактический бэкенд, адаптер и версия драйвера.
+- `rcs_encode::open` открывает бэкенд, оба реализуют трейт `Encoder` и сами дописывают цвет в VUI (D-017).
+- `amf`: конвертер AMF BGRA → NV12 и кодировщик Low Latency с LCVBR (D-016, D-018).
+- `mf`: видеопроцессор D3D11 BGRA → NV12, затем аппаратный H.264 MFT того же адаптера через `IMFDXGIDeviceManager`.
+  Программные MFT не используются, им нужен кадр в оперативной памяти.
 
 ## Диагностика
 
@@ -165,6 +169,8 @@ pub trait Encoder {
     fn encode(&mut self, frame: &CapturedFrame<'_>, pts: i64, force_idr: bool) -> Result<SubmitStats, EncodeError>;
     fn poll(&mut self, out: &mut EncodedFrame) -> Result<bool, EncodeError>;
     fn set_bitrate(&mut self, bits_per_second: u32) -> Result<(), EncodeError>;
+    fn backend(&self) -> &'static str;          // "amf" или "mf"
+    fn settings(&self) -> Option<String>;       // фактические настройки, JSON
 }
 
 pub trait InputSink {

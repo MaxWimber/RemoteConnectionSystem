@@ -60,6 +60,8 @@ const Readback kEncoderReadback[] = {
     {"enforce_hrd", AMF_VIDEO_ENCODER_ENFORCE_HRD},
     {"filler_data", AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE},
     {"intra_refresh_mbs_per_slot", AMF_VIDEO_ENCODER_INTRA_REFRESH_NUM_MBS_PER_SLOT},
+    {"vbaq", AMF_VIDEO_ENCODER_ENABLE_VBAQ},
+    {"max_au_size", AMF_VIDEO_ENCODER_MAX_AU_SIZE},
     {"query_timeout", AMF_VIDEO_ENCODER_QUERY_TIMEOUT},
     {"output_color_profile", AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE},
     {"output_transfer", AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC},
@@ -168,8 +170,7 @@ bool RcsAmfEncoder::start(ID3D11Device* device, const RcsAmfEncoderConfig& c) {
     // Usage first: it resets every other property to the defaults of that usage.
     if (!set(this, encoder, AMF_VIDEO_ENCODER_USAGE, static_cast<amf_int64>(c.usage)) ||
         !set(this, encoder, AMF_VIDEO_ENCODER_PROFILE, static_cast<amf_int64>(c.profile)) ||
-        !set(this, encoder, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
-             static_cast<amf_int64>(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, static_cast<amf_int64>(c.rate_control)) ||
         !set(this, encoder, AMF_VIDEO_ENCODER_TARGET_BITRATE, static_cast<amf_int64>(c.bitrate)) ||
         !set(this, encoder, AMF_VIDEO_ENCODER_PEAK_BITRATE, static_cast<amf_int64>(c.bitrate)) ||
         !set(this, encoder, AMF_VIDEO_ENCODER_FRAMERATE, ::AMFConstructRate(static_cast<amf_uint32>(c.fps), 1)) ||
@@ -190,8 +191,12 @@ bool RcsAmfEncoder::start(ID3D11Device* device, const RcsAmfEncoderConfig& c) {
     if (c.quality_preset >= 0 &&
         !set(this, encoder, AMF_VIDEO_ENCODER_QUALITY_PRESET, static_cast<amf_int64>(c.quality_preset)))
         return false;
-    if (c.intra_refresh_mbs > 0 && !set(this, encoder, AMF_VIDEO_ENCODER_INTRA_REFRESH_NUM_MBS_PER_SLOT,
-                                        static_cast<amf_int64>(c.intra_refresh_mbs)))
+    if (c.intra_refresh_mbs >= 0 && !set(this, encoder, AMF_VIDEO_ENCODER_INTRA_REFRESH_NUM_MBS_PER_SLOT,
+                                         static_cast<amf_int64>(c.intra_refresh_mbs)))
+        return false;
+    if (c.vbaq >= 0 && !set(this, encoder, AMF_VIDEO_ENCODER_ENABLE_VBAQ, c.vbaq != 0)) return false;
+    if (c.max_au_bits > 0 &&
+        !set(this, encoder, AMF_VIDEO_ENCODER_MAX_AU_SIZE, static_cast<amf_int64>(c.max_au_bits)))
         return false;
     if (c.enforce_hrd >= 0 && !set(this, encoder, AMF_VIDEO_ENCODER_ENFORCE_HRD, c.enforce_hrd != 0)) return false;
     if (c.filler_data >= 0 && !set(this, encoder, AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE, c.filler_data != 0))

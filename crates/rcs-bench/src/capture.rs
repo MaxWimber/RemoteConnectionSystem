@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rcs_capture::{Capture, CaptureEvent, CapturedFrame, DxgiCapture, TimerResolution, dxgi};
-use rcs_encode::amf::{AmfEncoder, EncoderConfig};
+use rcs_encode::amf::EncoderConfig;
 use rcs_encode::{EncodedFrame, Encoder, h264};
 use rcs_protocol::BUILD_ID;
 use serde_json::{Value, json};
@@ -172,7 +172,7 @@ impl Writer {
 }
 
 struct Session {
-    encoder: AmfEncoder,
+    encoder: Box<dyn Encoder>,
     started: Instant,
     last_pts: i64,
     force_idr: bool,
@@ -295,6 +295,9 @@ fn encoder_config(options: &Options, input: (u32, u32)) -> EncoderConfig {
     if let Some(ms) = options.query_timeout_ms {
         config.query_timeout_ms = ms;
     }
+    if let Some(method) = options.rate_control {
+        config.rate_control = method;
+    }
     config
 }
 
@@ -362,7 +365,14 @@ pub fn measure(options: &Options) -> Result<Value, String> {
         .map_err(|e| e.to_string())?;
     let mut input_size = capture.size();
     let config = encoder_config(options, input_size);
-    let encoder = AmfEncoder::new(&device, &config).map_err(|e| format!("AMF encoder: {e}"))?;
+    let backend = options.backend;
+    let encoder = rcs_encode::open(backend, &device, &config)
+        .map_err(|e| format!("encoder {}: {e}", backend.name()))?;
+    info!(
+        requested = backend.name(),
+        actual = encoder.backend(),
+        "encoder opened"
+    );
     let settings: Value = encoder
         .settings()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -453,14 +463,14 @@ pub fn measure(options: &Options) -> Result<Value, String> {
                 let size = capture.size();
                 if size != input_size && size.0 > 0 {
                     warn!(?size, "display size changed, recreating the encoder");
-                    match AmfEncoder::new(&device, &encoder_config(options, size)) {
+                    match rcs_encode::open(backend, &device, &encoder_config(options, size)) {
                         Ok(encoder) => {
                             session.encoder = encoder;
                             session.counters.encoders_created += 1;
                             input_size = size;
                         }
                         Err(e) => {
-                            failure = Some(format!("AMF encoder after a mode change: {e}"));
+                            failure = Some(format!("encoder after a mode change: {e}"));
                             break;
                         }
                     }
@@ -482,6 +492,7 @@ pub fn measure(options: &Options) -> Result<Value, String> {
     }
     let elapsed = started.elapsed().as_secs_f64();
     let sps_rewritten = session.encoder.sps_rewritten();
+    let backend_used = session.encoder.backend();
 
     let Session {
         writer,
@@ -497,6 +508,7 @@ pub fn measure(options: &Options) -> Result<Value, String> {
         "tool": "rcs-bench capture",
         "build": BUILD_ID,
         "adapter": adapter.info.name,
+        "encoder": { "requested": backend.name(), "backend": backend_used },
         "driver": adapter.info.driver_version,
         "failure": failure,
         "options": {
@@ -509,6 +521,7 @@ pub fn measure(options: &Options) -> Result<Value, String> {
             "repeat_fps": options.repeat_fps,
             "vbv_kbit": options.vbv_kbit,
             "query_timeout_ms": options.query_timeout_ms,
+            "rate_control": config.rate_control,
         },
         "input": { "width": input_size.0, "height": input_size.1 },
         "display": { "refresh_hz": (capture.refresh_hz() * 1000.0).round() / 1000.0 },
