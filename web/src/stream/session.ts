@@ -1,5 +1,6 @@
 // The media session: a receive-only RTCPeerConnection with H.264, reconnecting when it breaks.
 
+import { ClockSync, sampleFromPong } from './clock';
 import { Signaling, signalUrl, type ServerMessage } from './signaling';
 
 export type SessionState = 'idle' | 'connecting' | 'playing' | 'reconnecting' | 'replaced' | 'stopped';
@@ -42,6 +43,8 @@ export class StreamSession {
   private timer: number | undefined;
   private stopped = true;
   private disconnectTimer: number | undefined;
+  private pingTimer: number | undefined;
+  private clockSync: ClockSync | null = null;
 
   constructor(
     private readonly base: string,
@@ -50,6 +53,11 @@ export class StreamSession {
 
   get peer(): RTCPeerConnection | null {
     return this.pc;
+  }
+
+  /** The server clock of the current session, once the control channel has answered. */
+  get clock(): ClockSync | null {
+    return this.clockSync;
   }
 
   start(): void {
@@ -67,6 +75,8 @@ export class StreamSession {
   private teardown(): void {
     window.clearTimeout(this.timer);
     window.clearTimeout(this.disconnectTimer);
+    window.clearTimeout(this.pingTimer);
+    this.clockSync = null;
     this.signaling?.close();
     this.signaling = null;
     this.pc?.close();
@@ -118,8 +128,8 @@ export class StreamSession {
       const codecs = h264First(caps.codecs);
       if (codecs.length > 0) transceiver.setCodecPreferences(codecs);
     }
-    // Opened now so the SCTP association exists; input and control use it from phase 4.
-    pc.createDataChannel('control', { ordered: true });
+    // The control channel carries the server clock now (PROTOCOL.md) and settings and input from phase 4.
+    this.openControl(pc.createDataChannel('control', { ordered: true }));
     pc.ontrack = (e) => {
       const receiver = e.receiver as RTCRtpReceiver & {
         jitterBufferTarget?: number | null;
@@ -156,6 +166,39 @@ export class StreamSession {
     this.events.log('offer отправлен');
   }
 
+  /** Ten quick pings right away, then one every five seconds; the fastest exchange sets the clock offset. */
+  private openControl(channel: RTCDataChannel): void {
+    const clock = new ClockSync();
+    this.clockSync = clock;
+    const sent = new Map<number, number>();
+    let id = 0;
+    const ping = () => {
+      if (channel.readyState !== 'open') return;
+      id += 1;
+      const now = performance.now();
+      sent.set(id, now);
+      channel.send(JSON.stringify({ t: 'ping', id, client_ts: now }));
+      this.pingTimer = window.setTimeout(ping, id < 10 ? 200 : 5000);
+    };
+    channel.onopen = ping;
+    channel.onmessage = (e) => {
+      if (typeof e.data !== 'string') return;
+      let m: Record<string, unknown>;
+      try {
+        m = JSON.parse(e.data) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      if (m['t'] === 'hello' && typeof m['rtp_epoch_ms'] === 'number') {
+        clock.rtpEpochMs = m['rtp_epoch_ms'];
+        if (typeof m['rtp_clock'] === 'number') clock.rtpClock = m['rtp_clock'];
+      } else if (m['t'] === 'pong' && typeof m['id'] === 'number' && typeof m['server_ms'] === 'number') {
+        const at = sent.get(m['id']);
+        sent.delete(m['id']);
+        if (at !== undefined) clock.add(sampleFromPong(at, performance.now(), m['server_ms'], performance.timeOrigin));
+      }
+    };
+  }
   private async onSignal(m: ServerMessage): Promise<void> {
     const pc = this.pc;
     switch (m.type) {

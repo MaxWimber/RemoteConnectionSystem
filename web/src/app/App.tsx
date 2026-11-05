@@ -49,7 +49,7 @@ export function App() {
     session.current = s;
     s.start();
     if (video.current) {
-      meter.current = new LatencyMeter(video.current);
+      meter.current = new LatencyMeter(video.current, () => s.clock);
       meter.current.start();
     }
     return () => {
@@ -152,7 +152,7 @@ export function App() {
           <div>
             захват→показ p50 {fmt(latency?.captureToDisplayP50 ?? null)} / p95 {fmt(latency?.captureToDisplayP95 ?? null)}{' '}
             мс · захват→приём {fmt(latency?.captureToReceiveP50 ?? null)} мс · приём→показ{' '}
-            {fmt(latency?.receiveToDisplayP50 ?? null)} мс
+            {fmt(latency?.receiveToDisplayP50 ?? null)} мс · часы ±{fmt(latency?.clockErrorMs ?? null)} мс
           </div>
           <div>
             потеряно {summary?.packetsLost ?? 0} · NACK {summary?.nackCount ?? 0} · PLI {summary?.pliCount ?? 0} ·

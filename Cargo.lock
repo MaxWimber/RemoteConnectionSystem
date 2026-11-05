@@ -697,6 +697,7 @@ dependencies = [
 name = "rcs-webrtc"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "str0m",
  "tracing",
 ]

@@ -12,9 +12,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde_json::{Value, json};
 use str0m::change::SdpOffer;
+use str0m::channel::ChannelId;
 use str0m::format::Codec;
 use str0m::media::{MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
@@ -282,7 +284,17 @@ struct Session {
     rtc: Rtc,
     video: Option<(Mid, Pt)>,
     connected: bool,
+    /// RTP time 0 of the video stream, see `send_frames`.
     epoch: Instant,
+    /// The same moment in Unix milliseconds, for the `hello` on the control channel.
+    epoch_unix_ms: f64,
+    control: Option<ChannelId>,
+}
+
+fn unix_ms(at: SystemTime) -> f64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
 }
 
 struct NetworkLoop {
@@ -376,6 +388,8 @@ impl NetworkLoop {
             video: None,
             connected: false,
             epoch: now,
+            epoch_unix_ms: unix_ms(SystemTime::now()) - now.elapsed().as_secs_f64() * 1000.0,
+            control: None,
         });
         info!("session opened");
         Ok(answer.to_sdp_string())
@@ -570,11 +584,60 @@ fn handle_event(session: &mut Session, shared: &Shared, event: Event) -> Option<
                 .fetch_add(1, Ordering::Relaxed);
             shared.keyframe_wanted.store(true, Ordering::Relaxed);
         }
-        Event::ChannelOpen(_, label) => info!(%label, "data channel open"),
-        Event::ChannelClose(_) => debug!("data channel closed"),
+        Event::ChannelOpen(id, label) => {
+            info!(%label, "data channel open");
+            if label == CONTROL_CHANNEL {
+                session.control = Some(id);
+                let hello = json!({
+                    "t": "hello",
+                    "protocol": 1,
+                    "codec": "h264",
+                    "rtp_epoch_ms": session.epoch_unix_ms,
+                    "rtp_clock": 90_000,
+                });
+                send_control(session, &hello);
+            }
+        }
+        Event::ChannelData(data) if Some(data.id) == session.control && !data.binary => {
+            if let Some(reply) = control_reply(&data.data, unix_ms(SystemTime::now())) {
+                send_control(session, &reply);
+            }
+        }
+        Event::ChannelClose(id) => {
+            if Some(id) == session.control {
+                session.control = None;
+            }
+            debug!("data channel closed");
+        }
         _ => {}
     }
     None
+}
+
+/// The label of the control channel, `docs/PROTOCOL.md`.
+const CONTROL_CHANNEL: &str = "control";
+
+fn send_control(session: &mut Session, message: &Value) {
+    let Some(id) = session.control else { return };
+    if let Some(mut channel) = session.rtc.channel(id)
+        && let Err(e) = channel.write(false, message.to_string().as_bytes())
+    {
+        debug!(error = %e, "control write failed");
+    }
+}
+
+/// The answer to a control message, if it needs one. Phase 2 answers `ping` with the server clock.
+fn control_reply(text: &[u8], server_ms: f64) -> Option<Value> {
+    let message: Value = serde_json::from_slice(text).ok()?;
+    match message["t"].as_str()? {
+        "ping" => Some(json!({
+            "t": "pong",
+            "id": message["id"],
+            "client_ts": message["client_ts"],
+            "server_ms": server_ms,
+        })),
+        _ => None,
+    }
 }
 
 /// The H.264 payload type to send with: packetization-mode 1, High profile when offered, else any.
@@ -611,6 +674,17 @@ mod tests {
             captured: Instant::now(),
             keyframe: false,
         }
+    }
+
+    #[test]
+    fn ping_gets_a_pong_with_the_server_clock() {
+        let reply = control_reply(br#"{"t":"ping","id":7,"client_ts":12.5}"#, 1000.25).unwrap();
+        assert_eq!(reply["t"], "pong");
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["client_ts"], 12.5);
+        assert_eq!(reply["server_ms"], 1000.25);
+        assert!(control_reply(br#"{"t":"settings"}"#, 0.0).is_none());
+        assert!(control_reply(b"not json", 0.0).is_none());
     }
 
     #[test]
