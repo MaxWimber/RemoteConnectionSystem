@@ -141,6 +141,21 @@ impl FrameSink {
     }
 }
 
+/// The local address a datagram arrived on. ICE matches it against our candidates, so `0.0.0.0` will not do.
+/// A std socket cannot tell the real destination, so with a wildcard bind it is inferred from the source:
+/// loopback for loopback senders, else the advertised address of the same family that is not loopback.
+fn destination_for(local: SocketAddr, advertise: &[SocketAddr], source: SocketAddr) -> SocketAddr {
+    if !local.ip().is_unspecified() {
+        return local;
+    }
+    let loopback = source.ip().is_loopback();
+    advertise
+        .iter()
+        .find(|a| a.ip().is_loopback() == loopback && a.is_ipv4() == source.is_ipv4())
+        .copied()
+        .unwrap_or(local)
+}
+
 /// Appends a frame; when the queue is over its size, the oldest frame comes back to be dropped.
 fn push_bounded(queue: &mut VecDeque<VideoFrame>, frame: VideoFrame) -> Option<VideoFrame> {
     queue.push_back(frame);
@@ -484,7 +499,7 @@ impl NetworkLoop {
                     Receive {
                         proto: Protocol::Udp,
                         source,
-                        destination: self.local,
+                        destination: destination_for(self.local, &self.config.advertise, source),
                         contents,
                     },
                 );
@@ -596,6 +611,19 @@ mod tests {
         assert_eq!(dropped.data, [1]);
         let left: Vec<u8> = queue.iter().map(|f| f.data[0]).collect();
         assert_eq!(left, [2, 3]);
+    }
+
+    #[test]
+    fn wildcard_binds_infer_the_destination_from_the_source() {
+        let local: SocketAddr = "0.0.0.0:8443".parse().unwrap();
+        let lan: SocketAddr = "192.168.1.12:8443".parse().unwrap();
+        let lo: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let advertise = [lan, lo];
+        let phone: SocketAddr = "192.168.1.40:51000".parse().unwrap();
+        let me: SocketAddr = "127.0.0.1:51000".parse().unwrap();
+        assert_eq!(destination_for(local, &advertise, phone), lan);
+        assert_eq!(destination_for(local, &advertise, me), lo);
+        assert_eq!(destination_for(lo, &advertise, phone), lo);
     }
 
     #[test]
