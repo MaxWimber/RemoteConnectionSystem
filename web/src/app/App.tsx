@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { logout } from '../api/auth';
 import { buildReport, download, installErrorCapture, logEvent, recordSample } from '../stream/diagnostics';
 import { LatencyMeter, type LatencySummary } from '../stream/latency';
 import { StreamSession, type SessionState } from '../stream/session';
@@ -21,7 +22,12 @@ function fmt(value: number | null, digits = 1, unit = ''): string {
   return value === null ? '—' : `${value.toFixed(digits)}${unit}`;
 }
 
-export function App() {
+interface Props {
+  /** Called when the sign-in session is over; the reason is shown on the sign-in page. */
+  onSignedOut(reason: string): void;
+}
+
+export function App({ onSignedOut }: Props) {
   const video = useRef<HTMLVideoElement>(null);
   const session = useRef<StreamSession | null>(null);
   const lastStats = useRef<StatsMap | null>(null);
@@ -45,6 +51,7 @@ export function App() {
       stream: (stream) => {
         if (video.current) video.current.srcObject = stream;
       },
+      signedOut: () => onSignedOut('Сессия завершена: выход, истечение срока или вход с другого устройства.'),
     });
     session.current = s;
     s.start();
@@ -121,6 +128,15 @@ export function App() {
   };
 
   const reconnect = () => session.current?.start();
+  const signOut = async () => {
+    session.current?.stop();
+    try {
+      await logout(import.meta.env.BASE_URL);
+    } catch (e) {
+      logEvent(`logout: ${String(e)}`);
+    }
+    onSignedOut('Вы вышли.');
+  };
   const agent = agentStatus.current as Record<string, unknown> | null;
   const message = stateText[state];
 
@@ -138,6 +154,7 @@ export function App() {
         <button onClick={fullscreen} title="Полный экран">⛶</button>
         <button onClick={() => setShowStats(!showStats)} title="Статистика">ℹ</button>
         <button onClick={() => void saveDiagnostics()} title="Скачать диагностику">⤓</button>
+        <button onClick={() => void signOut()} title="Выйти">⏻</button>
       </div>
       {showStats && (
         <div class="stats">

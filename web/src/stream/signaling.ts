@@ -42,13 +42,16 @@ export function parseServerMessage(text: string): ServerMessage {
   }
 }
 
+/** Close code the server uses when the sign-in session ends: go back to sign-in, do not reconnect. */
+export const CLOSE_SESSION_ENDED = 4401;
+
 export class Signaling {
   private socket: WebSocket | null = null;
 
   constructor(
     private readonly url: string,
     private readonly onMessage: (m: ServerMessage) => void,
-    private readonly onClose: (reason: string) => void,
+    private readonly onClose: (reason: string, code: number) => void,
   ) {}
 
   open(): Promise<void> {
@@ -65,7 +68,7 @@ export class Signaling {
       };
       socket.onclose = (e) => {
         if (!opened) reject(new Error(`signaling closed (${e.code})`));
-        else this.onClose(`signaling closed (${e.code})`);
+        else this.onClose(`signaling closed (${e.code})`, e.code);
       };
     });
   }

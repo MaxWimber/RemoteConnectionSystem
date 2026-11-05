@@ -1,5 +1,5 @@
-# Phase 0: static stub only. rcs-web is not proxied until the Phase 3 security checklist passes.
-# HSTS is enabled in Phase 3, once the certificate has been proven stable.
+# Phase 3: Caddy terminates HTTPS and proxies the client and the API to rcs-web on loopback (docs/SECURITY.md, D-021).
+# rcs-web serves the /RemoteConnectionSystem prefix itself and sets CSP and the other page headers; Caddy adds HSTS.
 {
 	admin off
 	# HTTP/3 would need UDP 8444, which is not forwarded.
@@ -26,7 +26,10 @@ https://maxwimber.ru:8444 {
 		}
 	}
 
+	# Deferred, so these replace what rcs-web sent instead of doubling it. includeSubDomains waits for a subdomain check.
 	header {
+		defer
+		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options nosniff
 		Referrer-Policy no-referrer
 		X-Frame-Options DENY
@@ -35,9 +38,9 @@ https://maxwimber.ru:8444 {
 
 	redir /RemoteConnectionSystem /RemoteConnectionSystem/ 308
 
-	handle_path /RemoteConnectionSystem/* {
-		root * C:/ProgramData/RCS/www
-		file_server
+	# Caddy drops X-Forwarded-For from the browser and sends the real address; rcs-web trusts it only from loopback.
+	handle /RemoteConnectionSystem/* {
+		reverse_proxy 127.0.0.1:8080
 	}
 
 	handle {

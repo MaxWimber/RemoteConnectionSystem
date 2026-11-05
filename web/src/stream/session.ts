@@ -1,7 +1,8 @@
 // The media session: a receive-only RTCPeerConnection with H.264, reconnecting when it breaks.
 
 import { ClockSync, sampleFromPong } from './clock';
-import { Signaling, signalUrl, type ServerMessage } from './signaling';
+import { me } from '../api/auth';
+import { CLOSE_SESSION_ENDED, Signaling, signalUrl, type ServerMessage } from './signaling';
 
 export type SessionState = 'idle' | 'connecting' | 'playing' | 'reconnecting' | 'replaced' | 'stopped';
 
@@ -9,6 +10,8 @@ export interface SessionEvents {
   state(state: SessionState, detail?: string): void;
   log(message: string): void;
   stream(stream: MediaStream): void;
+  /** The sign-in session ended (logout, expiry, a sign-in elsewhere): show the sign-in page. */
+  signedOut(): void;
 }
 
 /** Wait before the n-th reconnect attempt: 1 s, 2 s, 4 s, then 5 s. */
@@ -83,6 +86,26 @@ export class StreamSession {
     this.pc = null;
   }
 
+  private endSignedOut(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.teardown();
+    this.events.log('сессия входа завершена');
+    this.events.signedOut();
+  }
+
+  private async sessionGone(): Promise<boolean> {
+    try {
+      if ((await me(this.base)).state !== 'signed-in') {
+        this.endSignedOut();
+        return true;
+      }
+    } catch {
+      // The server is not answering; keep trying to reconnect.
+    }
+    return false;
+  }
+
   private scheduleReconnect(reason: string): void {
     if (this.stopped) return;
     this.teardown();
@@ -99,12 +122,14 @@ export class StreamSession {
     const signaling = new Signaling(
       url,
       (m) => void this.onSignal(m),
-      (reason) => this.scheduleReconnect(reason),
+      (reason, code) => (code === CLOSE_SESSION_ENDED ? this.endSignedOut() : this.scheduleReconnect(reason)),
     );
     this.signaling = signaling;
     try {
       await signaling.open();
     } catch (e) {
+      // A refused WebSocket looks the same for a dead server and for an ended session; ask which one.
+      if (await this.sessionGone()) return;
       this.scheduleReconnect(String(e));
       return;
     }
@@ -219,6 +244,10 @@ export class StreamSession {
         return;
       case 'error':
         this.events.log(`ошибка сервера: ${m.code}`);
+        if (m.code === 'session_ended') {
+          this.endSignedOut();
+          return;
+        }
         this.scheduleReconnect(`ошибка сервера: ${m.code}`);
         return;
       case 'pong':
