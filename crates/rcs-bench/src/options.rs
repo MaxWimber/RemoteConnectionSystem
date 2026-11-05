@@ -22,6 +22,8 @@ pub struct Options {
     /// Capture, for testing P1-2: at this second the run behaves as if the GPU was removed and rebuilds the device,
     /// the capture and the encoder.
     pub simulate_device_lost_at: Option<u32>,
+    /// Load `game`: the game executable, found among the winget packages when absent.
+    pub game_exe: Option<PathBuf>,
     /// Load: `still` or `window`.
     pub kind: Option<String>,
     /// Scenarios: which ones to run, all when empty.
@@ -50,6 +52,7 @@ impl Default for Options {
             rate_control: None,
             backend: rcs_encode::Backend::Auto,
             simulate_device_lost_at: None,
+            game_exe: None,
             kind: None,
             scenarios: Vec::new(),
             ffmpeg_dir: None,
@@ -96,6 +99,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             "--simulate-device-lost-at" => {
                 options.simulate_device_lost_at = Some(positive(flag, number()?)? as u32)
             }
+            "--game-exe" => options.game_exe = Some(PathBuf::from(value)),
             "--kind" => options.kind = Some(value.clone()),
             "--scenarios" => {
                 options.scenarios = value

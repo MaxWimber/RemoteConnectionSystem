@@ -1,6 +1,7 @@
 //! Capture and encoder measurements.
 
 mod capture;
+mod game_load;
 mod gpu_load;
 mod load;
 mod logging;
@@ -20,7 +21,7 @@ Usage:
   rcs-bench ull --out DIR [same options]       which settings Ultra Low Latency accepts
   rcs-bench capture --out DIR [--seconds S] [--display N] [--repeat-fps F] [--vbv-kbit K] [same options]
   rcs-bench scenarios --out DIR [--seconds 300] [--scenarios static,window,video] [--ffmpeg-dir D] [capture options]
-  rcs-bench load --out DIR --kind still|window|switch|gpu --seconds S   screen load, started by scenarios
+  rcs-bench load --out DIR --kind still|window|switch|gpu|game --seconds S [--game-exe X]   screen load, started by scenarios
   rcs-bench matrix --out DIR [--seconds 10] [--scenarios baseline,vbv_1_frame,...] [--ffmpeg-dir D]
                             AMF settings against fixed clips: timings, frame sizes, SSIM and PSNR
   rcs-bench amf-probe|amf-ull --out DIR --adapter N [same options]   child processes of probe and ull";

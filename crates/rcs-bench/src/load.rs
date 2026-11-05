@@ -33,6 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 
+use crate::game_load;
 use crate::gpu_load::{self, GpuRenderer};
 use crate::options::Options;
 
@@ -47,6 +48,8 @@ pub enum LoadKind {
     Switch,
     /// A full-screen shader drawn without a frame cap, a stand-in for a game, see `gpu_load`.
     Gpu,
+    /// A real game, see `game_load`.
+    Game,
 }
 
 impl LoadKind {
@@ -56,6 +59,7 @@ impl LoadKind {
             "window" => Some(Self::Window),
             "switch" => Some(Self::Switch),
             "gpu" => Some(Self::Gpu),
+            "game" => Some(Self::Game),
             _ => None,
         }
     }
@@ -66,6 +70,7 @@ impl LoadKind {
             Self::Window => "window",
             Self::Switch => "switch",
             Self::Gpu => "gpu",
+            Self::Game => "game",
         }
     }
 }
@@ -351,6 +356,9 @@ fn set_mode(size: Option<(u32, u32)>) -> Result<(u32, u32), String> {
 pub fn run(options: &Options) -> Result<(), String> {
     let name = options.kind.as_deref().unwrap_or("window");
     let kind = LoadKind::parse(name).ok_or_else(|| format!("unknown load kind: {name}"))?;
+    if kind == LoadKind::Game {
+        return game_load::run(options);
+    }
     let _ = dxgi::set_dpi_awareness();
     fs::create_dir_all(&options.out)
         .map_err(|e| format!("cannot create {}: {e}", options.out.display()))?;
@@ -370,7 +378,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         }
         let screen = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
         let size = match kind {
-            LoadKind::Still | LoadKind::Gpu => screen,
+            LoadKind::Still | LoadKind::Gpu | LoadKind::Game => screen,
             LoadKind::Window | LoadKind::Switch => WINDOW_SIZE,
         };
         let hwnd = CreateWindowExW(
@@ -391,7 +399,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         (hwnd, screen)
     };
     let (width, height) = match kind {
-        LoadKind::Still | LoadKind::Gpu => screen,
+        LoadKind::Still | LoadKind::Gpu | LoadKind::Game => screen,
         LoadKind::Window | LoadKind::Switch => WINDOW_SIZE,
     };
     // The GPU load draws through its swap chain; the others paint a GDI back buffer.
@@ -427,7 +435,7 @@ pub fn run(options: &Options) -> Result<(), String> {
             break;
         }
         match kind {
-            LoadKind::Still => std::thread::sleep(Duration::from_millis(50)),
+            LoadKind::Still | LoadKind::Game => std::thread::sleep(Duration::from_millis(50)),
             LoadKind::Gpu => {
                 frames += 1;
                 let t = started.elapsed().as_secs_f32();

@@ -6,8 +6,10 @@
 //! - `switch`: only on request. The moving window, and 6 s into the load the display goes to 1280x720 for 6 s:
 //!   `ACCESS_LOST`, a new duplication with another size, a new encoder and an IDR (P1-2).
 //!
-//! Each scenario writes its own `capture.json`, `capture.h264` and `load.json` into a subfolder. The games
-//! scenario belongs to P1-10 and needs a game running, it is not started from here.
+//! - `gpu`: only on request. A full-screen shader without a frame cap, a stand-in for a game.
+//! - `game`: only on request. Xonotic plays its benchmark demo full screen at ultra settings (P1-10), see `game_load`.
+//!
+//! Each scenario writes its own `capture.json`, `capture.h264` and `load.json` into a subfolder.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,6 +30,7 @@ const CLIP_FILE: &str = "video-clip.mp4";
 const CLIP_SECONDS: u32 = 20;
 /// Time for the load to appear and settle before the capture starts.
 const WARMUP: Duration = Duration::from_secs(3);
+const GAME_WARMUP: Duration = Duration::from_secs(40);
 /// The load runs this much longer than the capture, so it never ends inside the measured window.
 const LOAD_TAIL_SECONDS: u32 = 5;
 /// A scenario keeps up when the capture misses at most this share of the desktop presents. A present counts as
@@ -45,6 +48,7 @@ enum Scenario {
     Video,
     Switch,
     Gpu,
+    Game,
 }
 
 /// Run when `--scenarios` is not given. `switch` changes the display mode and runs only on request.
@@ -53,7 +57,7 @@ const ALL: [Scenario; 3] = [Scenario::Static, Scenario::Window, Scenario::Video]
 impl Scenario {
     fn parse(name: &str) -> Option<Self> {
         ALL.into_iter()
-            .chain([Self::Switch, Self::Gpu])
+            .chain([Self::Switch, Self::Gpu, Self::Game])
             .find(|s| s.name() == name)
     }
 
@@ -64,6 +68,15 @@ impl Scenario {
             Self::Video => "video",
             Self::Switch => "switch",
             Self::Gpu => "gpu",
+            Self::Game => "game",
+        }
+    }
+
+    /// Time for the load to appear and settle before the capture starts; the game loads its map first.
+    fn warmup(self) -> Duration {
+        match self {
+            Self::Game => GAME_WARMUP,
+            _ => WARMUP,
         }
     }
 
@@ -139,13 +152,14 @@ fn start_load(
     clip: Option<&Path>,
     tools: Option<&Tools>,
 ) -> Result<Child, String> {
-    let seconds = options.seconds + WARMUP.as_secs() as u32 + LOAD_TAIL_SECONDS;
+    let seconds = options.seconds + scenario.warmup().as_secs() as u32 + LOAD_TAIL_SECONDS;
     let mut command = match scenario {
-        Scenario::Static | Scenario::Window | Scenario::Switch | Scenario::Gpu => {
+        Scenario::Static | Scenario::Window | Scenario::Switch | Scenario::Gpu | Scenario::Game => {
             let kind = match scenario {
                 Scenario::Static => LoadKind::Still,
                 Scenario::Switch => LoadKind::Switch,
                 Scenario::Gpu => LoadKind::Gpu,
+                Scenario::Game => LoadKind::Game,
                 _ => LoadKind::Window,
             };
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -159,6 +173,9 @@ fn start_load(
                 "--out",
             ])
             .arg(dir);
+            if let Some(game) = &options.game_exe {
+                c.arg("--game-exe").arg(game);
+            }
             c
         }
         Scenario::Video => {
@@ -321,8 +338,10 @@ pub fn run(options: &Options) -> Result<(), String> {
         Some(t) => Some(ensure_clip(t, &options.out)?),
         None => None,
     };
-    let total_s =
-        list.len() as u32 * (options.seconds + WARMUP.as_secs() as u32 + LOAD_TAIL_SECONDS);
+    let total_s = list
+        .iter()
+        .map(|s| options.seconds + s.warmup().as_secs() as u32 + LOAD_TAIL_SECONDS)
+        .sum::<u32>();
     println!(
         "Сценарии {}: по {} с, всего около {} мин. Окна нагрузки закрываются щелчком мыши.",
         list.iter().map(|s| s.name()).collect::<Vec<_>>().join(", "),
@@ -347,7 +366,7 @@ pub fn run(options: &Options) -> Result<(), String> {
                 continue;
             }
         };
-        std::thread::sleep(WARMUP);
+        std::thread::sleep(scenario.warmup());
         if let Ok(Some(status)) = child.try_wait() {
             let e = format!("the load stopped before the capture: {status}");
             failed.push(scenario.name());
