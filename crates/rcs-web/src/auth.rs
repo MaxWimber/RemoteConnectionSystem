@@ -404,14 +404,25 @@ fn expires_at(reference: &SessionRef) -> String {
     rfc3339(SystemTime::now() + reference.expires_in)
 }
 
-/// Runs `f` on the secrets file under the store lock, saving it when `f` says it changed.
-async fn with_secrets<T: Send + 'static>(
+/// One sign-in check at a time. The block is checked, `f` runs on the secrets file and a failure is counted under
+/// the same lock, so parallel requests cannot slip extra guesses past the limit. `f` returns the value on success
+/// (None is a wrong password or code) and whether the file changed.
+#[expect(
+    clippy::result_large_err,
+    reason = "the error is the finished HTTP reply, made once per sign-in request"
+)]
+async fn attempt<T: Send + 'static>(
     state: &Arc<AppState>,
-    f: impl FnOnce(&mut AuthFile) -> Result<(T, bool), String> + Send + 'static,
-) -> Result<T, String> {
+    ip: IpAddr,
+    step: &'static str,
+    f: impl FnOnce(&mut AuthFile) -> Result<(Option<T>, bool), String> + Send + 'static,
+) -> Result<T, Response> {
     let _turn = state.store_lock.lock().await;
+    if let Some(wait) = state.limiter.blocked(ip, Instant::now()) {
+        return Err(too_many(wait));
+    }
     let s = state.clone();
-    tokio::task::spawn_blocking(move || {
+    let checked = tokio::task::spawn_blocking(move || {
         let mut file = s.store.load()?;
         let (value, changed) = f(&mut file)?;
         if changed {
@@ -420,7 +431,13 @@ async fn with_secrets<T: Send + 'static>(
         Ok(value)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    match checked {
+        Err(e) => Err(server_error(&e)),
+        Ok(None) => Err(failed(state, ip, step)),
+        Ok(Some(value)) => Ok(value),
+    }
 }
 
 fn failed(state: &AppState, ip: IpAddr, step: &str) -> Response {
@@ -458,21 +475,17 @@ pub async fn login(
     let Some(password) = field(&body, "password") else {
         return json_error(StatusCode::BAD_REQUEST, "bad_request");
     };
-    let checked = {
-        let _permit = state.argon_permits.acquire().await;
-        with_secrets(&state, move |f| {
-            let ok = f
-                .password_hash
-                .as_deref()
-                .is_some_and(|h| verify_password(h, &password));
-            Ok((ok, false))
-        })
-        .await
-    };
+    let checked = attempt(&state, ip, "password", move |f| {
+        let ok = f
+            .password_hash
+            .as_deref()
+            .is_some_and(|h| verify_password(h, &password));
+        Ok((ok.then_some(()), false))
+    })
+    .await;
     match checked {
-        Err(e) => server_error(&e),
-        Ok(false) => failed(&state, ip, "password"),
-        Ok(true) => {
+        Err(r) => r,
+        Ok(()) => {
             // A browser that signs in again drops its earlier pending session.
             if let Some(old) = cookie_token(&headers)
                 && state
@@ -505,12 +518,11 @@ async fn second_step(
     ip: IpAddr,
     pending: SessionRef,
     method: &'static str,
-    checked: Result<Option<Value>, String>,
+    checked: Result<Value, Response>,
 ) -> Response {
     match checked {
-        Err(e) => server_error(&e),
-        Ok(None) => failed(&state, ip, method),
-        Ok(Some(extra)) => {
+        Err(r) => r,
+        Ok(extra) => {
             let Some((token, session, replaced)) =
                 state.sessions.promote(&pending.key, Instant::now())
             else {
@@ -553,7 +565,7 @@ pub async fn totp(
         return json_error(StatusCode::BAD_REQUEST, "bad_request");
     };
     let now_step = totp::step_of(unix_seconds(SystemTime::now()));
-    let checked = with_secrets(&state, move |f| {
+    let checked = attempt(&state, ip, "totp", move |f| {
         let secret = f.totp_secret()?;
         Ok(
             match totp::verify(&secret, &code, now_step, f.totp_last_step) {
@@ -584,7 +596,7 @@ pub async fn recovery(
     let Some(code) = field(&body, "code") else {
         return json_error(StatusCode::BAD_REQUEST, "bad_request");
     };
-    let checked = with_secrets(&state, move |f| {
+    let checked = attempt(&state, ip, "recovery", move |f| {
         Ok(if f.take_recovery_code(&code) {
             (
                 Some(json!({ "recovery_left": f.recovery_sha256.len() })),

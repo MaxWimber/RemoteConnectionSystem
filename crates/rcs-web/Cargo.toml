@@ -23,7 +23,7 @@ tracing-subscriber.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }

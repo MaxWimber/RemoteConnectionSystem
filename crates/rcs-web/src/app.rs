@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use rcs_protocol::agent::{Request, Response as AgentResponse};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Mutex, mpsc};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -37,15 +37,14 @@ pub struct AppState {
     pub limiter: Limiter,
     pub policy: Policy,
     pub store: Store,
-    /// One read-modify-write of the secrets file at a time.
+    /// One sign-in check at a time (`auth::attempt`): it reads and writes the secrets file, and one Argon2 run
+    /// (19 MiB, tens of milliseconds) at a time keeps a flood of attempts from taking the machine.
     pub store_lock: Mutex<()>,
     pub audit: Audit,
     /// The only `Origin` accepted, e.g. `https://maxwimber.ru:8444`.
     pub origin: String,
     /// `Path` of the cookie: the base path with a trailing slash.
     pub cookie_path: String,
-    /// Argon2 takes 19 MiB and tens of milliseconds; a flood of attempts must not take the machine.
-    pub argon_permits: Semaphore,
 }
 
 pub struct Settings {
@@ -71,7 +70,6 @@ impl AppState {
             audit: s.audit,
             origin: s.origin,
             cookie_path: format!("{}/", s.base),
-            argon_permits: Semaphore::new(2),
         }
     }
 }

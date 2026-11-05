@@ -560,6 +560,41 @@ async fn attempts_are_limited_per_address() {
 }
 
 #[tokio::test]
+async fn parallel_guesses_do_not_slip_past_the_limit() {
+    let f = fixture(Policy::default());
+    let pending = password_step(&f, "198.51.100.9").await;
+    let guesses = (0..20).map(|i| {
+        let req = post(
+            "/auth/totp",
+            json!({ "code": format!("{i:06}") }),
+            Some(&pending),
+            "198.51.100.9",
+        );
+        send(&f, req)
+    });
+    let replies = futures_util::future::join_all(guesses).await;
+    let checked = replies
+        .iter()
+        .filter(|r| r.status == StatusCode::UNAUTHORIZED)
+        .count();
+    let blocked = replies
+        .iter()
+        .filter(|r| r.status == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    // A code among 000000..000019 could be right by chance; it would then be the one 200.
+    assert!(checked <= 5, "{checked} codes were checked");
+    assert_eq!(
+        checked
+            + blocked
+            + replies
+                .iter()
+                .filter(|r| r.status == StatusCode::OK)
+                .count(),
+        20
+    );
+}
+
+#[tokio::test]
 async fn attempts_are_limited_in_total() {
     let f = fixture(Policy::default());
     for i in 0..20 {
