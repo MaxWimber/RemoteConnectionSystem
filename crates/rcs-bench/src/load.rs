@@ -33,6 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 
+use crate::gpu_load::{self, GpuRenderer};
 use crate::options::Options;
 
 pub const REPORT_FILE: &str = "load.json";
@@ -44,6 +45,8 @@ pub enum LoadKind {
     Window,
     /// The moving window plus a temporary display mode change, see `ModeSwitch`.
     Switch,
+    /// A full-screen shader drawn without a frame cap, a stand-in for a game, see `gpu_load`.
+    Gpu,
 }
 
 impl LoadKind {
@@ -52,6 +55,7 @@ impl LoadKind {
             "still" => Some(Self::Still),
             "window" => Some(Self::Window),
             "switch" => Some(Self::Switch),
+            "gpu" => Some(Self::Gpu),
             _ => None,
         }
     }
@@ -61,6 +65,7 @@ impl LoadKind {
             Self::Still => "still",
             Self::Window => "window",
             Self::Switch => "switch",
+            Self::Gpu => "gpu",
         }
     }
 }
@@ -365,7 +370,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         }
         let screen = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
         let size = match kind {
-            LoadKind::Still => screen,
+            LoadKind::Still | LoadKind::Gpu => screen,
             LoadKind::Window | LoadKind::Switch => WINDOW_SIZE,
         };
         let hwnd = CreateWindowExW(
@@ -386,13 +391,21 @@ pub fn run(options: &Options) -> Result<(), String> {
         (hwnd, screen)
     };
     let (width, height) = match kind {
-        LoadKind::Still => screen,
+        LoadKind::Still | LoadKind::Gpu => screen,
         LoadKind::Window | LoadKind::Switch => WINDOW_SIZE,
     };
-    let canvas = Canvas::new(hwnd, width, height)?;
-    canvas.draw_background();
-    canvas.draw_dynamic(0);
-    CANVAS.set(Some(canvas));
+    // The GPU load draws through its swap chain; the others paint a GDI back buffer.
+    let mut renderer = match kind {
+        LoadKind::Gpu => Some(GpuRenderer::new(hwnd, width as u32, height as u32)?),
+        _ => {
+            let canvas = Canvas::new(hwnd, width, height)?;
+            canvas.draw_background();
+            canvas.draw_dynamic(0);
+            CANVAS.set(Some(canvas));
+            None
+        }
+    };
+    let mut render_errors = 0u64;
     // SAFETY: the window is valid.
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -415,6 +428,16 @@ pub fn run(options: &Options) -> Result<(), String> {
         }
         match kind {
             LoadKind::Still => std::thread::sleep(Duration::from_millis(50)),
+            LoadKind::Gpu => {
+                frames += 1;
+                let t = started.elapsed().as_secs_f32();
+                if let Some(r) = renderer.as_mut()
+                    && r.render(t).is_err()
+                {
+                    render_errors += 1;
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+            }
             LoadKind::Window | LoadKind::Switch => {
                 frames += 1;
                 let t = started.elapsed().as_secs_f64();
@@ -451,6 +474,9 @@ pub fn run(options: &Options) -> Result<(), String> {
     }
     let elapsed = started.elapsed().as_secs_f64();
     let mode_events = switch.take().map(ModeSwitch::finish);
+    let tearing = renderer.as_ref().map(GpuRenderer::tearing);
+    // The swap chain goes before its window.
+    drop(renderer.take());
     // SAFETY: the window is valid and destroyed once.
     let _ = unsafe { DestroyWindow(hwnd) };
     CANVAS.set(None);
@@ -465,6 +491,10 @@ pub fn run(options: &Options) -> Result<(), String> {
         "window": { "width": width, "height": height },
         "screen": { "width": screen.0, "height": screen.1 },
         "mode_switch": mode_events,
+        "gpu": (kind == LoadKind::Gpu).then(|| json!({
+            "shader_iterations": gpu_load::SHADER_ITERATIONS, "render_errors": render_errors,
+            "tearing": tearing,
+        })),
     });
     let path = options.out.join(REPORT_FILE);
     let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;

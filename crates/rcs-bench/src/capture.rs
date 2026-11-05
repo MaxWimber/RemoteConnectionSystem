@@ -33,6 +33,9 @@ const WRITER_BUFFER_BYTES: usize = 1 << 20;
 const OUTPUT_TIMEOUT: Duration = Duration::from_millis(200);
 /// A frame that `AcquireNextFrame` returns faster than this was already waiting: the loop was busy when it came.
 const PENDING_FRAME_MS: f64 = 1.0;
+/// Credit a new frame needs, in frames. Below 1, so that a source at the display rate is never held back by timer
+/// jitter; each frame still costs a whole credit, so the average stays at the stream rate.
+const PACING_SHARE: f64 = 0.9;
 
 /// Per-frame stage times in milliseconds.
 #[derive(Default)]
@@ -101,6 +104,8 @@ struct Counters {
     merged_while_busy: u64,
     /// Presents merged although the loop was waiting: the source presented twice within one composition.
     merged_while_waiting: u64,
+    /// Presents merged while the loop held back to the stream rate: a source faster than the stream.
+    merged_by_pacing: u64,
     /// The first frames with any merge: captured frame number, merged presents, wait in milliseconds.
     merges: Vec<(u64, u32, f64)>,
     /// Rebuilds of device, capture and encoder after the GPU was lost, and how long each took.
@@ -453,8 +458,26 @@ pub fn measure(options: &Options) -> Result<Value, String> {
     let mut last_submit = started;
     let mut failure: Option<String> = None;
     let mut simulated_loss = false;
+    let mut credit = 1.0f64;
+    let mut credit_at = started;
 
     while started.elapsed() < duration {
+        // A source faster than the stream (a game without vsync) is sampled at the stream rate: the next new frame
+        // is taken no earlier than PACING_SHARE of an interval after the previous one. Presents merged meanwhile
+        // are dropped on purpose, not missed.
+        // Credit grows at the stream rate up to one frame; a frame needs PACING_SHARE of credit and costs one, so the
+        // long-run rate is exactly the stream rate while a source at the display rate never waits.
+        let mut paced = false;
+        let now = Instant::now();
+        credit = (credit + (now - credit_at).as_secs_f64() * fps).min(1.0);
+        credit_at = now;
+        if credit < PACING_SHARE {
+            std::thread::sleep(Duration::from_secs_f64((PACING_SHARE - credit) / fps));
+            paced = true;
+            let now = Instant::now();
+            credit = (credit + (now - credit_at).as_secs_f64() * fps).min(1.0);
+            credit_at = now;
+        }
         let wait_started = Instant::now();
         let mut repeat_due = false;
         let simulate_now = !simulated_loss
@@ -481,7 +504,9 @@ pub fn measure(options: &Options) -> Result<Value, String> {
                     let merged = frame.accumulated_frames.saturating_sub(1);
                     // The first frame carries everything presented before the duplication started.
                     if merged > 0 && session.counters.captured > 1 {
-                        if wait_ms < PENDING_FRAME_MS {
+                        if paced {
+                            session.counters.merged_by_pacing += u64::from(merged);
+                        } else if wait_ms < PENDING_FRAME_MS {
                             session.counters.merged_while_busy += u64::from(merged);
                         } else {
                             session.counters.merged_while_waiting += u64::from(merged);
@@ -492,6 +517,7 @@ pub fn measure(options: &Options) -> Result<Value, String> {
                         }
                     }
                     last_submit = Instant::now();
+                    credit -= 1.0;
                     if let Err(e) = session.submit(&frame, Some(wait_ms)) {
                         if device_lost(&device) {
                             warn!(error = %e, "device lost while encoding");
@@ -614,6 +640,7 @@ pub fn measure(options: &Options) -> Result<Value, String> {
             "desktop_presents_merged": capture.counters.accumulated_extra,
             "merged_while_busy": c.merged_while_busy,
             "merged_while_waiting": c.merged_while_waiting,
+            "merged_by_pacing": c.merged_by_pacing,
             "merges": c.merges.iter().map(|&(at, n, wait)| json!({
                 "frame": at, "merged": n, "wait_ms": (wait * 1000.0).round() / 1000.0,
             })).collect::<Vec<_>>(),

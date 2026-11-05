@@ -35,6 +35,8 @@ const LOAD_TAIL_SECONDS: u32 = 5;
 const MISSED_PRESENTS_LIMIT: f64 = 0.005;
 /// The source runs at the display rate when it presents at least this share of the refresh rate.
 const SOURCE_RATE_SHARE: f64 = 0.97;
+/// A source presenting this much faster than the display is treated as uncapped.
+const FASTER_SOURCE_SHARE: f64 = 1.1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scenario {
@@ -42,6 +44,7 @@ enum Scenario {
     Window,
     Video,
     Switch,
+    Gpu,
 }
 
 /// Run when `--scenarios` is not given. `switch` changes the display mode and runs only on request.
@@ -50,7 +53,7 @@ const ALL: [Scenario; 3] = [Scenario::Static, Scenario::Window, Scenario::Video]
 impl Scenario {
     fn parse(name: &str) -> Option<Self> {
         ALL.into_iter()
-            .chain([Self::Switch])
+            .chain([Self::Switch, Self::Gpu])
             .find(|s| s.name() == name)
     }
 
@@ -60,6 +63,7 @@ impl Scenario {
             Self::Window => "window",
             Self::Video => "video",
             Self::Switch => "switch",
+            Self::Gpu => "gpu",
         }
     }
 
@@ -137,10 +141,11 @@ fn start_load(
 ) -> Result<Child, String> {
     let seconds = options.seconds + WARMUP.as_secs() as u32 + LOAD_TAIL_SECONDS;
     let mut command = match scenario {
-        Scenario::Static | Scenario::Window | Scenario::Switch => {
+        Scenario::Static | Scenario::Window | Scenario::Switch | Scenario::Gpu => {
             let kind = match scenario {
                 Scenario::Static => LoadKind::Still,
                 Scenario::Switch => LoadKind::Switch,
+                Scenario::Gpu => LoadKind::Gpu,
                 _ => LoadKind::Window,
             };
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -230,10 +235,19 @@ fn summarize(scenario: Scenario, report: &Value, load: Value, load_exit: Option<
         0.0
     };
     let failure = report["failure"].clone();
+    // A source faster than the display (a game without vsync) is sampled at the stream rate, so merges are expected;
+    // there the pipeline keeps up when it encodes at the stream rate.
+    let target_fps = number(&report["options"]["fps"]).min(refresh.max(1.0));
+    let source_faster = presents_per_s > refresh * FASTER_SOURCE_SHARE;
+    let rate_ok = if source_faster {
+        number(&f["encoded_fps"]) >= target_fps * SOURCE_RATE_SHARE
+    } else {
+        missed_share <= MISSED_PRESENTS_LIMIT
+    };
     let kept_up = failure.is_null()
         && number(&f["lost_outputs"]) == 0.0
         && number(&f["pts_mismatch"]) == 0.0
-        && missed_share <= MISSED_PRESENTS_LIMIT;
+        && rate_ok;
     let source_at_rate = !scenario.moving() || presents_per_s >= refresh * SOURCE_RATE_SHARE;
     let stage = |key: &str| report["stages"][key]["summary"].clone();
     json!({
@@ -252,6 +266,7 @@ fn summarize(scenario: Scenario, report: &Value, load: Value, load_exit: Option<
         "missed_presents": missed,
         "missed_presents_percent": round(missed_share * 100.0, 3),
         "merged_by_source": f["merged_while_waiting"],
+        "merged_by_pacing": f["merged_by_pacing"],
         "late_frames": f["late_frames"],
         "lost_outputs": f["lost_outputs"],
         "idr": f["idr"],
