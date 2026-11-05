@@ -19,6 +19,9 @@ pub struct Options {
     pub rate_control: Option<i32>,
     /// Capture and scenarios: `auto`, `amf` or `mf`, as `media.encoder`.
     pub backend: rcs_encode::Backend,
+    /// Capture, for testing P1-2: at this second the run behaves as if the GPU was removed and rebuilds the device,
+    /// the capture and the encoder.
+    pub simulate_device_lost_at: Option<u32>,
     /// Load: `still` or `window`.
     pub kind: Option<String>,
     /// Scenarios: which ones to run, all when empty.
@@ -46,6 +49,7 @@ impl Default for Options {
             query_timeout_ms: None,
             rate_control: None,
             backend: rcs_encode::Backend::Auto,
+            simulate_device_lost_at: None,
             kind: None,
             scenarios: Vec::new(),
             ffmpeg_dir: None,
@@ -88,6 +92,9 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             "--encoder" => {
                 options.backend = rcs_encode::Backend::parse(value)
                     .ok_or_else(|| format!("{flag}: auto, amf or mf"))?
+            }
+            "--simulate-device-lost-at" => {
+                options.simulate_device_lost_at = Some(positive(flag, number()?)? as u32)
             }
             "--kind" => options.kind = Some(value.clone()),
             "--scenarios" => {

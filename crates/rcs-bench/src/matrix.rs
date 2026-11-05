@@ -121,6 +121,22 @@ fn variants(fps: i32) -> Vec<Variant> {
             "Intra-refresh выключен",
             &|c| c.intra_refresh_mbs = 0,
         ),
+        with(
+            "intra_refresh_continuous",
+            "Intra-refresh непрерывный, 255 MB на кадр (полный кадр за 32 кадра)",
+            &|c| {
+                c.intra_refresh_mode = 2;
+                c.intra_refresh_mbs = 255;
+            },
+        ),
+        with(
+            "intra_refresh_gop",
+            "Intra-refresh по GOP, 255 MB на кадр",
+            &|c| {
+                c.intra_refresh_mode = 1;
+                c.intra_refresh_mbs = 255;
+            },
+        ),
         with("vbaq_on", "VBAQ включён", &|c| c.vbaq = 1),
         with("filler_on", "Filler data включён", &|c| {
             c.filler_data = 1
@@ -594,7 +610,7 @@ pub fn run(options: &Options) -> Result<(), String> {
                     "width": c.width, "height": c.height, "bitrate": c.bitrate, "usage": c.usage,
                     "profile": c.profile, "rate_control": c.rate_control, "quality_preset": c.quality_preset,
                     "vbv_bits": c.vbv_bits, "enforce_hrd": c.enforce_hrd, "filler_data": c.filler_data,
-                    "intra_refresh_mbs": c.intra_refresh_mbs, "vbaq": c.vbaq, "max_au_bits": c.max_au_bits,
+                    "intra_refresh_mbs": c.intra_refresh_mbs, "intra_refresh_mode": c.intra_refresh_mode, "vbaq": c.vbaq, "max_au_bits": c.max_au_bits,
                     "query_timeout_ms": c.query_timeout_ms,
                 },
                 "encoder_settings": settings,

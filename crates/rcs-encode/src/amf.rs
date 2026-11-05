@@ -74,6 +74,8 @@ pub struct EncoderConfig {
     pub rate_control: i32,
     pub vbaq: i32,
     pub max_au_bits: i64,
+    /// -1 keeps the default (disabled on the server); 0 disabled, 1 GOP aligned, 2 continuous.
+    pub intra_refresh_mode: i32,
 }
 
 pub const USAGE_TRANSCODING: i32 = 0;
@@ -114,6 +116,7 @@ impl EncoderConfig {
             rate_control: RATE_CONTROL_LATENCY_CONSTRAINED_VBR,
             vbaq: -1,
             max_au_bits: 0,
+            intra_refresh_mode: -1,
         }
     }
 }

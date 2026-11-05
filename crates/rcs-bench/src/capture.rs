@@ -10,12 +10,16 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use rcs_capture::{Capture, CaptureEvent, CapturedFrame, DxgiCapture, TimerResolution, dxgi};
+use rcs_capture::{
+    Capture, CaptureError, CaptureEvent, CapturedFrame, DxgiCapture, TimerResolution, dxgi,
+};
 use rcs_encode::amf::EncoderConfig;
 use rcs_encode::{EncodedFrame, Encoder, h264};
 use rcs_protocol::BUILD_ID;
 use serde_json::{Value, json};
 use tracing::{info, info_span, warn};
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+use windows::Win32::Graphics::Dxgi::IDXGIAdapter1;
 
 use crate::logging;
 use crate::options::Options;
@@ -99,6 +103,9 @@ struct Counters {
     merged_while_waiting: u64,
     /// The first frames with any merge: captured frame number, merged presents, wait in milliseconds.
     merges: Vec<(u64, u32, f64)>,
+    /// Rebuilds of device, capture and encoder after the GPU was lost, and how long each took.
+    device_rebuilds: u64,
+    rebuild_ms: Vec<f64>,
 }
 
 const MERGES_KEPT: usize = 64;
@@ -351,6 +358,33 @@ pub fn set_dpi_awareness() {
     }
 }
 
+fn open_capture(
+    adapter: &IDXGIAdapter1,
+    options: &Options,
+) -> Result<(ID3D11Device, DxgiCapture), String> {
+    let (device, _) = dxgi::create_device(adapter).map_err(|e| dxgi::describe(&e))?;
+    let capture = DxgiCapture::new(adapter.clone(), device.clone(), options.display)
+        .map_err(|e| e.to_string())?;
+    Ok((device, capture))
+}
+
+/// After the GPU was removed or reset: a new adapter object, device, capture and encoder, as the agent will do.
+fn rebuild(options: &Options) -> Result<(ID3D11Device, DxgiCapture, Box<dyn Encoder>), String> {
+    let adapters = dxgi::enumerate_adapters().map_err(|e| dxgi::describe(&e))?;
+    let adapter = probe::encoder_adapter(&adapters).ok_or("no hardware adapter after the reset")?;
+    let (device, capture) = open_capture(&adapter.adapter, options)?;
+    let config = encoder_config(options, capture.size());
+    let encoder = rcs_encode::open(options.backend, &device, &config)
+        .map_err(|e| format!("encoder after the reset: {e}"))?;
+    Ok((device, capture, encoder))
+}
+
+/// True when the device is gone and only a rebuild helps.
+fn device_lost(device: &ID3D11Device) -> bool {
+    // SAFETY: the device is valid; the call only reads its state.
+    unsafe { device.GetDeviceRemovedReason() }.is_err()
+}
+
 /// One capture run into `options.out`. A failure during the run is recorded in the report's `failure`;
 /// `Err` means the run could not start or the report could not be written.
 pub fn measure(options: &Options) -> Result<Value, String> {
@@ -360,9 +394,7 @@ pub fn measure(options: &Options) -> Result<Value, String> {
 
     let adapters = dxgi::enumerate_adapters().map_err(|e| dxgi::describe(&e))?;
     let adapter = probe::encoder_adapter(&adapters).ok_or("no hardware adapter")?;
-    let (device, _) = dxgi::create_device(&adapter.adapter).map_err(|e| dxgi::describe(&e))?;
-    let mut capture = DxgiCapture::new(adapter.adapter.clone(), device.clone(), options.display)
-        .map_err(|e| e.to_string())?;
+    let (mut device, mut capture) = open_capture(&adapter.adapter, options)?;
     let mut input_size = capture.size();
     let config = encoder_config(options, input_size);
     let backend = options.backend;
@@ -420,66 +452,111 @@ pub fn measure(options: &Options) -> Result<Value, String> {
     };
     let mut last_submit = started;
     let mut failure: Option<String> = None;
+    let mut simulated_loss = false;
 
     while started.elapsed() < duration {
         let wait_started = Instant::now();
         let mut repeat_due = false;
-        // Wait for a new frame, but not past the moment the last frame is due again.
-        let wait = match repeat_interval {
-            Some(r) if capture.last_frame().is_some() => r
-                .saturating_sub(last_submit.elapsed())
-                .clamp(Duration::from_millis(1), frame_interval),
-            _ => frame_interval,
-        };
-        match capture.next_frame(wait) {
-            Ok(CaptureEvent::Frame(frame)) => {
-                let wait_ms = (frame.acquired - wait_started).as_secs_f64() * 1000.0;
-                session.counters.captured += 1;
-                let merged = frame.accumulated_frames.saturating_sub(1);
-                // The first frame carries everything presented before the duplication started.
-                if merged > 0 && session.counters.captured > 1 {
-                    if wait_ms < PENDING_FRAME_MS {
-                        session.counters.merged_while_busy += u64::from(merged);
-                    } else {
-                        session.counters.merged_while_waiting += u64::from(merged);
-                    }
-                    if session.counters.merges.len() < MERGES_KEPT {
-                        let at = session.counters.captured;
-                        session.counters.merges.push((at, merged, wait_ms));
-                    }
-                }
-                last_submit = Instant::now();
-                if let Err(e) = session.submit(&frame, Some(wait_ms)) {
-                    failure = Some(e);
-                    break;
-                }
-            }
-            Ok(CaptureEvent::Timeout) => {
-                repeat_due = repeat_interval.is_some_and(|r| last_submit.elapsed() >= r);
-            }
-            Ok(CaptureEvent::Reinitialize) => {
-                session.counters.reinitialized += 1;
-                session.force_idr = true;
-                let size = capture.size();
-                if size != input_size && size.0 > 0 {
-                    warn!(?size, "display size changed, recreating the encoder");
-                    match rcs_encode::open(backend, &device, &encoder_config(options, size)) {
-                        Ok(encoder) => {
-                            session.encoder = encoder;
-                            session.counters.encoders_created += 1;
-                            input_size = size;
+        let simulate_now = !simulated_loss
+            && options
+                .simulate_device_lost_at
+                .is_some_and(|at| started.elapsed() >= Duration::from_secs(u64::from(at)));
+        if simulate_now {
+            simulated_loss = true;
+            warn!("simulated device loss");
+        }
+        let mut rebuild_needed = simulate_now;
+        if !simulate_now {
+            // Wait for a new frame, but not past the moment the last frame is due again.
+            let wait = match repeat_interval {
+                Some(r) if capture.last_frame().is_some() => r
+                    .saturating_sub(last_submit.elapsed())
+                    .clamp(Duration::from_millis(1), frame_interval),
+                _ => frame_interval,
+            };
+            match capture.next_frame(wait) {
+                Ok(CaptureEvent::Frame(frame)) => {
+                    let wait_ms = (frame.acquired - wait_started).as_secs_f64() * 1000.0;
+                    session.counters.captured += 1;
+                    let merged = frame.accumulated_frames.saturating_sub(1);
+                    // The first frame carries everything presented before the duplication started.
+                    if merged > 0 && session.counters.captured > 1 {
+                        if wait_ms < PENDING_FRAME_MS {
+                            session.counters.merged_while_busy += u64::from(merged);
+                        } else {
+                            session.counters.merged_while_waiting += u64::from(merged);
                         }
-                        Err(e) => {
-                            failure = Some(format!("encoder after a mode change: {e}"));
+                        if session.counters.merges.len() < MERGES_KEPT {
+                            let at = session.counters.captured;
+                            session.counters.merges.push((at, merged, wait_ms));
+                        }
+                    }
+                    last_submit = Instant::now();
+                    if let Err(e) = session.submit(&frame, Some(wait_ms)) {
+                        if device_lost(&device) {
+                            warn!(error = %e, "device lost while encoding");
+                            rebuild_needed = true;
+                        } else {
+                            failure = Some(e);
                             break;
                         }
                     }
                 }
+                Ok(CaptureEvent::Timeout) => {
+                    repeat_due = repeat_interval.is_some_and(|r| last_submit.elapsed() >= r);
+                }
+                Ok(CaptureEvent::Reinitialize) => {
+                    session.counters.reinitialized += 1;
+                    session.force_idr = true;
+                    let size = capture.size();
+                    if size != input_size && size.0 > 0 {
+                        warn!(?size, "display size changed, recreating the encoder");
+                        match rcs_encode::open(backend, &device, &encoder_config(options, size)) {
+                            Ok(encoder) => {
+                                session.encoder = encoder;
+                                session.counters.encoders_created += 1;
+                                input_size = size;
+                            }
+                            Err(e) => {
+                                failure = Some(format!("encoder after a mode change: {e}"));
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(CaptureError::DeviceRemoved(e)) => {
+                    warn!(error = %dxgi::describe(&e), "device lost while capturing");
+                    rebuild_needed = true;
+                }
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    break;
+                }
             }
-            Err(e) => {
-                failure = Some(e.to_string());
-                break;
+        }
+        if rebuild_needed {
+            let rebuild_started = Instant::now();
+            capture.release();
+            match rebuild(options) {
+                Ok((new_device, mut new_capture, new_encoder)) => {
+                    new_capture.counters.absorb(&capture.counters);
+                    device = new_device;
+                    capture = new_capture;
+                    session.encoder = new_encoder;
+                    input_size = capture.size();
+                    session.force_idr = true;
+                    session.counters.device_rebuilds += 1;
+                    session.counters.encoders_created += 1;
+                    let ms = rebuild_started.elapsed().as_secs_f64() * 1000.0;
+                    session.counters.rebuild_ms.push(ms);
+                    info!(ms, "pipeline rebuilt");
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
             }
+            continue;
         }
         if repeat_due && let Some(frame) = capture.last_frame() {
             session.counters.repeated += 1;
@@ -553,7 +630,12 @@ pub fn measure(options: &Options) -> Result<Value, String> {
             "access_lost": capture.counters.access_lost,
             "reinitialized": c.reinitialized,
             "pool_recreated": capture.counters.pool_recreated,
+            "reopen_failures": capture.counters.reopen_failures,
+            "last_reopen_error": capture.counters.last_reopen_error,
             "encoders_created": c.encoders_created,
+            "device_rebuilds": c.device_rebuilds,
+            "rebuild_ms": c.rebuild_ms.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>(),
+            "simulated_device_loss_at_s": options.simulate_device_lost_at,
         },
         "memory": {
             "desktop_in_system_memory": capture.memory.desktop_in_system_memory,

@@ -3,6 +3,8 @@
 //! - `static`: a full-screen still test pattern, the encoder only sees repeats of the last frame.
 //! - `window`: a 960x600 window with changing content moves across the screen at the display rate.
 //! - `video`: ffplay shows a synthetic 1080p60 clip full screen: moving gradients, a test card and film-like noise.
+//! - `switch`: only on request. The moving window, and 6 s into the load the display goes to 1280x720 for 6 s:
+//!   `ACCESS_LOST`, a new duplication with another size, a new encoder and an IDR (P1-2).
 //!
 //! Each scenario writes its own `capture.json`, `capture.h264` and `load.json` into a subfolder. The games
 //! scenario belongs to P1-10 and needs a game running, it is not started from here.
@@ -39,13 +41,17 @@ enum Scenario {
     Static,
     Window,
     Video,
+    Switch,
 }
 
+/// Run when `--scenarios` is not given. `switch` changes the display mode and runs only on request.
 const ALL: [Scenario; 3] = [Scenario::Static, Scenario::Window, Scenario::Video];
 
 impl Scenario {
     fn parse(name: &str) -> Option<Self> {
-        ALL.into_iter().find(|s| s.name() == name)
+        ALL.into_iter()
+            .chain([Self::Switch])
+            .find(|s| s.name() == name)
     }
 
     fn name(self) -> &'static str {
@@ -53,6 +59,7 @@ impl Scenario {
             Self::Static => "static",
             Self::Window => "window",
             Self::Video => "video",
+            Self::Switch => "switch",
         }
     }
 
@@ -130,11 +137,11 @@ fn start_load(
 ) -> Result<Child, String> {
     let seconds = options.seconds + WARMUP.as_secs() as u32 + LOAD_TAIL_SECONDS;
     let mut command = match scenario {
-        Scenario::Static | Scenario::Window => {
-            let kind = if scenario == Scenario::Static {
-                LoadKind::Still
-            } else {
-                LoadKind::Window
+        Scenario::Static | Scenario::Window | Scenario::Switch => {
+            let kind = match scenario {
+                Scenario::Static => LoadKind::Still,
+                Scenario::Switch => LoadKind::Switch,
+                _ => LoadKind::Window,
             };
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
             let mut c = Command::new(exe);
@@ -232,6 +239,8 @@ fn summarize(scenario: Scenario, report: &Value, load: Value, load_exit: Option<
     json!({
         "scenario": scenario.name(),
         "failure": failure,
+        "capture": report["capture"],
+        "forced_idr": f["forced_idr"],
         "elapsed_s": report["elapsed_s"],
         "refresh_hz": refresh,
         "desktop_presents_per_s": round(presents_per_s, 2),

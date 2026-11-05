@@ -205,7 +205,7 @@ limited range. Остальные биты SPS копируются без из�
 | ID | Вопрос | Когда закрыть | Запасной вариант |
 |---|---|---|---|
 | Q-01 | Закрыт, D-016. Ultra Low Latency не проходит `Init` из-за ошибки среды AMF 1.4.31: режим закрывает `RateControlPreanalysisEnable`, а `Init` его читает. Используется Low Latency, p95 9,4 мс на 1080p | Фаза 1 | Low Latency |
-| Q-02 | Режимы intra-refresh и профиль H.264 в браузерах. Кодировщик: High 4.2 работает, есть `IntraRefreshMode` (выключен, по GOP, непрерывный) и `IntraRefreshMBsNumberPerSlot` | Фазы 1–2 | IDR по запросу, Constrained Baseline |
+| Q-02 | Часть кодировщика закрыта 2026-11-05: High 4.2 работает, Constrained Baseline тоже. `IntraRefreshMode` (по GOP, непрерывный) и `IntraRefreshMBsNumberPerSlot` среда принимает и читает обратно, но поток побайтно совпадает с выключенным режимом: на VCE 3.4 с AMF 1.4.31 intra-refresh не работает. Восстановление через IDR по запросу, с LCVBR (D-018) IDR не больше одного кадра. Открыто: профиль и восстановление в Chrome, Edge и Chrome на Android | Фаза 2 | Constrained Baseline |
 | Q-03 | `str0m` против `webrtc-rs`: текущая зрелость и задержка | Фаза 2 | `webrtc-rs` |
 | Q-04 | Поддержка `playout-delay` в выбранной библиотеке | Фаза 2 | `jitterBufferTarget` |
 | Q-05 | Контроль перегрузки выбранной библиотеки | Фаза 8 | Адаптация по потерям и RTT |

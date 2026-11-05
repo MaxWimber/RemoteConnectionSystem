@@ -47,6 +47,7 @@ typedef struct RcsAmfEncoderConfig {
     int32_t rate_control;       // AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_ENUM; target and peak are both bitrate
     int32_t vbaq;               // -1 keeps the default, otherwise bool
     int64_t max_au_bits;        // 0 keeps the default, otherwise the largest access unit in bits
+    int32_t intra_refresh_mode; // -1 keeps the default; 0 disabled, 1 GOP aligned, 2 continuous
 } RcsAmfEncoderConfig;
 
 typedef struct RcsAmfSubmitInfo {

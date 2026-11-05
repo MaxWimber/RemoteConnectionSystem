@@ -2,21 +2,25 @@
 //!
 //! A topmost popup window that never takes focus. `still` covers the screen with a fixed test pattern and does not
 //! redraw it. `window` moves a 960x600 window with changing content along a curve once per desktop composition, like
-//! a window being dragged. A click on the window ends it early. The result goes to `load.json` in the output folder.
+//! a window being dragged. `switch` does the same and in the middle switches the display to 1280x720 for a few seconds,
+//! which makes Desktop Duplication report `ACCESS_LOST`. A click on the window ends it early. The result goes to
+//! `load.json` in the output folder.
 
 use std::cell::RefCell;
 use std::fs;
 use std::time::{Duration, Instant};
 
 use rcs_capture::dxgi;
-use serde_json::json;
+use serde_json::{Value, json};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush,
-    DeleteDC, DeleteObject, EndPaint, FillRect, GetDC, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
-    InvalidateRect, PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT, TextOutW, UpdateWindow,
+    BeginPaint, BitBlt, CDS_FULLSCREEN, CDS_TYPE, ChangeDisplaySettingsExW, CreateCompatibleBitmap,
+    CreateCompatibleDC, CreateFontW, CreateSolidBrush, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
+    DM_PELSHEIGHT, DM_PELSWIDTH, DeleteDC, DeleteObject, ENUM_CURRENT_SETTINGS, EndPaint,
+    EnumDisplaySettingsW, FillRect, GetDC, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect,
+    PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+    UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -38,6 +42,8 @@ const WINDOW_SIZE: (i32, i32) = (960, 600);
 pub enum LoadKind {
     Still,
     Window,
+    /// The moving window plus a temporary display mode change, see `ModeSwitch`.
+    Switch,
 }
 
 impl LoadKind {
@@ -45,6 +51,7 @@ impl LoadKind {
         match name {
             "still" => Some(Self::Still),
             "window" => Some(Self::Window),
+            "switch" => Some(Self::Switch),
             _ => None,
         }
     }
@@ -53,6 +60,7 @@ impl LoadKind {
         match self {
             Self::Still => "still",
             Self::Window => "window",
+            Self::Switch => "switch",
         }
     }
 }
@@ -251,6 +259,90 @@ fn pump() -> bool {
     true
 }
 
+/// When the `switch` load changes the display mode and when it restores it.
+const SWITCH_AT: Duration = Duration::from_secs(6);
+const RESTORE_AT: Duration = Duration::from_secs(12);
+const SWITCH_SIZE: (u32, u32) = (1280, 720);
+
+/// A temporary display mode. `CDS_FULLSCREEN` keeps it out of the registry: Windows puts the saved mode back when
+/// this process ends, even after a crash, and `finish` restores it explicitly anyway.
+#[derive(Default)]
+struct ModeSwitch {
+    switched: bool,
+    restored: bool,
+    events: Vec<Value>,
+    started: Option<Instant>,
+}
+
+impl ModeSwitch {
+    fn step(&mut self, elapsed: Duration) {
+        let started = *self.started.get_or_insert_with(Instant::now);
+        if !self.switched && elapsed >= SWITCH_AT {
+            self.switched = true;
+            let result = set_mode(Some(SWITCH_SIZE));
+            self.record(started, "switch", result);
+        } else if self.switched && !self.restored && elapsed >= RESTORE_AT {
+            self.restore(started);
+        }
+    }
+
+    fn restore(&mut self, started: Instant) {
+        self.restored = true;
+        let result = set_mode(None);
+        self.record(started, "restore", result);
+    }
+
+    fn record(&mut self, started: Instant, what: &str, result: Result<(u32, u32), String>) {
+        let at = (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
+        self.events.push(match result {
+            Ok((w, h)) => json!({ "at_s": at, "event": what, "mode": format!("{w}x{h}") }),
+            Err(e) => json!({ "at_s": at, "event": what, "error": e }),
+        });
+    }
+
+    fn finish(mut self) -> Value {
+        if self.switched && !self.restored {
+            let started = self.started.unwrap_or_else(Instant::now);
+            self.restore(started);
+        }
+        Value::Array(self.events)
+    }
+}
+
+/// Switches the primary display to `size` at the current refresh rate, or back to the saved mode with `None`.
+/// Returns the mode now in use.
+fn set_mode(size: Option<(u32, u32)>) -> Result<(u32, u32), String> {
+    let result = match size {
+        Some((width, height)) => {
+            let mut mode = DEVMODEW {
+                dmSize: size_of::<DEVMODEW>() as u16,
+                ..Default::default()
+            };
+            // SAFETY: the structure is a live local with its size set.
+            if !unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut mode) }.as_bool() {
+                return Err("EnumDisplaySettings failed".into());
+            }
+            mode.dmPelsWidth = width;
+            mode.dmPelsHeight = height;
+            mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+            // SAFETY: the mode is a live local; the change is temporary (CDS_FULLSCREEN).
+            unsafe { ChangeDisplaySettingsExW(None, Some(&mode), None, CDS_FULLSCREEN, None) }
+        }
+        // SAFETY: no mode restores the one saved in the registry.
+        None => unsafe { ChangeDisplaySettingsExW(None, None, None, CDS_TYPE(0), None) },
+    };
+    if result != DISP_CHANGE_SUCCESSFUL {
+        return Err(format!("ChangeDisplaySettingsEx returned {}", result.0));
+    }
+    let mut now = DEVMODEW {
+        dmSize: size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    // SAFETY: as above.
+    let _ = unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut now) };
+    Ok((now.dmPelsWidth, now.dmPelsHeight))
+}
+
 pub fn run(options: &Options) -> Result<(), String> {
     let name = options.kind.as_deref().unwrap_or("window");
     let kind = LoadKind::parse(name).ok_or_else(|| format!("unknown load kind: {name}"))?;
@@ -274,7 +366,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         let screen = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
         let size = match kind {
             LoadKind::Still => screen,
-            LoadKind::Window => WINDOW_SIZE,
+            LoadKind::Window | LoadKind::Switch => WINDOW_SIZE,
         };
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
@@ -295,7 +387,7 @@ pub fn run(options: &Options) -> Result<(), String> {
     };
     let (width, height) = match kind {
         LoadKind::Still => screen,
-        LoadKind::Window => WINDOW_SIZE,
+        LoadKind::Window | LoadKind::Switch => WINDOW_SIZE,
     };
     let canvas = Canvas::new(hwnd, width, height)?;
     canvas.draw_background();
@@ -312,14 +404,18 @@ pub fn run(options: &Options) -> Result<(), String> {
     let mut frames = 0u64;
     let mut flush_failures = 0u64;
     let mut closed_by_click = false;
+    let mut switch = (kind == LoadKind::Switch).then(ModeSwitch::default);
     while started.elapsed() < duration {
+        if let Some(s) = switch.as_mut() {
+            s.step(started.elapsed());
+        }
         if !pump() {
             closed_by_click = true;
             break;
         }
         match kind {
             LoadKind::Still => std::thread::sleep(Duration::from_millis(50)),
-            LoadKind::Window => {
+            LoadKind::Window | LoadKind::Switch => {
                 frames += 1;
                 let t = started.elapsed().as_secs_f64();
                 let (free_x, free_y) = (f64::from(screen.0 - width), f64::from(screen.1 - height));
@@ -354,6 +450,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         }
     }
     let elapsed = started.elapsed().as_secs_f64();
+    let mode_events = switch.take().map(ModeSwitch::finish);
     // SAFETY: the window is valid and destroyed once.
     let _ = unsafe { DestroyWindow(hwnd) };
     CANVAS.set(None);
@@ -367,6 +464,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         "closed_by_click": closed_by_click,
         "window": { "width": width, "height": height },
         "screen": { "width": screen.0, "height": screen.1 },
+        "mode_switch": mode_events,
     });
     let path = options.out.join(REPORT_FILE);
     let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;

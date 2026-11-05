@@ -83,6 +83,26 @@ pub struct CaptureCounters {
     pub access_lost: u64,
     pub accumulated_extra: u64,
     pub pool_recreated: u64,
+    /// Attempts to recreate the duplication that failed, for example while the secure desktop is shown.
+    pub reopen_failures: u64,
+    /// The last of those failures.
+    pub last_reopen_error: Option<String>,
+}
+
+impl CaptureCounters {
+    /// Adds the counts of a capture this one replaced, so a report covers the whole run.
+    pub fn absorb(&mut self, old: &CaptureCounters) {
+        self.frames += old.frames;
+        self.timeouts += old.timeouts;
+        self.pointer_only += old.pointer_only;
+        self.access_lost += old.access_lost;
+        self.accumulated_extra += old.accumulated_extra;
+        self.pool_recreated += old.pool_recreated;
+        self.reopen_failures += old.reopen_failures;
+        if self.last_reopen_error.is_none() {
+            self.last_reopen_error = old.last_reopen_error.clone();
+        }
+    }
 }
 
 /// Facts that show the frame stays in video memory.
@@ -154,6 +174,16 @@ impl DxgiCapture {
 
     pub fn device(&self) -> &ID3D11Device {
         &self.device
+    }
+
+    /// Lets go of the duplication and the pool. A process may hold one duplication per output, so this must happen
+    /// before a new `DxgiCapture` is made for the same output, for example after the device was lost. The next
+    /// `next_frame` on this object opens the duplication again.
+    pub fn release(&mut self) {
+        self.duplication = None;
+        self.pool.clear();
+        self.last = None;
+        self.next = 0;
     }
 
     /// Refresh rate of the duplicated output in Hz, 0 when the mode does not report one.
@@ -252,8 +282,18 @@ fn classify(error: Error) -> CaptureError {
 impl Capture for DxgiCapture {
     fn next_frame(&mut self, timeout: Duration) -> Result<CaptureEvent<'_>, CaptureError> {
         if self.duplication.is_none() {
-            self.reopen()?;
-            return Ok(CaptureEvent::Reinitialize);
+            return match self.reopen() {
+                Ok(()) => Ok(CaptureEvent::Reinitialize),
+                Err(CaptureError::Failed(error)) => {
+                    // The output is not available yet: secure desktop, mode switch in progress, or a full-screen
+                    // app. Wait like a timeout and try again on the next call.
+                    self.counters.reopen_failures += 1;
+                    self.counters.last_reopen_error = Some(dxgi::describe(&error));
+                    std::thread::sleep(timeout);
+                    Ok(CaptureEvent::Timeout)
+                }
+                Err(removed) => Err(removed),
+            };
         }
         let duplication = self.duplication.as_ref().expect("checked above");
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();

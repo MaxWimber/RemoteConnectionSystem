@@ -60,6 +60,7 @@ const Readback kEncoderReadback[] = {
     {"enforce_hrd", AMF_VIDEO_ENCODER_ENFORCE_HRD},
     {"filler_data", AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE},
     {"intra_refresh_mbs_per_slot", AMF_VIDEO_ENCODER_INTRA_REFRESH_NUM_MBS_PER_SLOT},
+    {"intra_refresh_mode", L"IntraRefreshMode"},
     {"vbaq", AMF_VIDEO_ENCODER_ENABLE_VBAQ},
     {"max_au_size", AMF_VIDEO_ENCODER_MAX_AU_SIZE},
     {"query_timeout", AMF_VIDEO_ENCODER_QUERY_TIMEOUT},
@@ -193,6 +194,11 @@ bool RcsAmfEncoder::start(ID3D11Device* device, const RcsAmfEncoderConfig& c) {
         return false;
     if (c.intra_refresh_mbs >= 0 && !set(this, encoder, AMF_VIDEO_ENCODER_INTRA_REFRESH_NUM_MBS_PER_SLOT,
                                          static_cast<amf_int64>(c.intra_refresh_mbs)))
+        return false;
+    // "IntraRefreshMode" is not in the AVC header of SDK 1.5.3; the name and values come from the property catalog
+    // of the runtime on the server (rcs-bench probe): 0 Disabled, 1 GopAligned, 2 Continuous.
+    if (c.intra_refresh_mode >= 0 &&
+        !set(this, encoder, L"IntraRefreshMode", static_cast<amf_int64>(c.intra_refresh_mode)))
         return false;
     if (c.vbaq >= 0 && !set(this, encoder, AMF_VIDEO_ENCODER_ENABLE_VBAQ, c.vbaq != 0)) return false;
     if (c.max_au_bits > 0 &&
