@@ -12,13 +12,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use str0m::change::SdpOffer;
 use str0m::format::Codec;
 use str0m::media::{MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
-use str0m::rtp::Extension;
+use str0m::rtp::{AbsCaptureTime, Extension};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tracing::{debug, info, warn};
 
@@ -31,6 +31,7 @@ const IDLE_WAIT: Duration = Duration::from_millis(50);
 const WAKE: [u8; 1] = [0x5a];
 /// Free in the standard map of str0m; the answer follows the ids of the offer anyway.
 const PLAYOUT_DELAY_ID: u8 = 6;
+const ABS_CAPTURE_TIME_ID: u8 = 7;
 /// Largest datagram we expect; ICE, DTLS and RTCP from browsers fit easily.
 const RECV_BUFFER: usize = 2048;
 
@@ -349,6 +350,8 @@ impl NetworkLoop {
             .clear_codecs()
             .enable_h264(true)
             .set_extension(PLAYOUT_DELAY_ID, Extension::PlayoutDelay)
+            // The capture time lets the browser report capture -> display latency (requestVideoFrameCallback).
+            .set_extension(ABS_CAPTURE_TIME_ID, Extension::AbsoluteCaptureTime)
             .build(now);
         for addr in &self.config.advertise {
             match Candidate::host(*addr, "udp") {
@@ -411,13 +414,17 @@ impl NetworkLoop {
                     );
                     let size = frame.data.len() as u64;
                     // Zero playout delay asks the browser to show frames as soon as they are decoded (Q-04).
+                    // Wall-clock time of the capture: the same machine captures and sends, so the offset is zero.
+                    let capture_time = SystemTime::now()
+                        .checked_sub(frame.captured.elapsed())
+                        .unwrap_or(SystemTime::now());
                     let written = session.rtc.writer(mid).map(|w| {
-                        w.playout_delay(MediaTime::ZERO, MediaTime::ZERO).write(
-                            pt,
-                            frame.captured,
-                            rtp_time,
-                            frame.data.as_slice(),
-                        )
+                        w.playout_delay(MediaTime::ZERO, MediaTime::ZERO)
+                            .abs_capture_time(AbsCaptureTime {
+                                capture_time,
+                                clock_offset: Some(0),
+                            })
+                            .write(pt, frame.captured, rtp_time, frame.data.as_slice())
                     });
                     match written {
                         Some(Ok(())) => {

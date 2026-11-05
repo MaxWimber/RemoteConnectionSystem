@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { buildReport, download, installErrorCapture, logEvent, recordSample } from '../stream/diagnostics';
+import { LatencyMeter, type LatencySummary } from '../stream/latency';
 import { StreamSession, type SessionState } from '../stream/session';
 import { summarize, toMap, type StatsMap, type StreamSummary } from '../stream/stats';
 import { appTitle } from './title';
@@ -29,6 +30,8 @@ export function App() {
   const [detail, setDetail] = useState<string>('');
   const [showStats, setShowStats] = useState(false);
   const [summary, setSummary] = useState<StreamSummary | null>(null);
+  const [latency, setLatency] = useState<LatencySummary | null>(null);
+  const meter = useRef<LatencyMeter | null>(null);
 
   useEffect(() => {
     installErrorCapture();
@@ -45,7 +48,14 @@ export function App() {
     });
     session.current = s;
     s.start();
-    return () => s.stop();
+    if (video.current) {
+      meter.current = new LatencyMeter(video.current);
+      meter.current.start();
+    }
+    return () => {
+      meter.current?.stop();
+      s.stop();
+    };
   }, []);
 
   // getStats once a second: the panel, and samples for the diagnostics file.
@@ -57,10 +67,12 @@ export function App() {
         const now = toMap(await pc.getStats());
         const s = summarize(now, lastStats.current ?? undefined);
         lastStats.current = now;
+        const l = meter.current?.summary() ?? null;
         if (s) {
-          recordSample(s);
+          recordSample(s, l);
           setSummary(s);
         }
+        setLatency(l);
       } catch (e) {
         logEvent(`getStats: ${String(e)}`);
       }
@@ -136,6 +148,11 @@ export function App() {
           <div>
             буфер {fmt(summary?.jitterBufferMs ?? null)} мс · декод. {fmt(summary?.decodeMs ?? null)} мс · обработка{' '}
             {fmt(summary?.processingMs ?? null)} мс · RTT {fmt(summary?.rttMs ?? null)} мс
+          </div>
+          <div>
+            захват→показ p50 {fmt(latency?.captureToDisplayP50 ?? null)} / p95 {fmt(latency?.captureToDisplayP95 ?? null)}{' '}
+            мс · захват→приём {fmt(latency?.captureToReceiveP50 ?? null)} мс · приём→показ{' '}
+            {fmt(latency?.receiveToDisplayP50 ?? null)} мс
           </div>
           <div>
             потеряно {summary?.packetsLost ?? 0} · NACK {summary?.nackCount ?? 0} · PLI {summary?.pliCount ?? 0} ·

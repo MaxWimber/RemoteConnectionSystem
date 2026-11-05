@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { backoffMs, h264First } from './session';
+import { ABS_CAPTURE_TIME, backoffMs, h264First, withAbsCaptureTime } from './session';
 import { parseServerMessage, signalUrl } from './signaling';
 
 test('reconnect waits grow and stop at five seconds', () => {
@@ -31,4 +31,14 @@ test('server messages of another version or shape are errors', () => {
   expect(parseServerMessage('{"v":2,"type":"answer","sdp":"v=0"}')).toMatchObject({ code: 'protocol_mismatch' });
   expect(parseServerMessage('nonsense')).toMatchObject({ code: 'bad_message' });
   expect(parseServerMessage('{"v":1,"type":"session-replaced"}').type).toBe('session-replaced');
+});
+
+test('abs-capture-time is switched from stopped to recvonly, nothing else changes', () => {
+  const list = [
+    { uri: 'urn:ietf:params:rtp-hdrext:sdes:mid', direction: 'sendrecv' as const },
+    { uri: ABS_CAPTURE_TIME, direction: 'stopped' as const },
+    { uri: 'http://www.webrtc.org/experiments/rtp-hdrext/video-timing', direction: 'stopped' as const },
+  ];
+  const out = withAbsCaptureTime(list);
+  expect(out.map((e) => e.direction)).toEqual(['sendrecv', 'recvonly', 'stopped']);
 });

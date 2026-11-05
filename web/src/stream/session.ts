@@ -23,6 +23,18 @@ export function h264First(codecs: RTCRtpCodec[]): RTCRtpCodec[] {
   return [...mode1, ...rest];
 }
 
+export interface HeaderExtension {
+  uri: string;
+  direction: RTCRtpTransceiverDirection;
+}
+
+export const ABS_CAPTURE_TIME = 'http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time';
+
+/** Turns on receiving abs-capture-time, which Chrome offers stopped; the rest stays as it is. */
+export function withAbsCaptureTime<T extends HeaderExtension>(list: T[]): T[] {
+  return list.map((e) => (e.uri === ABS_CAPTURE_TIME && e.direction === 'stopped' ? { ...e, direction: 'recvonly' } : e));
+}
+
 export class StreamSession {
   private pc: RTCPeerConnection | null = null;
   private signaling: Signaling | null = null;
@@ -89,6 +101,18 @@ export class StreamSession {
     const pc = new RTCPeerConnection({ bundlePolicy: 'max-bundle' });
     this.pc = pc;
     const transceiver = pc.addTransceiver('video', { direction: 'recvonly' });
+    // The capture time of each frame gives the browser capture -> display latency (requestVideoFrameCallback).
+    const negotiable = transceiver as RTCRtpTransceiver & {
+      getHeaderExtensionsToNegotiate?: () => HeaderExtension[];
+      setHeaderExtensionsToNegotiate?: (list: HeaderExtension[]) => void;
+    };
+    if (negotiable.getHeaderExtensionsToNegotiate && negotiable.setHeaderExtensionsToNegotiate) {
+      try {
+        negotiable.setHeaderExtensionsToNegotiate(withAbsCaptureTime(negotiable.getHeaderExtensionsToNegotiate()));
+      } catch (e) {
+        this.events.log(`abs-capture-time: ${String(e)}`);
+      }
+    }
     const caps = RTCRtpReceiver.getCapabilities('video');
     if (caps && typeof transceiver.setCodecPreferences === 'function') {
       const codecs = h264First(caps.codecs);

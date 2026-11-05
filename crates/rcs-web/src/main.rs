@@ -126,6 +126,12 @@ async fn run(options: Options) -> Result<(), String> {
         .layer(SetResponseHeaderLayer::overriding(
             header::REFERRER_POLICY,
             HeaderValue::from_static("no-referrer"),
+        ))
+        // The browser asks again every time, so a new client build is never hidden behind a cached index.html;
+        // unchanged files come back as 304 thanks to Last-Modified.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
         ));
     let listener = tokio::net::TcpListener::bind(options.listen)
         .await

@@ -1,5 +1,6 @@
 // "Скачать диагностику": what the browser saw, as one JSON file (docs/ARCHITECTURE.md, Диагностика).
 
+import type { LatencySummary } from './latency';
 import type { StatsMap, StreamSummary } from './stats';
 
 const MAX_EVENTS = 500;
@@ -12,7 +13,7 @@ interface LogEvent {
 
 const events: LogEvent[] = [];
 const errors: LogEvent[] = [];
-const samples: Array<{ at: string; summary: StreamSummary }> = [];
+const samples: Array<{ at: string; summary: StreamSummary; latency: LatencySummary | null }> = [];
 
 function push<T>(list: T[], item: T, max: number): void {
   list.push(item);
@@ -23,8 +24,8 @@ export function logEvent(message: string): void {
   push(events, { at: new Date().toISOString(), message }, MAX_EVENTS);
 }
 
-export function recordSample(summary: StreamSummary): void {
-  push(samples, { at: new Date().toISOString(), summary }, MAX_SAMPLES);
+export function recordSample(summary: StreamSummary, latency: LatencySummary | null = null): void {
+  push(samples, { at: new Date().toISOString(), summary, latency }, MAX_SAMPLES);
 }
 
 let installed = false;
