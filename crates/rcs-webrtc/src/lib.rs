@@ -43,6 +43,22 @@ pub struct Config {
     pub bind: SocketAddr,
     /// Host candidates written into the answer: the addresses browsers should send to.
     pub advertise: Vec<SocketAddr>,
+    /// Testing only (P2-4): every `every` the server sends nothing for `burst`, like a short network outage.
+    pub simulate_loss: Option<LossTest>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LossTest {
+    pub every: Duration,
+    pub burst: Duration,
+}
+
+impl LossTest {
+    /// Whether a datagram sent `since` the session started falls into a simulated outage.
+    pub fn drops(&self, since: Duration) -> bool {
+        let every = self.every.as_nanos().max(1);
+        since.as_nanos() % every < self.burst.as_nanos()
+    }
 }
 
 /// One encoded access unit in Annex B.
@@ -67,6 +83,8 @@ pub struct Counters {
     /// PLI and FIR from the browser.
     pub keyframe_requests: AtomicU64,
     pub write_errors: AtomicU64,
+    /// Datagrams held back by `Config::simulate_loss`.
+    pub datagrams_dropped_test: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -78,6 +96,7 @@ pub struct CountersSnapshot {
     pub frames_dropped_idle: u64,
     pub keyframe_requests: u64,
     pub write_errors: u64,
+    pub datagrams_dropped_test: u64,
 }
 
 struct Shared {
@@ -265,6 +284,7 @@ impl Server {
             frames_dropped_idle: load(&c.frames_dropped_idle),
             keyframe_requests: load(&c.keyframe_requests),
             write_errors: load(&c.write_errors),
+            datagrams_dropped_test: load(&c.datagrams_dropped_test),
         }
     }
 }
@@ -473,7 +493,16 @@ impl NetworkLoop {
             match session.rtc.poll_output() {
                 Ok(Output::Timeout(t)) => break t.min(idle),
                 Ok(Output::Transmit(t)) => {
-                    if let Err(e) = self.socket.send_to(&t.contents, t.destination) {
+                    // Only once media flows, so ICE and DTLS are never part of the simulated outage.
+                    if session.connected
+                        && let Some(test) = self.config.simulate_loss
+                        && test.drops(session.epoch.elapsed())
+                    {
+                        self.shared
+                            .counters
+                            .datagrams_dropped_test
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else if let Err(e) = self.socket.send_to(&t.contents, t.destination) {
                         debug!(error = %e, to = %t.destination, "send failed");
                     }
                 }
@@ -688,6 +717,18 @@ mod tests {
     }
 
     #[test]
+    fn loss_test_drops_only_inside_the_burst() {
+        let test = LossTest {
+            every: Duration::from_secs(5),
+            burst: Duration::from_millis(300),
+        };
+        assert!(test.drops(Duration::from_millis(100)));
+        assert!(!test.drops(Duration::from_millis(400)));
+        assert!(test.drops(Duration::from_millis(5_200)));
+        assert!(!test.drops(Duration::from_millis(9_999)));
+    }
+
+    #[test]
     fn overflow_drops_the_oldest_frame() {
         let mut queue = VecDeque::new();
         assert!(push_bounded(&mut queue, frame(1)).is_none());
@@ -716,6 +757,7 @@ mod tests {
         let server = Server::start(Config {
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             advertise: Vec::new(),
+            simulate_loss: None,
         })
         .expect("bind on loopback");
         assert!(server.open("not an sdp".into()).is_err());

@@ -21,6 +21,7 @@ use tracing::{Level, error, info, info_span};
 const USAGE: &str = "\
 Usage: rcs-agent [--udp ADDR] [--advertise ADDR,ADDR] [--pipe NAME] [--log DIR]
                  [--encoder auto|amf|mf] [--width W] [--height H] [--fps F] [--bitrate-mbps B] [--display N]
+                 [--simulate-loss EVERY_MS:BURST_MS]   testing only: stop sending for BURST_MS every EVERY_MS
   --udp        UDP address for WebRTC, default 127.0.0.1:8443
   --advertise  addresses written into the answer, default the --udp address, or the LAN address and loopback
                when --udp is 0.0.0.0";
@@ -31,6 +32,7 @@ struct Options {
     pipe: String,
     log: PathBuf,
     pipeline: pipeline::Config,
+    simulate_loss: Option<rcs_webrtc::LossTest>,
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
@@ -39,6 +41,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         advertise: Vec::new(),
         pipe: PIPE_NAME.into(),
         log: PathBuf::from("out").join("agent"),
+        simulate_loss: None,
         pipeline: pipeline::Config {
             display: 0,
             backend: Backend::Auto,
@@ -77,6 +80,19 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--fps" => options.pipeline.fps = number()? as i32,
             "--bitrate-mbps" => options.pipeline.bitrate = number()? * 1_000_000,
             "--display" => options.pipeline.display = number().unwrap_or(0) as u32,
+            "--simulate-loss" => {
+                let (every, burst) = value
+                    .split_once(':')
+                    .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+                    .filter(|(a, b)| *b > 0 && b < a)
+                    .ok_or_else(|| {
+                        format!("{flag}: EVERY_MS:BURST_MS, burst shorter than every")
+                    })?;
+                options.simulate_loss = Some(rcs_webrtc::LossTest {
+                    every: std::time::Duration::from_millis(every),
+                    burst: std::time::Duration::from_millis(burst),
+                });
+            }
             _ => return Err(format!("unknown option {flag}")),
         }
     }
@@ -158,6 +174,7 @@ fn run(options: Options) -> Result<(), String> {
     let server = rcs_webrtc::Server::start(rcs_webrtc::Config {
         bind: options.udp,
         advertise: options.advertise.clone(),
+        simulate_loss: options.simulate_loss,
     })
     .map_err(|e| format!("UDP {}: {e}", options.udp))?;
     info!(udp = %server.local_addr(), advertise = ?options.advertise, pipe = %options.pipe, "agent started");
@@ -229,6 +246,7 @@ fn status(
         bytes_sent: c.bytes_sent,
         frames_dropped_queue: c.frames_dropped_queue,
         keyframe_requests: c.keyframe_requests,
+        datagrams_dropped_test: c.datagrams_dropped_test,
         pipeline_restarts: stats.restarts.load(Ordering::Relaxed),
         last_error: info.last_error,
     }

@@ -60,6 +60,9 @@ pub struct AgentStatus {
     pub bytes_sent: u64,
     pub frames_dropped_queue: u64,
     pub keyframe_requests: u64,
+    /// Datagrams held back by the agent's `--simulate-loss` test option.
+    #[serde(default)]
+    pub datagrams_dropped_test: u64,
     pub pipeline_restarts: u64,
     pub last_error: Option<String>,
 }
