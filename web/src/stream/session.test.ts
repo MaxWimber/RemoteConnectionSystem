@@ -1,0 +1,34 @@
+import { expect, test } from 'vitest';
+import { backoffMs, h264First } from './session';
+import { parseServerMessage, signalUrl } from './signaling';
+
+test('reconnect waits grow and stop at five seconds', () => {
+  expect([0, 1, 2, 3, 10].map(backoffMs)).toEqual([1000, 2000, 4000, 5000, 5000]);
+});
+
+test('only H.264 is kept, packetization-mode 1 first', () => {
+  const codecs = [
+    { mimeType: 'video/VP8', clockRate: 90000 },
+    { mimeType: 'video/H264', clockRate: 90000, sdpFmtpLine: 'packetization-mode=0;profile-level-id=42e01f' },
+    { mimeType: 'video/H264', clockRate: 90000, sdpFmtpLine: 'packetization-mode=1;profile-level-id=64001f' },
+  ];
+  const result = h264First(codecs);
+  expect(result).toHaveLength(2);
+  expect(result[0]?.sdpFmtpLine).toContain('packetization-mode=1');
+});
+
+test('signaling url follows the page scheme and the base path', () => {
+  const page = { protocol: 'https:', host: 'example.test:8444' } as Location;
+  expect(signalUrl(page, '/RemoteConnectionSystem/')).toBe(
+    'wss://example.test:8444/RemoteConnectionSystem/api/signal',
+  );
+  const local = { protocol: 'http:', host: '127.0.0.1:8080' } as Location;
+  expect(signalUrl(local, '/RemoteConnectionSystem')).toBe('ws://127.0.0.1:8080/RemoteConnectionSystem/api/signal');
+});
+
+test('server messages of another version or shape are errors', () => {
+  expect(parseServerMessage('{"v":1,"type":"answer","sdp":"v=0"}')).toEqual({ v: 1, type: 'answer', sdp: 'v=0' });
+  expect(parseServerMessage('{"v":2,"type":"answer","sdp":"v=0"}')).toMatchObject({ code: 'protocol_mismatch' });
+  expect(parseServerMessage('nonsense')).toMatchObject({ code: 'bad_message' });
+  expect(parseServerMessage('{"v":1,"type":"session-replaced"}').type).toBe('session-replaced');
+});

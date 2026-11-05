@@ -1,7 +1,8 @@
 import { render } from 'preact';
-import { appTitle } from './app/title';
+import { App } from './app/App';
+import './app/app.css';
 
 const root = document.getElementById('app');
 if (root) {
-  render(<h1>{appTitle}</h1>, root);
+  render(<App />, root);
 }
