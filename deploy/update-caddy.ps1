@@ -28,27 +28,47 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $report = [ordered]@{
-    config_valid = $false; service_running = $false; page_status = $null; hsts = $null; csp = $null
+    audit_log_granted = $null; config_valid = $false; service_running = $false; page_status = $null; hsts = $null; csp = $null
     api_without_session = $null; signal_without_session = $null; http_redirect = $null; lan_rules_left = $null; error = $null
 }
 
 # Everything goes to Caddy on this machine, as a browser from outside would see it.
 function Invoke-Curl([string[]]$Arguments) {
     $output = & curl.exe -s --max-time 15 --resolve "${Domain}:${httpsPort}:127.0.0.1" --resolve "${Domain}:80:127.0.0.1" @Arguments
-    return "$output".Trim()
+    # Keep the lines apart: the header checks below match at line starts.
+    return (@($output) -join "`n").Trim()
 }
 
 try {
-    $listening = Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue
-    if (-not $listening -or ($listening | Where-Object { $_.LocalAddress -ne '127.0.0.1' })) {
+    # An audit log created by an elevated set-password belongs to Administrators; rcs-web runs as the user until
+    # phase 6 (D-021) and needs to append to it.
+    $auditLog = Join-Path $dataDir 'logs\audit.log'
+    if (Test-Path -LiteralPath $auditLog) {
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        & icacls.exe $auditLog /grant "*${sid}:(M)" /Q | Out-Null
+        $report.audit_log_granted = $LASTEXITCODE -eq 0
+    }
+
+    # rcs-web may be starting right now, after the permission above.
+    $deadline = (Get-Date).AddSeconds(90)
+    do {
+        $listening = @(Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue)
+        if ($listening.Count -gt 0) { break }
+        Start-Sleep -Seconds 2
+    } while ((Get-Date) -lt $deadline)
+    if ($listening.Count -eq 0 -or ($listening | Where-Object { $_.LocalAddress -ne '127.0.0.1' })) {
         throw 'rcs-web должен слушать только 127.0.0.1:8080. Запустите его перед этим скриптом.'
     }
 
     $backup = "$configPath.phase0"
     if (-not (Test-Path $backup)) { Copy-Item -LiteralPath $configPath -Destination $backup }
     Copy-Item -LiteralPath (Join-Path $root 'deploy\Caddyfile') -Destination $configPath -Force
+    # Caddy logs to stderr, which Windows PowerShell turns into errors under 'Stop'; only the exit code matters.
+    $ErrorActionPreference = 'Continue'
     & $caddyExe validate --config $configPath --adapter caddyfile 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    $validated = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($validated -ne 0) {
         Copy-Item -LiteralPath $backup -Destination $configPath -Force
         throw 'Caddyfile не прошёл проверку, прежняя настройка возвращена.'
     }

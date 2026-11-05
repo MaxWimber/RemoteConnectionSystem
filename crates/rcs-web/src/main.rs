@@ -184,7 +184,12 @@ async fn serve(options: Options) -> Result<(), String> {
     .map_err(|e| format!("server: {e}"))
 }
 
+/// Appends to an existing audit log only. These commands may run elevated, and a log they created would belong to
+/// Administrators, which `rcs-web` under the user's account could then not write.
 fn audit_best_effort(options: &Options, event: &str) {
+    if !options.audit.exists() {
+        return;
+    }
     if let Ok(audit) = Audit::open(options.audit.clone()) {
         audit.event(event, None, json!({}));
         // The writer thread flushes before the process exits only if given a moment.
