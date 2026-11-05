@@ -532,8 +532,9 @@ fn handle_event(session: &mut Session, shared: &Shared, event: Event) -> Option<
                 .writer(added.mid)
                 .and_then(|w| choose_h264(w.payload_params().map(|p| (p.pt(), p.spec()))));
             match pt {
-                Some(pt) => {
-                    info!(mid = %added.mid, ?pt, "video track ready");
+                Some((pt, level_id)) => {
+                    let profile_level_id = level_id.map(|v| format!("{v:06x}")).unwrap_or_default();
+                    info!(mid = %added.mid, ?pt, %profile_level_id, "video track ready");
                     session.video = Some((added.mid, pt));
                 }
                 None => warn!("the browser offered no usable H.264"),
@@ -570,24 +571,27 @@ fn handle_event(session: &mut Session, shared: &Shared, event: Event) -> Option<
 }
 
 /// The H.264 payload type to send with: packetization-mode 1, High profile when offered, else any.
-fn choose_h264(params: impl Iterator<Item = (Pt, str0m::format::CodecSpec)>) -> Option<Pt> {
-    let mut best: Option<(u8, Pt)> = None;
+/// Also returns its `profile-level-id`, for the log.
+fn choose_h264(
+    params: impl Iterator<Item = (Pt, str0m::format::CodecSpec)>,
+) -> Option<(Pt, Option<u32>)> {
+    let mut best: Option<(u8, Pt, Option<u32>)> = None;
     for (pt, spec) in params {
         if spec.codec != Codec::H264 || spec.format.packetization_mode != Some(1) {
             continue;
         }
-        let profile = spec.format.profile_level_id.map(|v| (v >> 16) as u8);
-        let rank = match profile {
+        let level_id = spec.format.profile_level_id;
+        let rank = match level_id.map(|v| (v >> 16) as u8) {
             Some(0x64) => 3,
             Some(0x4d) => 2,
             Some(_) => 1,
             None => 0,
         };
-        if best.is_none_or(|(r, _)| rank > r) {
-            best = Some((rank, pt));
+        if best.is_none_or(|(r, _, _)| rank > r) {
+            best = Some((rank, pt, level_id));
         }
     }
-    best.map(|(_, pt)| pt)
+    best.map(|(_, pt, level_id)| (pt, level_id))
 }
 
 #[cfg(test)]
