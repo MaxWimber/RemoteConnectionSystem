@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { logout } from '../api/auth';
+import { InputController } from '../input/controller';
 import { buildReport, download, installErrorCapture, logEvent, recordSample } from '../stream/diagnostics';
 import { LatencyMeter, type LatencySummary } from '../stream/latency';
 import { StreamSession, type SessionState } from '../stream/session';
@@ -38,6 +39,7 @@ export function App({ onSignedOut }: Props) {
   const [summary, setSummary] = useState<StreamSummary | null>(null);
   const [latency, setLatency] = useState<LatencySummary | null>(null);
   const meter = useRef<LatencyMeter | null>(null);
+  const input = useRef<InputController | null>(null);
 
   useEffect(() => {
     installErrorCapture();
@@ -58,8 +60,11 @@ export function App({ onSignedOut }: Props) {
     if (video.current) {
       meter.current = new LatencyMeter(video.current, () => s.clock);
       meter.current.start();
+      input.current = new InputController(video.current, () => s.input, logEvent);
+      input.current.attach();
     }
     return () => {
+      input.current?.detach();
       meter.current?.stop();
       s.stop();
     };
@@ -129,6 +134,7 @@ export function App({ onSignedOut }: Props) {
 
   const reconnect = () => session.current?.start();
   const signOut = async () => {
+    input.current?.detach();
     session.current?.stop();
     try {
       await logout(import.meta.env.BASE_URL);
@@ -152,6 +158,9 @@ export function App({ onSignedOut }: Props) {
       )}
       <div class="toolbar" aria-label={appTitle}>
         <button onClick={fullscreen} title="Полный экран">⛶</button>
+        <button onClick={() => input.current?.capturePointer()} title="Захватить мышь для игр (Esc отпускает)">
+          🖱
+        </button>
         <button onClick={() => setShowStats(!showStats)} title="Статистика">ℹ</button>
         <button onClick={() => void saveDiagnostics()} title="Скачать диагностику">⤓</button>
         <button onClick={() => void signOut()} title="Выйти">⏻</button>
@@ -184,6 +193,12 @@ export function App({ onSignedOut }: Props) {
               сервер: {String(agent['encoder'] ?? '—')} · отправлено {String(agent['frames_sent'] ?? '—')} · сброшено
               очередью {String(agent['frames_dropped_queue'] ?? '—')} · запросов IDR{' '}
               {String(agent['keyframe_requests'] ?? '—')}
+            </div>
+          )}
+          {agent && (
+            <div class="detail">
+              ввод: {String(agent['input'] ?? '—')} · событий {String(agent['input_events'] ?? '—')} · отброшено{' '}
+              {String(agent['input_dropped'] ?? '—')} · ошибок {String(agent['input_errors'] ?? '—')}
             </div>
           )}
         </div>

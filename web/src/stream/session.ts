@@ -2,6 +2,7 @@
 
 import { ClockSync, sampleFromPong } from './clock';
 import { me } from '../api/auth';
+import { InputChannels } from '../input/channels';
 import { watchNetwork } from './network';
 import { CLOSE_SESSION_ENDED, Signaling, signalUrl, type ServerMessage } from './signaling';
 
@@ -49,6 +50,7 @@ export class StreamSession {
   private disconnectTimer: number | undefined;
   private pingTimer: number | undefined;
   private clockSync: ClockSync | null = null;
+  private inputChannels: InputChannels | null = null;
   private unwatch: (() => void) | undefined;
 
   constructor(
@@ -58,6 +60,11 @@ export class StreamSession {
 
   get peer(): RTCPeerConnection | null {
     return this.pc;
+  }
+
+  /** The input channels of the current connection; they send nothing until open. */
+  get input(): InputChannels | null {
+    return this.inputChannels;
   }
 
   /** The server clock of the current session, once the control channel has answered. */
@@ -91,6 +98,7 @@ export class StreamSession {
     window.clearTimeout(this.disconnectTimer);
     window.clearTimeout(this.pingTimer);
     this.clockSync = null;
+    this.inputChannels = null;
     this.signaling?.close();
     this.signaling = null;
     this.pc?.close();
@@ -166,6 +174,7 @@ export class StreamSession {
     }
     // The control channel carries the server clock now (PROTOCOL.md) and settings and input from phase 4.
     this.openControl(pc.createDataChannel('control', { ordered: true }));
+    this.inputChannels = new InputChannels(pc);
     pc.ontrack = (e) => {
       const receiver = e.receiver as RTCRtpReceiver & {
         jitterBufferTarget?: number | null;
