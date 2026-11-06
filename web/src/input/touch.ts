@@ -1,4 +1,8 @@
 // Touch on Android (P4-8): touchpad mode with gestures, direct mode with real touches, and the screen keyboard.
+//
+// The touchpad keeps its own pointer position and sends absolute moves. Relative moves went through the Windows
+// pointer acceleration, which slows down small injected moves so much that the pointer crawled; the gain here is
+// ours and the same on every server.
 
 import type { InputChannels } from './channels';
 import { ContactIds, TouchpadGestures, type GestureAction } from './gestures';
@@ -10,6 +14,13 @@ export type TouchMode = 'touchpad' | 'direct';
 
 const MODE_KEY = 'rcs.touchMode';
 const TICK_MS = 50;
+/** After this long without touchpad moves the pointer is taken from the server again: a program may have moved it. */
+const RESYNC_MS = 1000;
+
+/** Picture pixels per finger pixel: 1.5 for slow, careful moves, up to 4 for a quick swipe across the screen. */
+export function touchpadGain(pxPerMs: number): number {
+  return Math.min(4, 1.5 + 1.5 * Math.max(0, pxPerMs - 0.3));
+}
 
 export function loadMode(): TouchMode {
   try {
@@ -42,7 +53,10 @@ export class TouchController {
   private gestures: TouchpadGestures;
   private ids = new ContactIds();
   private pending = new Map<number, TouchPoint>();
-  private relative = { dx: 0, dy: 0 };
+  /** The touchpad pointer, 0..65535 over the picture. */
+  private position: { x: number; y: number } | null = null;
+  private positionDirty = false;
+  private lastMoveAt = -Infinity;
   private wheel = { dx: 0, dy: 0 };
   private frame = 0;
   private timer = 0;
@@ -54,14 +68,18 @@ export class TouchController {
     private readonly field: HTMLTextAreaElement,
     private readonly channels: () => InputChannels | null,
     private readonly log: (message: string) => void,
+    /** Where the server says its pointer is. */
+    private readonly serverPosition: () => { x: number; y: number } | null = () => null,
+    /** Called when the touchpad pointer moved, to draw it. */
+    private readonly moved: () => void = () => {},
   ) {
-    this.gestures = new TouchpadGestures(
-      (a) => this.onGesture(a),
-      () => {
-        const box = contentBox(this.video.getBoundingClientRect(), this.video.videoWidth, this.video.videoHeight);
-        return this.video.videoWidth > 0 && box.width > 0 ? this.video.videoWidth / box.width : 1;
-      },
-    );
+    // Gestures report finger movement in CSS pixels; the gain is applied here.
+    this.gestures = new TouchpadGestures((a) => this.onGesture(a), () => 1);
+  }
+
+  /** The touchpad pointer, for drawing it without waiting for the server. */
+  get localPosition(): { x: number; y: number } | null {
+    return this.mode === 'touchpad' ? this.position : null;
   }
 
   get current(): TouchMode {
@@ -132,6 +150,9 @@ export class TouchController {
     e.preventDefault();
     if (this.mode === 'touchpad') {
       const now = performance.now();
+      if (phase === 'down' && (this.position === null || now - this.lastMoveAt > RESYNC_MS)) {
+        this.position = this.serverPosition() ?? this.position ?? { x: 32768, y: 32768 };
+      }
       if (phase === 'down') this.gestures.down(e.pointerId, e.clientX, e.clientY, now);
       else if (phase === 'move') this.gestures.move(e.pointerId, e.clientX, e.clientY);
       else if (phase === 'up') this.gestures.up(e.pointerId, now);
@@ -157,8 +178,18 @@ export class TouchController {
       this.flush();
       c.send({ type: 'mouse_button', button: a.button, down: a.down });
     } else if (a.type === 'move') {
-      this.relative.dx += a.dx;
-      this.relative.dy += a.dy;
+      const now = performance.now();
+      // A pause means a new stroke: its first step counts as a frame long.
+      const dt = now - this.lastMoveAt > 100 ? 16 : Math.max(1, now - this.lastMoveAt);
+      this.lastMoveAt = now;
+      const gain = touchpadGain(Math.hypot(a.dx, a.dy) / dt);
+      const box = contentBox(this.video.getBoundingClientRect(), this.video.videoWidth, this.video.videoHeight);
+      const per = 65535 / Math.max(1, box.width - 1);
+      const p = this.position ?? { x: 32768, y: 32768 };
+      const clamp = (v: number) => Math.min(65535, Math.max(0, v));
+      this.position = { x: clamp(p.x + a.dx * gain * per), y: clamp(p.y + a.dy * gain * per) };
+      this.positionDirty = true;
+      this.moved();
       this.schedule();
     } else {
       this.wheel.dx += a.dx;
@@ -183,12 +214,9 @@ export class TouchController {
       c.send({ type: 'touch', points: [...this.pending.values()] });
       this.pending.clear();
     }
-    const dx = Math.trunc(this.relative.dx);
-    const dy = Math.trunc(this.relative.dy);
-    if (dx !== 0 || dy !== 0) {
-      c.moveRelative(dx, dy);
-      this.relative.dx -= dx;
-      this.relative.dy -= dy;
+    if (this.positionDirty && this.position) {
+      c.moveAbsolute(Math.round(this.position.x), Math.round(this.position.y));
+      this.positionDirty = false;
     }
     const [wx, restX] = takeWhole(this.wheel.dx);
     const [wy, restY] = takeWhole(this.wheel.dy);

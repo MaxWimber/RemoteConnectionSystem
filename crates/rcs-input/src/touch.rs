@@ -206,6 +206,9 @@ impl TouchInjector {
         self.infos.extend(self.frame.iter().map(to_info));
         // SAFETY: the slice holds initialized POINTER_TOUCH_INFOs, as many as the call is told.
         unsafe { InjectTouchInput(&self.infos) }.map_err(|e| {
+            // Windows refuses frames for contacts it has ended itself, for example after an edge swipe of the
+            // system. Forget them, so the next touch starts clean instead of failing again.
+            self.contacts = Contacts::default();
             // SAFETY: no pointers; reads this thread's last error right after the call.
             let code = unsafe { GetLastError() }.0;
             InputError::Blocked {

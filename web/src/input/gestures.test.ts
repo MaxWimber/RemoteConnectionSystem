@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ContactIds, DOUBLE_TAP_MS, LONG_PRESS_MS, TouchpadGestures, type GestureAction } from './gestures';
-import { textChange } from './touch';
+import { textChange, touchpadGain } from './touch';
 
 function recorder(scale = 2) {
   const actions: GestureAction[] = [];
@@ -110,5 +110,14 @@ describe('screen keyboard text', () => {
     expect(textChange('abc', 'ab')).toEqual({ deletes: 1, insert: '' });
     expect(textChange('a😀', 'a')).toEqual({ deletes: 1, insert: '' });
     expect(textChange('a😀', 'a😃')).toEqual({ deletes: 1, insert: '😃' });
+  });
+});
+
+describe('touchpad gain', () => {
+  it('is 1.5 for slow moves and grows to 4 for quick ones', () => {
+    expect(touchpadGain(0)).toBe(1.5);
+    expect(touchpadGain(0.3)).toBe(1.5);
+    expect(touchpadGain(1.3)).toBeCloseTo(3);
+    expect(touchpadGain(10)).toBe(4);
   });
 });

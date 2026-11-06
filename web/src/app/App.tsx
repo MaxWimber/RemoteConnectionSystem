@@ -80,14 +80,22 @@ export function App({ onSignedOut }: Props) {
       input.current = controller;
       controller.attach();
       if (touchDevice && keyboardField.current) {
-        touch.current = new TouchController(video.current, keyboardField.current, () => s.input, logEvent);
+        touch.current = new TouchController(
+          video.current,
+          keyboardField.current,
+          () => s.input,
+          logEvent,
+          () => cursor.current?.serverPosition ?? null,
+          () => cursor.current?.render(),
+        );
         touch.current.attach();
       }
       if (cursorImage.current) {
         const view = new CursorView(
           video.current,
           cursorImage.current,
-          () => controller.pointerLocked || (touch.current?.drawsPointer ?? false),
+          () => (controller.pointerLocked ? 'locked' : touch.current?.drawsPointer ? 'touchpad' : 'css'),
+          () => touch.current?.localPosition ?? null,
         );
         cursor.current = view;
         document.addEventListener('pointerlockchange', () => view.render());

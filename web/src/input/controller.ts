@@ -155,7 +155,14 @@ export class InputController {
     if (!button) return;
     e.preventDefault();
     if (down) {
-      this.video.setPointerCapture(e.pointerId);
+      // Capture keeps the button's release on the video; under Pointer Lock it is not needed and throws.
+      if (!this.pointerLocked) {
+        try {
+          this.video.setPointerCapture(e.pointerId);
+        } catch {
+          // The pointer is already gone; the release still comes through the window.
+        }
+      }
       this.onMove(e);
     }
     this.flush();
