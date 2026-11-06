@@ -115,8 +115,8 @@ export class GamepadPoller {
   private senders = Array.from({ length: MAX_PADS }, () => new PadSender());
   private frame = 0;
   private offs: (() => void)[] = [];
-  /** Extra pads, for example the on-screen gamepad, polled with the physical ones. */
-  private extra = new Map<number, () => PadState | null>();
+  /** Extra pads, for example the on-screen gamepad: numbered after the physical ones, polled with them. */
+  private extra: (() => PadState | null)[] = [];
 
   constructor(
     private readonly channels: () => InputChannels | null,
@@ -153,9 +153,14 @@ export class GamepadPoller {
     this.frame = 0;
   }
 
-  /** Adds a pad from another source on a pad number; it is sent like a physical one. */
-  addSource(pad: number, read: () => PadState | null): void {
-    this.extra.set(pad, read);
+  /** Adds a pad from another source; it is sent like a physical one while it returns a state. */
+  addSource(read: () => PadState | null): void {
+    this.extra.push(read);
+    this.start();
+  }
+
+  /** Polls again from the next frame, for example when the on-screen pad appears or changes. */
+  wake(): void {
     this.start();
   }
 
@@ -173,12 +178,12 @@ export class GamepadPoller {
     const now = performance.now();
     const c = this.channels();
     const states = new Map<number, PadState>();
-    this.pads()
-      .slice(0, MAX_PADS)
-      .forEach((gp, i) => states.set(i, padState(gp)));
-    for (const [pad, read] of this.extra) {
+    const physical = this.pads().slice(0, MAX_PADS);
+    physical.forEach((gp, i) => states.set(i, padState(gp)));
+    let next = physical.length;
+    for (const read of this.extra) {
       const s = read();
-      if (s) states.set(pad, s);
+      if (s && next < MAX_PADS) states.set(next++, s);
     }
     for (const [pad, state] of states) {
       const sender = this.senders[pad];

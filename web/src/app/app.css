@@ -106,6 +106,58 @@ button {
   pointer-events: none;
 }
 
+.screen-pad {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.pad-control {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid rgba(255, 255, 255, 0.45);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.85);
+  font: 600 3.5vmin system-ui, sans-serif;
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.pad-control.active {
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.pad-knob {
+  width: 45%;
+  height: 45%;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.screen-pad.editing .pad-control {
+  border-style: dashed;
+}
+
+.screen-pad.editing .pad-control.selected {
+  border-color: #4a8cff;
+}
+
+.screen-pad-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 4px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 6px;
+  pointer-events: auto;
+}
+
 .notice {
   position: absolute;
   left: 50%;

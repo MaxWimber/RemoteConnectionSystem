@@ -3,6 +3,7 @@ import { logout } from '../api/auth';
 import { InputController } from '../input/controller';
 import { CursorView } from '../input/cursor';
 import { GamepadPoller } from '../input/gamepads';
+import { ScreenPad } from '../gamepad-ui/screen-pad';
 import { probeInputLatency } from '../input/probe';
 import { TouchController } from '../input/touch';
 import { buildReport, download, installErrorCapture, logEvent, recordSample } from '../stream/diagnostics';
@@ -47,6 +48,9 @@ export function App({ onSignedOut }: Props) {
   const [probe, setProbe] = useState('');
   const gamepads = useRef<GamepadPoller | null>(null);
   const [notice, setNotice] = useState('');
+  const screenEl = useRef<HTMLDivElement>(null);
+  const screenPad = useRef<ScreenPad | null>(null);
+  const [padShown, setPadShown] = useState(false);
   const session = useRef<StreamSession | null>(null);
   const lastStats = useRef<StatsMap | null>(null);
   const agentStatus = useRef<unknown>(null);
@@ -96,8 +100,14 @@ export function App({ onSignedOut }: Props) {
           logEvent(`геймпад: статус: ${String(e)}`);
         }
       };
-      gamepads.current = new GamepadPoller(() => s.input, logEvent, () => void checkGamepads());
-      gamepads.current.attach();
+      const poller = new GamepadPoller(() => s.input, logEvent, () => void checkGamepads());
+      gamepads.current = poller;
+      poller.attach();
+      if (touchDevice && screenEl.current) {
+        const pad = new ScreenPad(screenEl.current, () => poller.wake());
+        screenPad.current = pad;
+        poller.addSource(() => pad.read());
+      }
       if (touchDevice && keyboardField.current) {
         touch.current = new TouchController(video.current, keyboardField.current, () => s.input);
         touch.current.attach();
@@ -112,6 +122,7 @@ export function App({ onSignedOut }: Props) {
       }
     }
     return () => {
+      screenPad.current?.destroy();
       gamepads.current?.detach();
       touch.current?.detach();
       input.current?.detach();
@@ -240,6 +251,20 @@ export function App({ onSignedOut }: Props) {
     }
   };
 
+  /** The on-screen pad needs ViGEmBus too: say so when it is shown. */
+  const checkPadServer = async () => {
+    try {
+      const r = await fetch(`${import.meta.env.BASE_URL}api/status`, { cache: 'no-store' });
+      const g = r.ok ? String(((await r.json()) as Record<string, unknown>)['gamepad'] ?? '') : '';
+      if (g && g !== 'vigem' && g !== 'record') {
+        setNotice(`Геймпад не передаётся: ${g}`);
+        window.setTimeout(() => setNotice(''), 8000);
+      }
+    } catch {
+      // The pad still shows; the status panel tells more.
+    }
+  };
+
   const reconnect = () => session.current?.start();
   const signOut = async () => {
     input.current?.detach();
@@ -255,7 +280,7 @@ export function App({ onSignedOut }: Props) {
   const message = stateText[state];
 
   return (
-    <div class="screen">
+    <div class="screen" ref={screenEl}>
       <video ref={video} class="video" autoplay muted playsInline disablePictureInPicture />
       <img ref={cursorImage} class="cursor-overlay" alt="" hidden />
       <textarea
@@ -277,9 +302,21 @@ export function App({ onSignedOut }: Props) {
       <div class="toolbar" aria-label={appTitle}>
         <button onClick={fullscreen} title="Полный экран">⛶</button>
         {touchDevice ? (
-          <button onClick={() => touch.current?.showKeyboard()} title="Клавиатура">
-            ⌨
-          </button>
+          <>
+            <button onClick={() => touch.current?.showKeyboard()} title="Клавиатура">
+              ⌨
+            </button>
+            <button
+              onClick={() => {
+                const shown = screenPad.current?.toggle() ?? false;
+                setPadShown(shown);
+                if (shown) void checkPadServer();
+              }}
+              title={padShown ? 'Скрыть экранный геймпад' : 'Экранный геймпад'}
+            >
+              🎮
+            </button>
+          </>
         ) : (
           <button onClick={() => input.current?.capturePointer()} title="Захватить мышь для игр (Esc отпускает)">
             🖱
