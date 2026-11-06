@@ -1,0 +1,49 @@
+{
+  "about": "Shared examples of the binary input messages, docs/PROTOCOL.md. Read by the Rust and TypeScript tests.",
+  "client": [
+    { "name": "absolute move", "hex": "0101000080ffff", "message": { "type": "mouse_move_absolute", "seq": 1, "x": 32768, "y": 65535 } },
+    { "name": "absolute move, last seq", "hex": "01ffff00000000", "message": { "type": "mouse_move_absolute", "seq": 65535, "x": 0, "y": 0 } },
+    { "name": "relative move", "hex": "020200fbffffffe8030000", "message": { "type": "mouse_move_relative", "seq": 2, "dx": -5, "dy": 1000 } },
+    { "name": "relative move, extreme sums", "hex": "020300ffffff7f00000080", "message": { "type": "mouse_move_relative", "seq": 3, "dx": 2147483647, "dy": -2147483648 } },
+    { "name": "gamepad", "hex": "030700010110ff000080ff7f0000ffff", "message": { "type": "gamepad_state", "seq": 7, "pad": 1, "buttons": 4097, "left_trigger": 255, "right_trigger": 0, "left_x": -32768, "left_y": 32767, "right_x": 0, "right_y": -1 } },
+    { "name": "key A down", "hex": "10011e00", "message": { "type": "key", "down": true, "scancode": 30 } },
+    { "name": "right Ctrl up", "hex": "10001de0", "message": { "type": "key", "down": false, "scancode": 57373 } },
+    { "name": "right button down", "hex": "110101", "message": { "type": "mouse_button", "button": "right", "down": true } },
+    { "name": "forward button up", "hex": "110400", "message": { "type": "mouse_button", "button": "forward", "down": false } },
+    { "name": "wheel one step down", "hex": "12000088ff", "message": { "type": "wheel", "dx": 0, "dy": -120 } },
+    { "name": "two touch points", "hex": "130200006400c8000301ffff0100", "message": { "type": "touch", "points": [ { "id": 0, "phase": "down", "x": 100, "y": 200 }, { "id": 3, "phase": "move", "x": 65535, "y": 1 } ] } },
+    { "name": "release all", "hex": "14", "message": { "type": "release_all" } },
+    { "name": "text", "hex": "150f00d09fd180d0b8d0b2d0b5d1822c2061", "message": { "type": "text", "text": "Привет, a" } },
+    { "name": "empty text", "hex": "150000", "message": { "type": "text", "text": "" } },
+    { "name": "special Ctrl+Alt+Del", "hex": "1601", "message": { "type": "special", "code": 1 } }
+  ],
+  "server": [
+    { "name": "cursor state", "hex": "21090001e803d007", "message": { "type": "cursor_state", "seq": 9, "visible": true, "x": 1000, "y": 2000 } },
+    { "name": "cursor shape", "hex": "200200010002002000200089504e47", "message": { "type": "cursor_shape", "shape_id": 2, "hot_x": 1, "hot_y": 2, "width": 32, "height": 32, "png": "89504e47" } }
+  ],
+  "client_invalid": [
+    { "name": "empty", "hex": "", "error": "empty" },
+    { "name": "absolute move too short", "hex": "01010000", "error": "malformed", "type": 1 },
+    { "name": "absolute move too long", "hex": "0101000080ffff00", "error": "malformed", "type": 1 },
+    { "name": "gamepad 4", "hex": "030700040110ff000080ff7f0000ffff", "error": "malformed", "type": 3 },
+    { "name": "key with reserved flags", "hex": "10021e00", "error": "malformed", "type": 16 },
+    { "name": "button 5", "hex": "110501", "error": "malformed", "type": 17 },
+    { "name": "button down 2", "hex": "110102", "error": "malformed", "type": 17 },
+    { "name": "no touch points", "hex": "1300", "error": "malformed", "type": 19 },
+    { "name": "11 touch points", "hex": "130b", "error": "malformed", "type": 19 },
+    { "name": "touch point cut short", "hex": "130100006400c8", "error": "malformed", "type": 19 },
+    { "name": "touch phase 4", "hex": "130100046400c800", "error": "malformed", "type": 19 },
+    { "name": "release all with a body", "hex": "1401", "error": "malformed", "type": 20 },
+    { "name": "text shorter than its length", "hex": "150200ff", "error": "malformed", "type": 21 },
+    { "name": "text not UTF-8", "hex": "150100ff", "error": "malformed", "type": 21 },
+    { "name": "special without a code", "hex": "16", "error": "malformed", "type": 22 },
+    { "name": "unknown type", "hex": "7f", "error": "unknown", "type": 127 },
+    { "name": "unknown type with a body", "hex": "ff0102", "error": "unknown", "type": 255 },
+    { "name": "a server message", "hex": "21090001e803d007", "error": "unknown", "type": 33 }
+  ],
+  "server_invalid": [
+    { "name": "cursor visible 2", "hex": "21090002e803d007", "error": "malformed", "type": 33 },
+    { "name": "cursor shape without a picture", "hex": "2002000100020020002000", "error": "malformed", "type": 32 },
+    { "name": "a client message", "hex": "10011e00", "error": "unknown", "type": 16 }
+  ]
+}

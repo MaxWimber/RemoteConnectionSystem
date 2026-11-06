@@ -1,6 +1,7 @@
 //! Wire formats shared by the agent, the web server and the tests.
 
 pub mod agent;
+pub mod input;
 
 /// Protocol version from `docs/PROTOCOL.md`.
 pub const PROTOCOL_VERSION: u32 = 1;
