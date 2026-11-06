@@ -5,6 +5,7 @@
 //! a disconnect, a lost focus or a dropped message.
 
 pub mod sendinput;
+pub mod touch;
 
 pub use rcs_protocol::input::{MouseButton, TouchPhase, TouchPoint};
 
@@ -67,6 +68,10 @@ pub trait InputSink {
     fn handle(&mut self, event: &InputEvent<'_>) -> Result<(), InputError>;
     /// Lets go of every key, button and contact that is down. Safe to call at any time.
     fn release_all(&mut self) -> Result<(), InputError>;
+    /// Called often by the input thread, also without events: keeps resting touch contacts alive.
+    fn tick(&mut self) -> Result<(), InputError> {
+        Ok(())
+    }
 }
 
 /// Keys, buttons and touch contacts that are down. No heap: 512 scan codes, 5 buttons, 256 contact ids.

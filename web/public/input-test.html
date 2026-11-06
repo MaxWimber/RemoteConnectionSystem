@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RCS: замер задержки ввода</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #808080;
+        color: #fff;
+        font: 18px system-ui, sans-serif;
+      }
+      #square {
+        position: fixed;
+        left: 0;
+        top: 0;
+        width: 240px;
+        height: 240px;
+        background: #000;
+      }
+      #text {
+        position: fixed;
+        left: 280px;
+        top: 40px;
+        max-width: 640px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="square"></div>
+    <div id="text">
+      <p>Страница для замера задержки ввода (фаза 4, D-022). Откройте её на сервере во весь экран (F11), чтобы квадрат
+        был в левом верхнем углу экрана.</p>
+      <p>Квадрат меняет цвет на каждое нажатие клавиши и кнопки мыши. Затем в клиенте откройте статистику ℹ и
+        нажмите «Замер ввода».</p>
+      <p id="count">Нажатий: 0</p>
+    </div>
+    <script src="input-test.js"></script>
+  </body>
+</html>

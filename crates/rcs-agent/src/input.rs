@@ -189,6 +189,9 @@ impl Thread {
                 break;
             }
             self.forward_cursor_shape(&mut shape_id);
+            if let Err(e) = sink.tick() {
+                self.note_error(&e);
+            }
             match self.receiver.recv_timeout(POLL) {
                 Ok(m) => {
                     if m.session != self.live.load(Ordering::Relaxed) {

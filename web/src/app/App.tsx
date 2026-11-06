@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { logout } from '../api/auth';
 import { InputController } from '../input/controller';
 import { CursorView } from '../input/cursor';
+import { probeInputLatency } from '../input/probe';
+import { TouchController, loadMode, type TouchMode } from '../input/touch';
 import { buildReport, download, installErrorCapture, logEvent, recordSample } from '../stream/diagnostics';
 import { LatencyMeter, type LatencySummary } from '../stream/latency';
 import { StreamSession, type SessionState } from '../stream/session';
@@ -9,6 +11,12 @@ import { summarize, toMap, type StatsMap, type StreamSummary } from '../stream/s
 import { appTitle } from './title';
 
 const STATS_INTERVAL_MS = 1000;
+/** A phone or tablet: no mouse, so touch gestures and the screen keyboard. */
+const touchDevice = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+
+interface WakeLockLike {
+  release(): Promise<void>;
+}
 const AGENT_INTERVAL_MS = 2000;
 
 const stateText: Record<SessionState, string> = {
@@ -33,6 +41,10 @@ export function App({ onSignedOut }: Props) {
   const video = useRef<HTMLVideoElement>(null);
   const cursorImage = useRef<HTMLImageElement>(null);
   const cursor = useRef<CursorView | null>(null);
+  const keyboardField = useRef<HTMLTextAreaElement>(null);
+  const touch = useRef<TouchController | null>(null);
+  const [touchMode, setTouchMode] = useState<TouchMode>(loadMode());
+  const [probe, setProbe] = useState('');
   const session = useRef<StreamSession | null>(null);
   const lastStats = useRef<StatsMap | null>(null);
   const agentStatus = useRef<unknown>(null);
@@ -67,14 +79,23 @@ export function App({ onSignedOut }: Props) {
       const controller = new InputController(video.current, () => s.input, logEvent);
       input.current = controller;
       controller.attach();
+      if (touchDevice && keyboardField.current) {
+        touch.current = new TouchController(video.current, keyboardField.current, () => s.input, logEvent);
+        touch.current.attach();
+      }
       if (cursorImage.current) {
-        const view = new CursorView(video.current, cursorImage.current, () => controller.pointerLocked);
+        const view = new CursorView(
+          video.current,
+          cursorImage.current,
+          () => controller.pointerLocked || (touch.current?.drawsPointer ?? false),
+        );
         cursor.current = view;
         document.addEventListener('pointerlockchange', () => view.render());
         window.addEventListener('resize', () => view.render());
       }
     }
     return () => {
+      touch.current?.detach();
       input.current?.detach();
       meter.current?.stop();
       s.stop();
@@ -118,10 +139,49 @@ export function App({ onSignedOut }: Props) {
     return () => window.clearInterval(id);
   }, [showStats]);
 
+  // Keep the phone's screen on while the picture plays (P4-10).
+  useEffect(() => {
+    if (state !== 'playing') return;
+    const nav = navigator as Navigator & { wakeLock?: { request(type: 'screen'): Promise<WakeLockLike> } };
+    if (!nav.wakeLock) return;
+    let lock: WakeLockLike | null = null;
+    let done = false;
+    const take = () => {
+      if (document.visibilityState !== 'visible') return;
+      nav
+        .wakeLock!.request('screen')
+        .then((l) => {
+          if (done) void l.release();
+          else lock = l;
+        })
+        .catch((e: unknown) => logEvent(`wake lock: ${String(e)}`));
+    };
+    take();
+    // The lock ends when the page is hidden; take it again when it comes back.
+    document.addEventListener('visibilitychange', take);
+    return () => {
+      done = true;
+      document.removeEventListener('visibilitychange', take);
+      void lock?.release();
+    };
+  }, [state]);
+
   const fullscreen = () => {
     const el = document.documentElement;
-    if (document.fullscreenElement) void document.exitFullscreen();
-    else void el.requestFullscreen({ navigationUI: 'hide' }).catch((e) => logEvent(`fullscreen: ${String(e)}`));
+    if (document.fullscreenElement) {
+      void document.exitFullscreen();
+      return;
+    }
+    void el
+      .requestFullscreen({ navigationUI: 'hide' })
+      .then(() => {
+        // A phone turns to landscape for a 16:9 picture, where the browser allows it (P4-10).
+        const orientation = screen.orientation as ScreenOrientation & { lock?: (o: string) => Promise<void> };
+        if (touchDevice && orientation.lock) {
+          orientation.lock('landscape').catch((e: unknown) => logEvent(`orientation: ${String(e)}`));
+        }
+      })
+      .catch((e) => logEvent(`fullscreen: ${String(e)}`));
   };
 
   const saveDiagnostics = async () => {
@@ -143,6 +203,25 @@ export function App({ onSignedOut }: Props) {
     download(buildReport(stats, agentStatus.current));
   };
 
+  const runProbe = async () => {
+    const v = video.current;
+    if (!v || probe.startsWith('замер…')) return;
+    const trials = 30;
+    setProbe(`замер… 0/${trials}`);
+    try {
+      const r = await probeInputLatency(v, () => session.current?.input ?? null, trials, (n) =>
+        setProbe(`замер… ${n}/${trials}`),
+      );
+      logEvent(`замер ввода: ${JSON.stringify(r)}`);
+      setProbe(
+        `нажатие→показ p50 ${fmt(r.p50)} / p95 ${fmt(r.p95)} мс · мин ${fmt(r.min)} · макс ${fmt(r.max)} · ` +
+          `без ответа ${r.misses} из ${r.trials}`,
+      );
+    } catch (e) {
+      setProbe(`замер не удался: ${String(e)}`);
+    }
+  };
+
   const reconnect = () => session.current?.start();
   const signOut = async () => {
     input.current?.detach();
@@ -161,6 +240,14 @@ export function App({ onSignedOut }: Props) {
     <div class="screen">
       <video ref={video} class="video" autoplay muted playsInline disablePictureInPicture />
       <img ref={cursorImage} class="cursor-overlay" alt="" hidden />
+      <textarea
+        ref={keyboardField}
+        class="keyboard-field"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck={false}
+        aria-label="Ввод текста на сервер"
+      />
       {message && (
         <div class="status">
           <div>{message}</div>
@@ -170,9 +257,27 @@ export function App({ onSignedOut }: Props) {
       )}
       <div class="toolbar" aria-label={appTitle}>
         <button onClick={fullscreen} title="Полный экран">⛶</button>
-        <button onClick={() => input.current?.capturePointer()} title="Захватить мышь для игр (Esc отпускает)">
-          🖱
-        </button>
+        {touchDevice ? (
+          <>
+            <button
+              onClick={() => {
+                const mode = touch.current?.toggle();
+                if (mode) setTouchMode(mode);
+                cursor.current?.render();
+              }}
+              title={touchMode === 'touchpad' ? 'Режим тачпада: нажмите для прямого касания' : 'Прямое касание: нажмите для тачпада'}
+            >
+              {touchMode === 'touchpad' ? '▭' : '☝'}
+            </button>
+            <button onClick={() => touch.current?.showKeyboard()} title="Клавиатура">
+              ⌨
+            </button>
+          </>
+        ) : (
+          <button onClick={() => input.current?.capturePointer()} title="Захватить мышь для игр (Esc отпускает)">
+            🖱
+          </button>
+        )}
         <button onClick={() => setShowStats(!showStats)} title="Статистика">ℹ</button>
         <button onClick={() => void saveDiagnostics()} title="Скачать диагностику">⤓</button>
         <button onClick={() => void signOut()} title="Выйти">⏻</button>
@@ -213,6 +318,12 @@ export function App({ onSignedOut }: Props) {
               {String(agent['input_dropped'] ?? '—')} · ошибок {String(agent['input_errors'] ?? '—')}
             </div>
           )}
+          <div class="probe">
+            <button onClick={() => void runProbe()} title="Нужна страница input-test.html во весь экран на сервере">
+              Замер ввода
+            </button>{' '}
+            {probe}
+          </div>
           {cursor.current && (
             <div class="detail">{cursor.current.describe()}</div>
           )}

@@ -1,7 +1,7 @@
 //! `SendInput`: mouse, keyboard by scan code, wheel and text through `KEYEVENTF_UNICODE`.
 //!
 //! [`translate`] turns an event into [`Injection`]s and is pure, so tests check it without touching Windows.
-//! [`SendInputSink`] sends them. Touch goes through `InjectTouchInput` (P4-9) and is not handled here.
+//! [`SendInputSink`] sends them, and hands touch to [`TouchInjector`] (`InjectTouchInput`, P4-9).
 
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     XBUTTON1, XBUTTON2,
 };
 
+use crate::touch::TouchInjector;
 use crate::{Held, InputError, InputEvent, InputSink, MouseButton};
 
 const SCAN_ENTER: u16 = 0x1c;
@@ -243,6 +244,8 @@ pub struct SendInputSink {
     held: Held,
     plan: Vec<Injection>,
     inputs: Vec<INPUT>,
+    /// Made on the first touch.
+    touch: Option<TouchInjector>,
 }
 
 impl SendInputSink {
@@ -252,6 +255,7 @@ impl SendInputSink {
             held: Held::default(),
             plan: Vec::with_capacity(64),
             inputs: Vec::with_capacity(64),
+            touch: None,
         }
     }
 
@@ -288,7 +292,16 @@ impl InputSink for SendInputSink {
             InputEvent::Button { button, down } => {
                 self.held.button(button, down);
             }
-            InputEvent::Touch(_) => return Err(InputError::Unsupported("touch")),
+            InputEvent::Touch(points) => {
+                if self.touch.is_none() {
+                    self.touch = Some(TouchInjector::new()?);
+                }
+                let geometry = self.geometry;
+                return self
+                    .touch
+                    .as_mut()
+                    .map_or(Ok(()), |t| t.touch(points, &geometry));
+            }
             _ => {}
         }
         translate(event, &self.geometry, &mut self.plan);
@@ -296,8 +309,13 @@ impl InputSink for SendInputSink {
     }
 
     fn release_all(&mut self) -> Result<(), InputError> {
+        let touch = self.touch.as_mut().map_or(Ok(()), TouchInjector::release);
         release(&mut self.held, &mut self.plan);
-        self.send()
+        self.send().and(touch)
+    }
+
+    fn tick(&mut self) -> Result<(), InputError> {
+        self.touch.as_mut().map_or(Ok(()), TouchInjector::tick)
     }
 }
 

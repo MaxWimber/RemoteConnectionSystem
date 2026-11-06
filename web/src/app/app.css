@@ -24,6 +24,21 @@ body,
   height: 100%;
   object-fit: contain;
   background: #000;
+  /* Touches go to the server, not to page scrolling and zoom. */
+  touch-action: none;
+}
+
+/* Takes the phone keyboard's typing; invisible but focusable. */
+.keyboard-field {
+  position: fixed;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  border: 0;
+  padding: 0;
+  resize: none;
 }
 
 .cursor-overlay {
@@ -89,6 +104,15 @@ button {
   background: rgba(0, 0, 0, 0.7);
   font: 12px/1.5 ui-monospace, monospace;
   pointer-events: none;
+}
+
+.stats .probe {
+  pointer-events: auto;
+}
+
+.stats .probe button {
+  min-height: 28px;
+  font-size: 12px;
 }
 
 .signin {
