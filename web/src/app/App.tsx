@@ -3,7 +3,7 @@ import { logout } from '../api/auth';
 import { InputController } from '../input/controller';
 import { CursorView } from '../input/cursor';
 import { probeInputLatency } from '../input/probe';
-import { TouchController, loadMode, type TouchMode } from '../input/touch';
+import { TouchController } from '../input/touch';
 import { buildReport, download, installErrorCapture, logEvent, recordSample } from '../stream/diagnostics';
 import { LatencyMeter, type LatencySummary } from '../stream/latency';
 import { StreamSession, type SessionState } from '../stream/session';
@@ -11,7 +11,7 @@ import { summarize, toMap, type StatsMap, type StreamSummary } from '../stream/s
 import { appTitle } from './title';
 
 const STATS_INTERVAL_MS = 1000;
-/** A phone or tablet: no mouse, so touch gestures and the screen keyboard. */
+/** A phone or tablet: no mouse, so touches and the screen keyboard. */
 const touchDevice = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
 
 interface WakeLockLike {
@@ -43,7 +43,6 @@ export function App({ onSignedOut }: Props) {
   const cursor = useRef<CursorView | null>(null);
   const keyboardField = useRef<HTMLTextAreaElement>(null);
   const touch = useRef<TouchController | null>(null);
-  const [touchMode, setTouchMode] = useState<TouchMode>(loadMode());
   const [probe, setProbe] = useState('');
   const session = useRef<StreamSession | null>(null);
   const lastStats = useRef<StatsMap | null>(null);
@@ -80,22 +79,12 @@ export function App({ onSignedOut }: Props) {
       input.current = controller;
       controller.attach();
       if (touchDevice && keyboardField.current) {
-        touch.current = new TouchController(
-          video.current,
-          keyboardField.current,
-          () => s.input,
-          logEvent,
-          () => cursor.current?.serverPosition ?? null,
-          () => cursor.current?.render(),
-        );
+        touch.current = new TouchController(video.current, keyboardField.current, () => s.input);
         touch.current.attach();
       }
       if (cursorImage.current) {
-        const view = new CursorView(
-          video.current,
-          cursorImage.current,
-          () => (controller.pointerLocked ? 'locked' : touch.current?.drawsPointer ? 'touchpad' : 'css'),
-          () => touch.current?.localPosition ?? null,
+        const view = new CursorView(video.current, cursorImage.current, () =>
+          controller.pointerLocked ? 'locked' : 'css',
         );
         cursor.current = view;
         document.addEventListener('pointerlockchange', () => view.render());
@@ -266,21 +255,9 @@ export function App({ onSignedOut }: Props) {
       <div class="toolbar" aria-label={appTitle}>
         <button onClick={fullscreen} title="Полный экран">⛶</button>
         {touchDevice ? (
-          <>
-            <button
-              onClick={() => {
-                const mode = touch.current?.toggle();
-                if (mode) setTouchMode(mode);
-                cursor.current?.render();
-              }}
-              title={touchMode === 'touchpad' ? 'Режим тачпада: нажмите для прямого касания' : 'Прямое касание: нажмите для тачпада'}
-            >
-              {touchMode === 'touchpad' ? '▭' : '☝'}
-            </button>
-            <button onClick={() => touch.current?.showKeyboard()} title="Клавиатура">
-              ⌨
-            </button>
-          </>
+          <button onClick={() => touch.current?.showKeyboard()} title="Клавиатура">
+            ⌨
+          </button>
         ) : (
           <button onClick={() => input.current?.capturePointer()} title="Захватить мышь для игр (Esc отпускает)">
             🖱

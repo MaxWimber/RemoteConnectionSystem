@@ -44,8 +44,8 @@ export function cssCursor(shape: Shape | null, visible: boolean): string {
   return `url("${shape.url}") ${shape.hotX} ${shape.hotY}, default`;
 }
 
-/** How the pointer is shown: CSS cursor on a PC, over the video under Pointer Lock, where the phone's finger put it. */
-export type CursorMode = 'css' | 'locked' | 'touchpad';
+/** How the pointer is shown: the CSS cursor of the video, or over the video under Pointer Lock. */
+export type CursorMode = 'css' | 'locked';
 
 /** A plain arrow until the server sends a shape. */
 const ARROW: Shape = {
@@ -72,8 +72,6 @@ export class CursorView {
     private readonly video: HTMLVideoElement,
     private readonly overlay: HTMLImageElement,
     private readonly mode: () => CursorMode,
-    /** The position the phone's touchpad keeps, 0..65535; it does not wait for the server. */
-    private readonly local: () => { x: number; y: number } | null = () => null,
   ) {}
 
   /** The last position the server reported, or null before the first one. */
@@ -107,9 +105,7 @@ export class CursorView {
     // On a PC the pointer follows the local mouse and is always shown: Windows may hide its own after touch
     // input and not bring it back for injected mouse moves. Under Pointer Lock a game decides.
     this.video.style.cursor = mode === 'css' && !big ? cssCursor(this.shape, true) : 'none';
-    let at: { x: number; y: number } | null = null;
-    if (mode === 'touchpad') at = this.local() ?? this.serverPosition ?? { x: 32768, y: 32768 };
-    else if ((mode === 'locked' || big) && this.visible) at = this.serverPosition;
+    const at = (mode === 'locked' || big) && this.visible ? this.serverPosition : null;
     this.overlay.hidden = at === null;
     if (!at) return;
     const shape = this.shape ?? ARROW;
