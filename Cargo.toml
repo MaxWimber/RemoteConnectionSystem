@@ -12,6 +12,7 @@ rcs-protocol = { path = "crates/rcs-protocol" }
 rcs-capture = { path = "crates/rcs-capture" }
 rcs-encode = { path = "crates/rcs-encode" }
 rcs-webrtc = { path = "crates/rcs-webrtc" }
+rcs-input = { path = "crates/rcs-input" }
 cc = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -41,6 +42,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

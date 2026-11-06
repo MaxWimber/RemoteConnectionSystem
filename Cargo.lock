@@ -717,6 +717,10 @@ dependencies = [
 [[package]]
 name = "rcs-input"
 version = "0.1.0"
+dependencies = [
+ "rcs-protocol",
+ "windows",
+]
 
 [[package]]
 name = "rcs-protocol"
