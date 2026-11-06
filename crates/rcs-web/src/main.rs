@@ -1,7 +1,8 @@
 //! `rcs-web`: the web client, sign-in, signaling and, from phase 7, files.
 //!
 //! Listens on loopback only; Caddy publishes it (docs/SECURITY.md). Without a password and TOTP set up locally
-//! with `rcs-web set-password` and `rcs-web enroll-totp` it does not start.
+//! with `rcs-web set-password` and `rcs-web enroll-totp` it does not start. `rcs-web service` is what the service
+//! control manager runs under `NT SERVICE\rcs-web` (D-025).
 
 mod agent;
 mod app;
@@ -16,16 +17,24 @@ mod util;
 #[cfg(test)]
 mod tests;
 
+use std::ffi::OsString;
+use std::fs::OpenOptions;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use rcs_protocol::BUILD_ID;
 use rcs_protocol::agent::PIPE_NAME;
 use serde_json::json;
-use tracing::info;
+use tracing::{error, info};
+use windows_service::service::{
+    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
+};
+use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::app::{AppState, Settings};
 use crate::audit::Audit;
@@ -37,13 +46,17 @@ Usage:
   rcs-web [--listen ADDR] [--static DIR] [--pipe NAME] [--base PATH] [--origin URL] [--secrets DIR] [--audit FILE]
   rcs-web set-password [--secrets DIR] [--audit FILE]
   rcs-web enroll-totp [--secrets DIR] [--audit FILE]
+  rcs-web service [options as above] [--log FILE]   run by the service control manager only
 
   --listen   loopback address, default 127.0.0.1:8080
   --static   the built web client, default web/dist
   --base     URL prefix, default /RemoteConnectionSystem
   --origin   the public origin browsers use, default https://maxwimber.ru:8444
   --secrets  default %ProgramData%\\RCS\\secrets
-  --audit    default %ProgramData%\\RCS\\logs\\audit.log";
+  --audit    default %ProgramData%\\RCS\\logs\\audit.log
+  --log      the service's log, default %ProgramData%\\RCS\\logs\\rcs-web.jsonl";
+
+const SERVICE_NAME: &str = "rcs-web";
 
 struct Options {
     listen: SocketAddr,
@@ -53,6 +66,7 @@ struct Options {
     origin: String,
     secrets: PathBuf,
     audit: PathBuf,
+    log: PathBuf,
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
@@ -64,6 +78,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         origin: "https://maxwimber.ru:8444".into(),
         secrets: secrets::default_dir(),
         audit: audit::default_path(),
+        log: audit::default_path().with_file_name("rcs-web.jsonl"),
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
@@ -76,6 +91,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--origin" => options.origin = value.trim_end_matches('/').to_string(),
             "--secrets" => options.secrets = PathBuf::from(value),
             "--audit" => options.audit = PathBuf::from(value),
+            "--log" => options.log = PathBuf::from(value),
             _ => return Err(format!("unknown option {flag}")),
         }
     }
@@ -96,11 +112,17 @@ fn parse(args: &[String]) -> Result<Options, String> {
     Ok(options)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("runtime: {e}"))
+}
+
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (command, rest) = match args.first().map(String::as_str) {
-        Some(c @ ("set-password" | "enroll-totp")) => (c, &args[1..]),
+        Some(c @ ("set-password" | "enroll-totp" | "service")) => (c, &args[1..]),
         Some("--help" | "-h" | "help") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -117,12 +139,16 @@ async fn main() -> ExitCode {
     let result = match command {
         "set-password" => set_password(&options),
         "enroll-totp" => enroll_totp(&options),
+        "service" => log_to_file(&options.log).and_then(|()| {
+            service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+                .map_err(|e| format!("{e}: this mode is started by the service control manager"))
+        }),
         _ => {
             tracing_subscriber::fmt()
                 .json()
                 .with_max_level(tracing::Level::INFO)
                 .init();
-            serve(options).await
+            runtime().and_then(|rt| rt.block_on(serve(options, std::future::pending())))
         }
     };
     match result {
@@ -153,7 +179,92 @@ fn check_secrets(store: &Store) -> Result<(), String> {
     Ok(())
 }
 
-async fn serve(options: Options) -> Result<(), String> {
+fn log_to_file(path: &PathBuf) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("log {}: {e}", path.display()))?;
+    tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(Mutex::new(file))
+        .try_init()
+        .map_err(|e| format!("logging: {e}"))?;
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        error!(panic = %info, %backtrace, "panic");
+    }));
+    Ok(())
+}
+
+define_windows_service!(ffi_service_main, service_main);
+
+fn service_main(_scm_args: Vec<OsString>) {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    if let Err(e) = parse(&args).and_then(run_service) {
+        error!(error = %e, "service failed");
+    }
+}
+
+/// Serves until the service control manager says stop; the open connections close gracefully.
+fn run_service(options: Options) -> Result<(), String> {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let stop = Mutex::new(Some(stop));
+    let handler = move |event| -> ServiceControlHandlerResult {
+        match event {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                if let Some(s) = stop.lock().ok().and_then(|mut s| s.take()) {
+                    let _ = s.send(());
+                }
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+    let status =
+        service_control_handler::register(SERVICE_NAME, handler).map_err(|e| e.to_string())?;
+    let set = |state, accepted, code| {
+        status.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: accepted,
+            exit_code: ServiceExitCode::Win32(code),
+            checkpoint: 0,
+            wait_hint: Duration::from_secs(10),
+            process_id: None,
+        })
+    };
+    set(
+        ServiceState::Running,
+        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        0,
+    )
+    .map_err(|e| e.to_string())?;
+    let result = runtime().and_then(|rt| {
+        rt.block_on(serve(options, async {
+            let _ = stopped.await;
+        }))
+    });
+    if let Err(e) = &result {
+        error!(error = %e, "rcs-web stopped");
+    }
+    let _ = set(
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        u32::from(result.is_err()),
+    );
+    result
+}
+
+async fn serve(
+    options: Options,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), String> {
     let store = Store::new(options.secrets.clone());
     check_secrets(&store)?;
     let audit = Audit::open(options.audit.clone())?;
@@ -180,6 +291,7 @@ async fn serve(options: Options) -> Result<(), String> {
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown)
     .await
     .map_err(|e| format!("server: {e}"))
 }

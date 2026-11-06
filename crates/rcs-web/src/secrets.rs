@@ -22,8 +22,9 @@ use windows::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
+use windows::Win32::Security::{LookupAccountNameW, PSID, SID_NAME_USE};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::core::{BOOL, HSTRING, PWSTR, w};
+use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR, w};
 
 use crate::util::{hex, sha256, unhex};
 
@@ -264,6 +265,40 @@ fn take_blob(blob: CRYPT_INTEGER_BLOB) -> Vec<u8> {
     }
 }
 
+/// The account `rcs-web` runs under as a service (D-025). It exists only once the service is installed.
+pub const SERVICE_ACCOUNT: &str = r"NT SERVICE\rcs-web";
+
+/// The SID of an account as `S-1-5-...`, or None when the account does not exist.
+pub fn account_sid(name: &str) -> Option<String> {
+    let name = HSTRING::from(name);
+    let mut sid = vec![0u8; 128];
+    let mut sid_len = sid.len() as u32;
+    let mut domain = vec![0u16; 256];
+    let mut domain_len = domain.len() as u32;
+    let mut kind = SID_NAME_USE::default();
+    // SAFETY: both buffers are writable for the lengths passed; the out pointers refer to live locals.
+    unsafe {
+        LookupAccountNameW(
+            PCWSTR::null(),
+            &name,
+            Some(PSID(sid.as_mut_ptr().cast())),
+            &mut sid_len,
+            Some(PWSTR(domain.as_mut_ptr())),
+            &mut domain_len,
+            &mut kind,
+        )
+    }
+    .ok()?;
+    let mut text = PWSTR::null();
+    // SAFETY: the SID lives in `sid`; `text` is a LocalAlloc string freed below.
+    unsafe {
+        ConvertSidToStringSidW(PSID(sid.as_mut_ptr().cast()), &mut text).ok()?;
+        let out = text.to_string().ok();
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        out
+    }
+}
+
 /// The SID of the account this process runs under, as `S-1-5-21-...`.
 fn current_user_sid() -> Result<String, String> {
     let mut token = HANDLE::default();
@@ -299,11 +334,17 @@ fn current_user_sid() -> Result<String, String> {
     }
 }
 
-/// Protected DACL: full control for SYSTEM, Administrators and the current account, inherited by the files.
+/// Protected DACL: full control for SYSTEM, Administrators, the current account and, once installed, the
+/// `rcs-web` service account, inherited by the files. So `set-password` run by an administrator keeps the service
+/// able to read the secrets.
 fn restrict_dir(dir: &Path) -> Result<(), String> {
     let sid = current_user_sid()?;
+    let service = account_sid(SERVICE_ACCOUNT)
+        .filter(|s| *s != sid)
+        .map(|s| format!("(A;OICI;FA;;;{s})"))
+        .unwrap_or_default();
     let sddl = HSTRING::from(format!(
-        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})"
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid}){service}"
     ));
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     // SAFETY: `sddl` is a valid wide string; `descriptor` receives a LocalAlloc block freed below.
@@ -347,6 +388,15 @@ fn restrict_dir(dir: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 pub mod tests {
+    #[test]
+    fn accounts_resolve_to_sids() {
+        assert_eq!(
+            super::account_sid(r"NT AUTHORITY\SYSTEM").as_deref(),
+            Some("S-1-5-18")
+        );
+        assert_eq!(super::account_sid(r"NT SERVICE\no-such-service-rcs"), None);
+    }
+
     use super::*;
 
     /// A fresh directory under the system temp folder for one test.

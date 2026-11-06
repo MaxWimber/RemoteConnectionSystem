@@ -1,8 +1,8 @@
 //! The agent's end of `\\.\pipe\rcs-agent`: one client at a time, length-prefixed JSON (`rcs_protocol::agent`).
 //!
-//! The pipe allows only its owner (the user who runs the agent) and SYSTEM, refuses remote clients, and is created
-//! as the first instance of its name, so another process cannot take the name first. Until phase 6 `rcs-web` runs
-//! as the same user (`docs/SECURITY.md`).
+//! The pipe allows only its owner (the user who runs the agent), SYSTEM and, once installed, the `rcs-web` service
+//! account (D-025); it refuses remote clients and is created as the first instance of its name, so another process
+//! cannot take the name first.
 
 use std::fs::File;
 use std::os::windows::io::FromRawHandle;
@@ -11,28 +11,73 @@ use rcs_protocol::agent::{Request, Response, read_message, write_message};
 use tracing::{debug, warn};
 use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Security::{
+    LookupAccountNameW, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SID_NAME_USE,
+};
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE, PIPE_WAIT,
 };
-use windows::core::{HSTRING, w};
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 const BUFFER: u32 = 64 * 1024;
 
-/// Owner and SYSTEM get full access, nobody else gets any; `P` keeps inherited entries out.
+/// The account `rcs-web` runs under as a service (D-025). It exists only once the service is installed.
+pub const SERVICE_ACCOUNT: &str = r"NT SERVICE\rcs-web";
+
+/// The SID of an account as `S-1-5-...`, or None when the account does not exist.
+pub fn account_sid(name: &str) -> Option<String> {
+    let name = HSTRING::from(name);
+    let mut sid = vec![0u8; 128];
+    let mut sid_len = sid.len() as u32;
+    let mut domain = vec![0u16; 256];
+    let mut domain_len = domain.len() as u32;
+    let mut kind = SID_NAME_USE::default();
+    // SAFETY: both buffers are writable for the lengths passed; the out pointers refer to live locals.
+    unsafe {
+        LookupAccountNameW(
+            PCWSTR::null(),
+            &name,
+            Some(PSID(sid.as_mut_ptr().cast())),
+            &mut sid_len,
+            Some(PWSTR(domain.as_mut_ptr())),
+            &mut domain_len,
+            &mut kind,
+        )
+    }
+    .ok()?;
+    let mut text = PWSTR::null();
+    // SAFETY: the SID lives in `sid`; `text` is a LocalAlloc string freed below.
+    unsafe {
+        ConvertSidToStringSidW(PSID(sid.as_mut_ptr().cast()), &mut text).ok()?;
+        let out = text.to_string().ok();
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        out
+    }
+}
+
+/// The pipe's DACL: owner, SYSTEM and the `rcs-web` service if it exists; `P` keeps inherited entries out.
+fn pipe_sddl(service_sid: Option<&str>) -> String {
+    let service = service_sid
+        .map(|s| format!("(A;;GA;;;{s})"))
+        .unwrap_or_default();
+    format!("D:P(A;;GA;;;OW)(A;;GA;;;SY){service}")
+}
+
+/// Owner, SYSTEM and the `rcs-web` service get full access, nobody else gets any.
 struct Security(PSECURITY_DESCRIPTOR);
 
 impl Security {
     fn new() -> Result<Self, String> {
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: the SDDL string is a static wide string; the out pointer is a live local, freed in Drop.
+        let sddl = HSTRING::from(pipe_sddl(account_sid(SERVICE_ACCOUNT).as_deref()));
+        // SAFETY: the SDDL string outlives the call; the out pointer is a live local, freed in Drop.
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:P(A;;GA;;;OW)(A;;GA;;;SY)"),
+                &sddl,
                 SDDL_REVISION_1,
                 &mut descriptor,
                 None,
