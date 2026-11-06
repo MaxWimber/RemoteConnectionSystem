@@ -94,7 +94,9 @@ Permissions-Policy: camera=(), microphone=()
 - `rcs-supervisor` не слушает сеть и выполняет минимум действий под SYSTEM.
 - Агент разбирает данные из сети с проверкой длины, диапазонов и типа. Паники не должны завершать службу,
   ошибочный пакет только отбрасывается.
-- `\\.\pipe\rcs-agent` использует DACL и `FILE_FLAG_FIRST_PIPE_INSTANCE`.
+- `\\.\pipe\rcs-agent` использует DACL (владелец, SYSTEM, `NT SERVICE\rcs-web`) и `FILE_FLAG_FIRST_PIPE_INSTANCE`.
+- `\\.\pipe\rcs-supervisor` открыт только SYSTEM и принимает один запрос: Ctrl+Alt+Del.
+- `rcs-web` работает под `NT SERVICE\rcs-web` без прав администратора; агент под SYSTEM в консольной сессии.
 - `SoftwareSASGeneration` меняется только с подтверждения пользователя в фазе 6.
 
 ## Журнал
