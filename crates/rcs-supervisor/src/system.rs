@@ -160,12 +160,35 @@ pub fn report_text(id: u32, text: &str) {
     let _ = unsafe { DeregisterEventSource(source) };
 }
 
+/// Puts a process into a new kill-on-close job; without one the agent would outlive a crashed supervisor, which is
+/// logged but does not stop the launch.
+fn join_new_job(process: HANDLE) -> Option<Owned> {
+    let job = match kill_on_close_job() {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(error = %e, "no job for the agent");
+            return None;
+        }
+    };
+    // SAFETY: both handles are live.
+    match unsafe { AssignProcessToJobObject(job.0, process) } {
+        Ok(()) => Some(job),
+        Err(e) => {
+            warn!(error = %e, "agent not in the job");
+            None
+        }
+    }
+}
+
 /// A running agent: its process handle and the stop event it watches.
 pub struct ProcessAgent {
     process: HANDLE,
     /// Keeps the process handle of a `Command` child alive; None for `CreateProcessAsUserW`, where `owned` does.
     _child: Option<Child>,
     _owned: Option<Owned>,
+    /// The agent's own kill-on-close job. A job takes processes of one session only, the session of its first one,
+    /// so every launch gets a new job; dropping it after the agent ended changes nothing.
+    _job: Option<Owned>,
     stop: *const StopEvent,
 }
 
@@ -211,7 +234,6 @@ pub struct WindowsPlatform {
     pub agent_args: Vec<String>,
     pub launch: Launch,
     stop: StopEvent,
-    job: Owned,
     event_log: Option<HANDLE>,
 }
 
@@ -233,7 +255,6 @@ impl WindowsPlatform {
             agent_args,
             launch,
             stop: StopEvent::create(name)?,
-            job: kill_on_close_job()?,
             event_log,
         })
     }
@@ -315,14 +336,12 @@ impl WindowsPlatform {
         .map_err(|e| format!("start agent in session {session}: {e}"))?;
         let _thread = Owned(info.hThread);
         let process = Owned(info.hProcess);
-        // SAFETY: both handles are live.
-        if let Err(e) = unsafe { AssignProcessToJobObject(self.job.0, process.0) } {
-            warn!(error = %e, "agent not in the job");
-        }
+        let job = join_new_job(process.0);
         Ok(ProcessAgent {
             process: process.0,
             _child: None,
             _owned: Some(process),
+            _job: job,
             stop: &raw const self.stop,
         })
     }
@@ -333,14 +352,12 @@ impl WindowsPlatform {
             .spawn()
             .map_err(|e| format!("start agent: {e}"))?;
         let process = HANDLE(child.as_raw_handle());
-        // SAFETY: both handles are live.
-        if let Err(e) = unsafe { AssignProcessToJobObject(self.job.0, process) } {
-            warn!(error = %e, "agent not in the job");
-        }
+        let job = join_new_job(process);
         Ok(ProcessAgent {
             process,
             _child: Some(child),
             _owned: None,
+            _job: job,
             stop: &raw const self.stop,
         })
     }
