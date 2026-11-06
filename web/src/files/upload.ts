@@ -34,6 +34,8 @@ export interface Deps {
   store: Store;
   /** Asked once when the target exists; `false` leaves the upload cancelled. */
   confirmOverwrite(name: string): Promise<boolean>;
+  /** Runs `fn` while holding `name` in every tab of this site, or returns `'busy'` at once if another holds it. */
+  exclusive<T>(name: string, fn: () => Promise<T>): Promise<T | 'busy'>;
 }
 
 export interface Source {
@@ -46,6 +48,8 @@ export interface Source {
 const SPEED_WINDOW_MS = 5000;
 const MAX_BACKOFF_MS = 30_000;
 const MAX_BAD_HASH = 3;
+/** `409` this many times in a row: someone else is writing the same upload. */
+const MAX_CONFLICTS = 3;
 
 export async function sha256Hex(data: ArrayBuffer): Promise<string> {
   const d = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
@@ -89,6 +93,11 @@ export const browserDeps = (base: string, confirmOverwrite: (name: string) => Pr
     },
   },
   confirmOverwrite,
+  exclusive: async (name, fn) => {
+    const locks = (navigator as Navigator & { locks?: LockManager }).locks;
+    if (!locks) return fn();
+    return locks.request(name, { ifAvailable: true }, async (lock) => (lock ? fn() : ('busy' as const)));
+  },
 });
 
 /** A break the client waits out: no network, a proxy error, a server restart. */
@@ -196,6 +205,7 @@ export class Upload {
   /** Sends chunks from `received` to the end; returns when the server has everything. */
   private async send(received: number): Promise<void> {
     let badHash = 0;
+    let conflicts = 0;
     let next: Promise<Prepared> | null = null;
     while (received < this.file.size) {
       const current: Prepared = await (next && (await next).offset === received ? next : this.prepare(received));
@@ -206,6 +216,7 @@ export class Upload {
       });
       if (r.status === 409) {
         const b = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+        if (++conflicts >= MAX_CONFLICTS) throw new ApiError(409, 'another_writer', b);
         received = Number(b['received'] ?? (await this.status()));
         next = null;
         continue;
@@ -217,6 +228,7 @@ export class Upload {
       const b = await check(r);
       received = Number(b['received']);
       badHash = 0;
+      conflicts = 0;
       this.progress(received);
     }
   }
@@ -227,7 +239,13 @@ export class Upload {
     return String(b['sha256'] ?? '');
   }
 
+  /** One writer per file across tabs and rows: a second one would only collide with the first (D-026). */
   async run(): Promise<void> {
+    const result = await this.deps.exclusive(this.key, () => this.loop());
+    if (result === 'busy') this.set({ phase: 'error', error: 'busy', speed: 0 });
+  }
+
+  private async loop(): Promise<void> {
     let backoff = 1000;
     let completing = false;
     for (;;) {
@@ -284,8 +302,9 @@ export class Upload {
   /** Stops sending and removes what the server has so far. */
   async cancel(): Promise<void> {
     this.abort.abort();
-    this.deps.store.remove(this.key);
+    // Without an id this one never started: the upload, if any, belongs to the writer that holds the lock.
     if (!this.id || this.view.phase === 'done') return;
+    this.deps.store.remove(this.key);
     try {
       await this.deps.fetch(this.url(`uploads/${this.id}`), {
         method: 'DELETE',

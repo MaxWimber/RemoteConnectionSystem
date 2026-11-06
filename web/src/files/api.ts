@@ -102,6 +102,10 @@ export function errorText(e: unknown): string {
 
 export function codeText(code: string): string {
   switch (code) {
+    case 'busy':
+      return 'Этот файл уже загружается: в другой строке или вкладке.';
+    case 'another_writer':
+      return 'Ту же загрузку пишет другая вкладка, эта остановлена.';
     case 'exists':
       return 'Такое имя уже есть.';
     case 'not_found':

@@ -10,6 +10,8 @@ class FakeServer {
   chunk = 4;
   /** PUTs that fail with a network error before reaching the server. */
   failPuts = new Set<number>();
+  /** Another writer gets in first on every PUT. */
+  racer = false;
   /** `complete` happens but its answer is lost. */
   loseComplete = false;
   puts = 0;
@@ -53,6 +55,7 @@ class FakeServer {
     if (method === 'PUT') {
       this.puts++;
       if (this.failPuts.has(this.puts)) throw new TypeError('Failed to fetch');
+      if (this.racer) u.data.push(0, 0, 0, 0);
       const offset = Number(url.searchParams.get('offset'));
       if (offset !== u.data.length) return json(409, { error: 'offset_mismatch', received: u.data.length });
       const data = new Uint8Array(init!.body as ArrayBuffer);
@@ -65,6 +68,8 @@ class FakeServer {
   };
 }
 
+const held = new Set<string>();
+
 function deps(server: FakeServer, overwrite = true, store = new Map<string, string>()): Deps {
   let t = 0;
   return {
@@ -75,6 +80,15 @@ function deps(server: FakeServer, overwrite = true, store = new Map<string, stri
     now: () => (t += 100),
     store: { get: (k) => store.get(k) ?? null, set: (k, v) => void store.set(k, v), remove: (k) => void store.delete(k) },
     confirmOverwrite: async () => overwrite,
+    exclusive: async (name, fn) => {
+      if (held.has(name)) return 'busy';
+      held.add(name);
+      try {
+        return await fn();
+      } finally {
+        held.delete(name);
+      }
+    },
   };
 }
 
@@ -159,6 +173,28 @@ describe('upload', () => {
     expect(u.view.phase).toBe('cancelled');
     expect(s.deletes).toBe(1);
     expect(s.uploads.size).toBe(0);
+  });
+
+  it('a second writer of the same file is refused', async () => {
+    const s = new FakeServer();
+    const d = deps(s);
+    const first = new Upload(file('0123456789'), 'same.bin', d, () => {});
+    const second = new Upload(file('0123456789'), 'same.bin', d, () => {});
+    await Promise.all([first.run(), second.run()]);
+    expect(first.view.phase).toBe('done');
+    expect(second.view.phase).toBe('error');
+    expect(second.view.error).toBe('busy');
+    await second.cancel();
+    expect(s.deletes).toBe(0);
+  });
+
+  it('stops when another tab keeps writing the same upload', async () => {
+    const s = new FakeServer();
+    s.racer = true;
+    const u = new Upload(file('0123456789abcdefghijklmnopqrstuvwxyz'), 'race.bin', deps(s), () => {});
+    await u.run();
+    expect(u.view.phase).toBe('error');
+    expect(u.view.error).toBe('another_writer');
   });
 
   it('a refused request is an error, not a retry', async () => {

@@ -119,8 +119,16 @@ export function FileManager({ base, onClose }: Props) {
     const deps = browserDeps(base, async (name) => confirm(`«${name}» уже есть в этой папке. Заменить?`));
     const added: Row[] = [];
     for (const f of Array.from(files)) {
+      const path = joinPath(dirRef.current, f.name);
+      const same = queue.current.find(
+        (r) => r.upload.active && r.view.path === path && r.view.size === f.size,
+      );
+      if (same) {
+        setMessage(`«${f.name}» уже загружается.`);
+        continue;
+      }
       const key = nextKey.current++;
-      const upload = new Upload(f, joinPath(dirRef.current, f.name), deps, (v) => update(key, v));
+      const upload = new Upload(f, path, deps, (v) => update(key, v));
       added.push({ key, upload, view: { ...upload.view } });
     }
     queue.current = [...queue.current, ...added];
