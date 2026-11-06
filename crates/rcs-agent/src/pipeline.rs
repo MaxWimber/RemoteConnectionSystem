@@ -287,6 +287,10 @@ impl Pipeline {
                 }
                 Ok(CaptureEvent::Reinitialize) => {
                     force_idr = true;
+                    info!(
+                        desktop = ?rcs_capture::desktop::attached_name(),
+                        "capture reinitialized"
+                    );
                     let size = self.capture.size();
                     if size != self.input && size.0 > 0 {
                         info!(?size, "display size changed, new encoder");

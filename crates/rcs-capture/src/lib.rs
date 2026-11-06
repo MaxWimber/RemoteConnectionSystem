@@ -1,6 +1,7 @@
 //! Screen capture.
 
 pub mod capture;
+pub mod desktop;
 pub mod dxgi;
 
 pub use capture::{

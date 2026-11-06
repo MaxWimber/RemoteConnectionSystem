@@ -90,6 +90,8 @@ pub struct CaptureCounters {
     pub reopen_failures: u64,
     /// The last of those failures.
     pub last_reopen_error: Option<String>,
+    /// Moves of the capture thread to another input desktop (`Default` and `Winlogon`, P6-4).
+    pub desktop_switches: u64,
 }
 
 impl CaptureCounters {
@@ -102,6 +104,7 @@ impl CaptureCounters {
         self.accumulated_extra += old.accumulated_extra;
         self.pool_recreated += old.pool_recreated;
         self.reopen_failures += old.reopen_failures;
+        self.desktop_switches += old.desktop_switches;
         if self.last_reopen_error.is_none() {
             self.last_reopen_error = old.last_reopen_error.clone();
         }
@@ -234,6 +237,11 @@ impl DxgiCapture {
 
     fn reopen(&mut self) -> Result<(), CaptureError> {
         self.duplication = None;
+        // The sign-in screen, the lock screen and UAC prompts are another desktop: follow the one that takes input.
+        // An ordinary user cannot open Winlogon; the thread then stays where it is and duplication waits.
+        if let Ok(Some(_)) = crate::desktop::follow_input_desktop() {
+            self.counters.desktop_switches += 1;
+        }
         let duplication =
             dxgi::duplicate(&self.adapter, &self.device, self.output_index).map_err(classify)?;
         // SAFETY: the duplication is valid.

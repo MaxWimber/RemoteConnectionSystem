@@ -30,6 +30,8 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_
 
 /// How often the thread looks at the release flag and the live session when no message comes.
 const POLL: Duration = Duration::from_millis(20);
+/// How often the thread checks which desktop takes input (P6-4).
+const DESKTOP_CHECK: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -223,9 +225,19 @@ impl Thread {
         let mut session = Session::default();
         let mut held_anything = false;
         let mut shape_id = 0u16;
+        let mut desktop_checked = Instant::now() - DESKTOP_CHECK;
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 break;
+            }
+            if desktop_checked.elapsed() >= DESKTOP_CHECK {
+                desktop_checked = Instant::now();
+                // Input goes to the desktop in front: the sign-in screen and UAC prompts are Winlogon.
+                match rcs_capture::desktop::follow_input_desktop() {
+                    Ok(Some(name)) => info!(desktop = %name, "input desktop"),
+                    Ok(None) => {}
+                    Err(e) => debug!(error = %e, "input desktop not opened"),
+                }
             }
             self.forward_cursor_shape(&mut shape_id);
             if let Err(e) = out.sink.tick() {
