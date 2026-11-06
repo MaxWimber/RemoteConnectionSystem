@@ -6,6 +6,10 @@ publish.workspace = true
 
 [dependencies]
 rcs-protocol.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+windows.workspace = true
+windows-service = "0.8"
 
 [lints]
 workspace = true

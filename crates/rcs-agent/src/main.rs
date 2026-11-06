@@ -24,11 +24,12 @@ use tracing::{Level, error, info, info_span};
 const USAGE: &str = "\
 Usage: rcs-agent [--udp ADDR] [--advertise ADDR,ADDR] [--pipe NAME] [--log DIR]
                  [--encoder auto|amf|mf] [--width W] [--height H] [--fps F] [--bitrate-mbps B] [--display N]
-                 [--input record|sendinput]
+                 [--input record|sendinput] [--stop-event NAME]
                  [--simulate-loss EVERY_MS:BURST_MS]   testing only: stop sending for BURST_MS every EVERY_MS
   --udp        UDP address for WebRTC, default 127.0.0.1:8443
   --input      record (default) checks and counts input without sending it to Windows; sendinput controls this
                computer (D-022)
+  --stop-event the supervisor's event: when it is set the agent lets go of all input and exits (D-025)
   --advertise  addresses written into the answer, default the --udp address, or the LAN address and loopback
                when --udp is 0.0.0.0";
 
@@ -40,6 +41,7 @@ struct Options {
     pipeline: pipeline::Config,
     simulate_loss: Option<rcs_webrtc::LossTest>,
     input: input::Mode,
+    stop_event: Option<String>,
 }
 
 /// Input messages waiting for the input thread (D-022).
@@ -55,6 +57,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         log: PathBuf::from("out").join("agent"),
         simulate_loss: None,
         input: input::Mode::Record,
+        stop_event: None,
         pipeline: pipeline::Config {
             display: 0,
             backend: Backend::Auto,
@@ -83,6 +86,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
                     .collect::<Result<_, _>>()?
             }
             "--pipe" => options.pipe = value.clone(),
+            "--stop-event" => options.stop_event = Some(value.clone()),
             "--input" => {
                 options.input = input::Mode::parse(value)
                     .ok_or_else(|| format!("{flag}: record or sendinput"))?
@@ -228,6 +232,10 @@ fn run(options: Options) -> Result<(), String> {
     }
     .spawn()
     .map_err(|e| format!("input thread: {e}"))?;
+    let input_thread = Arc::new(Mutex::new(Some(input_thread)));
+    if let Some(name) = &options.stop_event {
+        watch_stop_event(name, stop.clone(), input_thread.clone())?;
+    }
     let worker = pipeline::spawn(
         options.pipeline.clone(),
         server.sink(),
@@ -269,8 +277,49 @@ fn run(options: Options) -> Result<(), String> {
     });
     stop.store(true, Ordering::Relaxed);
     let _ = worker.join();
-    let _ = input_thread.join();
+    if let Some(t) = input_thread.lock().ok().and_then(|mut t| t.take()) {
+        let _ = t.join();
+    }
     served
+}
+
+/// Waits for the supervisor's stop event on its own thread. Then the input thread lets go of every key, button and
+/// contact and unplugs the gamepads, and the process exits: the pipe server blocks in `ConnectNamedPipe` and has
+/// nothing to finish.
+fn watch_stop_event(
+    name: &str,
+    stop: Arc<AtomicBool>,
+    input_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+) -> Result<(), String> {
+    use windows::Win32::System::Threading::{
+        INFINITE, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+    };
+    // SAFETY: the name outlives the call; the handle is kept by the watcher thread until the process exits.
+    let event = unsafe {
+        OpenEventW(
+            SYNCHRONIZATION_SYNCHRONIZE,
+            false,
+            &windows::core::HSTRING::from(name),
+        )
+    }
+    .map_err(|e| format!("stop event {name}: {e}"))?;
+    let raw = event.0 as usize;
+    std::thread::Builder::new()
+        .name("stop-event".into())
+        .spawn(move || {
+            let event = windows::Win32::Foundation::HANDLE(raw as *mut _);
+            // SAFETY: the handle stays open for the life of the process.
+            unsafe { WaitForSingleObject(event, INFINITE) };
+            info!("stop requested by the supervisor");
+            stop.store(true, Ordering::Relaxed);
+            if let Some(t) = input_thread.lock().ok().and_then(|mut t| t.take()) {
+                let _ = t.join();
+            }
+            info!("agent stopped");
+            std::process::exit(0);
+        })
+        .map_err(|e| format!("stop thread: {e}"))?;
+    Ok(())
 }
 
 fn status(
