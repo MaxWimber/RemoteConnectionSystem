@@ -56,6 +56,8 @@ fn fixture(policy: Policy) -> Fixture {
     file.set_totp_secret(&secret).unwrap();
     file.set_recovery_codes(&codes);
     store.save(&file).unwrap();
+    let storage = dir.join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
     let www = dir.join("www");
     std::fs::create_dir_all(&www).unwrap();
     std::fs::write(www.join("index.html"), "<!doctype html><title>t</title>").unwrap();
@@ -69,6 +71,7 @@ fn fixture(policy: Policy) -> Fixture {
         policy,
         store,
         audit: Audit::open(dir.join("audit.log")).unwrap(),
+        files: crate::files::Files::new(&storage, None, 1 << 30),
     }));
     // Requests come "from Caddy": loopback, with the browser address in X-Forwarded-For.
     let router = app::router(state.clone(), &www, BASE)
@@ -883,3 +886,5 @@ async fn websocket_closes_when_the_session_runs_out_or_is_replaced() {
     let (errors, _) = until_closed(&mut socket, Duration::from_secs(2)).await;
     assert_eq!(errors, ["session_ended"]);
 }
+
+mod files;

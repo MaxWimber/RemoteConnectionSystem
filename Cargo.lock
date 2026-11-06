@@ -831,6 +831,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",

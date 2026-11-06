@@ -9,6 +9,7 @@ mod app;
 mod audit;
 mod auth;
 mod console;
+mod files;
 mod secrets;
 mod signal;
 mod totp;
@@ -54,7 +55,9 @@ Usage:
   --origin   the public origin browsers use, default https://maxwimber.ru:8444
   --secrets  default %ProgramData%\\RCS\\secrets
   --audit    default %ProgramData%\\RCS\\logs\\audit.log
-  --log      the service's log, default %ProgramData%\\RCS\\logs\\rcs-web.jsonl";
+  --log      the service's log, default %ProgramData%\\RCS\\logs\\rcs-web.jsonl
+  --files-root      the file manager's folder, default D:\\RCS-Storage; not a drive root, not the system drive
+  --max-upload-gib  the largest upload, default 200";
 
 const SERVICE_NAME: &str = "rcs-web";
 
@@ -67,6 +70,8 @@ struct Options {
     secrets: PathBuf,
     audit: PathBuf,
     log: PathBuf,
+    files_root: PathBuf,
+    max_upload_gib: u64,
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
@@ -79,6 +84,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         secrets: secrets::default_dir(),
         audit: audit::default_path(),
         log: audit::default_path().with_file_name("rcs-web.jsonl"),
+        files_root: PathBuf::from(r"D:\RCS-Storage"),
+        max_upload_gib: 200,
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
@@ -92,6 +99,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--secrets" => options.secrets = PathBuf::from(value),
             "--audit" => options.audit = PathBuf::from(value),
             "--log" => options.log = PathBuf::from(value),
+            "--files-root" => options.files_root = PathBuf::from(value),
+            "--max-upload-gib" => {
+                options.max_upload_gib = value.parse().map_err(|e| format!("{flag}: {e}"))?;
+            }
             _ => return Err(format!("unknown option {flag}")),
         }
     }
@@ -158,6 +169,14 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The letter of the Windows drive, which `files.root` must not be on.
+fn system_drive() -> char {
+    std::env::var("SystemDrive")
+        .ok()
+        .and_then(|d| d.chars().next())
+        .unwrap_or('C')
 }
 
 /// Refuses to start until both secrets are set and readable.
@@ -276,8 +295,14 @@ async fn serve(
         policy: Policy::default(),
         store,
         audit,
+        files: files::Files::new(
+            &options.files_root,
+            Some(system_drive()),
+            options.max_upload_gib.saturating_mul(1 << 30),
+        ),
     }));
     app::spawn_sweeper(state.clone());
+    files::upload::spawn_sweeper(state.clone());
     let router = app::router(state, &options.static_dir, &options.base);
     let listener = tokio::net::TcpListener::bind(options.listen)
         .await

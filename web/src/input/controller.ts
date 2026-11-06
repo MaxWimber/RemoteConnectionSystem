@@ -185,6 +185,8 @@ export class InputController {
     // Typing into a field of this page, if one ever has focus, stays local.
     const target = e.target as HTMLElement | null;
     if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+    // So do keys inside a panel of the page, such as the file manager.
+    if (target?.closest?.('[data-local-keys]')) return;
     const scancode = scancodeFor(e.code);
     if (scancode === undefined) return;
     e.preventDefault();

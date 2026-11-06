@@ -6,12 +6,15 @@
     1. Copies rcs-supervisor.exe, rcs-agent.exe, rcs-web.exe from target\release and web\dist to C:\Program Files\RCS.
     2. Creates or updates the services: rcs-web under NT SERVICE\rcs-web, rcs-supervisor under LocalSystem; both start
        automatically and restart after a failure.
-    3. Gives NT SERVICE\rcs-web full control of the secrets, modify on the logs, read on the program folder.
+    3. Gives NT SERVICE\rcs-web full control of the secrets, modify on the logs and on files.root (-FilesRoot, phase 7),
+       read on the program folder.
     4. Registers the event source "RCS Supervisor", points the 8443/UDP firewall rule at the installed agent.
-    5. Starts both services and checks: rcs-web listens on 127.0.0.1:8080, the supervisor started the agent, Caddy
-       answers 401 without a session.
+    5. Copies deploy\Caddyfile to %ProgramData%\RCS when it changed, validates it and restarts rcs-caddy; the previous
+       file is kept as Caddyfile.before and put back if the new one does not validate.
+    6. Starts both services and checks: rcs-web listens on 127.0.0.1:8080, the supervisor started the agent, Caddy
+       answers 401 without a session, also for the file API.
   Uninstall: stops and deletes both services, removes C:\Program Files\RCS and the folder rights of the service
-  account, points the firewall rule back at target\release\rcs-agent.exe. Secrets and logs stay. Afterwards rcs-web and
+  account (files.root included), points the firewall rule back at target\release\rcs-agent.exe. Secrets and logs stay. Afterwards rcs-web and
   rcs-agent run by hand as in phases 3 to 5.
 
     powershell -ExecutionPolicy Bypass -File deploy\install.ps1
@@ -22,6 +25,7 @@ param(
     [string]$InstallDir = 'C:\Program Files\RCS',
     [string]$Advertise = '95.31.119.180:8443,192.168.1.12:8443,127.0.0.1:8443',
     [ValidateSet('record', 'sendinput')][string]$InputMode = 'sendinput',
+    [string]$FilesRoot = 'D:\RCS-Storage',
     [string]$OutDir
 )
 
@@ -111,7 +115,9 @@ try {
         foreach ($dir in @($secrets, $logs)) {
             if (Test-Path $dir) { Native icacls.exe @($dir, '/remove:g', $account, '/T', '/C', '/Q') -Allow @(0, 1332) | Out-Null }
         }
-        Step 'права учётной записи службы на секреты и журналы сняты'
+        # Inherited by everything below, so the folder itself is enough.
+        if (Test-Path $FilesRoot) { Native icacls.exe @($FilesRoot, '/remove:g', $account, '/C', '/Q') -Allow @(0, 1332) | Out-Null }
+        Step 'права учётной записи службы на секреты, журналы и files.root сняты'
         # The service rewrote the secrets' DACL for its own account; manual mode needs the user who runs it back.
         $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         if (Test-Path $secrets) { Native icacls.exe @($secrets, '/grant', "${user}:(OI)(CI)F", '/T', '/C', '/Q') | Out-Null }
@@ -134,6 +140,7 @@ try {
     }
     if (-not (Test-Path (Join-Path $dist 'index.html'))) { throw "Нет собранного клиента в ${dist}: npm run build." }
     if (-not (Test-Path (Join-Path $secrets 'auth.json'))) { throw 'Секреты не настроены: rcs-web set-password и enroll-totp.' }
+    if (-not (Test-Path -LiteralPath $FilesRoot -PathType Container)) { throw "Нет папки files.root: $FilesRoot." }
     $manual = Get-Process rcs-agent, rcs-web -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$release*" }
     if ($manual) { throw "Остановите вручную запущенные $(($manual | ForEach-Object Name) -join ', '): они заняли порты и канал." }
 
@@ -152,7 +159,7 @@ try {
 
     $web = Join-Path $InstallDir 'rcs-web.exe'
     $sup = Join-Path $InstallDir 'rcs-supervisor.exe'
-    $webBin = "`"\`"$web\`" service --static \`"$(Join-Path $InstallDir 'web')\`"`""
+    $webBin = "`"\`"$web\`" service --static \`"$(Join-Path $InstallDir 'web')\`" --files-root \`"$FilesRoot\`"`""
     $agentLog = Join-Path $logs 'agent'
     $supBin = "`"\`"$sup\`" service -- --udp 0.0.0.0:8443 --advertise $Advertise --input $InputMode --log \`"$agentLog\`"`""
     Install-RcsService 'rcs-web' $webBin $account 'RCS web' 'RemoteConnectionSystem: вход, сигналинг, веб-клиент на 127.0.0.1:8080.'
@@ -163,7 +170,28 @@ try {
     Native icacls.exe @($secrets, '/grant', "${account}:(OI)(CI)F", '/T', '/C', '/Q') | Out-Null
     Native icacls.exe @($logs, '/grant', "${account}:(OI)(CI)M", '/T', '/C', '/Q') | Out-Null
     Native icacls.exe @($InstallDir, '/grant', "${account}:(OI)(CI)RX", '/T', '/C', '/Q') | Out-Null
-    Step "права ${account}: секреты F, журналы M, программа RX"
+    Native icacls.exe @($FilesRoot, '/grant', "${account}:(OI)(CI)M", '/C', '/Q') | Out-Null
+    Step "права ${account}: секреты F, журналы M, $FilesRoot M, программа RX"
+
+    $caddyExe = Join-Path $data 'bin\caddy.exe'
+    $caddyConfig = Join-Path $data 'Caddyfile'
+    $caddyNew = Join-Path $PSScriptRoot 'Caddyfile'
+    $caddyChanged = (Get-FileHash -LiteralPath $caddyNew).Hash -ne (Get-FileHash -LiteralPath $caddyConfig -ErrorAction SilentlyContinue).Hash
+    $report.checks.caddyfile_changed = $caddyChanged
+    if ((Test-Path $caddyExe) -and $caddyChanged) {
+        $before = "$caddyConfig.before"
+        Copy-Item -LiteralPath $caddyConfig -Destination $before -Force
+        Copy-Item -LiteralPath $caddyNew -Destination $caddyConfig -Force
+        $old = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { & $caddyExe validate --config $caddyConfig --adapter caddyfile 2>&1 | Out-Null } finally { $ErrorActionPreference = $old }
+        if ($LASTEXITCODE -ne 0) {
+            Copy-Item -LiteralPath $before -Destination $caddyConfig -Force
+            throw "Caddyfile не прошёл проверку, прежний возвращён (код $LASTEXITCODE)."
+        }
+        Restart-Service -Name 'rcs-caddy'
+        Step 'Caddyfile обновлён (прежний: Caddyfile.before), rcs-caddy перезапущен'
+    }
 
     if (-not [Diagnostics.EventLog]::SourceExists('RCS Supervisor')) {
         New-EventLog -LogName Application -Source 'RCS Supervisor'
@@ -201,7 +229,12 @@ try {
     $code = Native curl.exe @('-s', '-o', 'NUL', '-w', '%{http_code}', '--resolve', 'maxwimber.ru:8444:127.0.0.1',
         'https://maxwimber.ru:8444/RemoteConnectionSystem/api/status') -Allow @(0, 7, 28, 35, 56)
     $report.checks.caddy_status_without_session = "$code"
-    if (-not $listening -or -not $agent -or "$code" -ne '401') {
+    $filesCode = Native curl.exe @('-s', '-o', 'NUL', '-w', '%{http_code}', '--resolve', 'maxwimber.ru:8444:127.0.0.1',
+        'https://maxwimber.ru:8444/RemoteConnectionSystem/api/files/list') -Allow @(0, 7, 28, 35, 56)
+    $report.checks.caddy_files_without_session = "$filesCode"
+    $acl = (Get-Acl -LiteralPath $FilesRoot).Access | Where-Object { $_.IdentityReference -eq $account }
+    $report.checks.files_root_rights = @($acl | ForEach-Object { "$($_.FileSystemRights)" })
+    if (-not $listening -or -not $agent -or "$code" -ne '401' -or "$filesCode" -ne '401') {
         throw "Проверка после установки не прошла: $($report.checks | ConvertTo-Json -Compress)"
     }
     Write-Host 'Установлено: rcs-web и rcs-supervisor работают, агент запущен.' -ForegroundColor Green

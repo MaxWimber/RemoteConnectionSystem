@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { logout } from '../api/auth';
+import { FileManager } from '../files/FileManager';
 import { InputController } from '../input/controller';
 import { CursorView } from '../input/cursor';
 import { GamepadPoller } from '../input/gamepads';
@@ -51,6 +52,7 @@ export function App({ onSignedOut }: Props) {
   const screenEl = useRef<HTMLDivElement>(null);
   const screenPad = useRef<ScreenPad | null>(null);
   const [padShown, setPadShown] = useState(false);
+  const [filesShown, setFilesShown] = useState(false);
   const session = useRef<StreamSession | null>(null);
   const lastStats = useRef<StatsMap | null>(null);
   const agentStatus = useRef<unknown>(null);
@@ -328,10 +330,14 @@ export function App({ onSignedOut }: Props) {
             🖱
           </button>
         )}
+        <button onClick={() => setFilesShown(!filesShown)} title="Файлы">
+          📁
+        </button>
         <button onClick={() => setShowStats(!showStats)} title="Статистика">ℹ</button>
         <button onClick={() => void saveDiagnostics()} title="Скачать диагностику">⤓</button>
         <button onClick={() => void signOut()} title="Выйти">⏻</button>
       </div>
+      {filesShown && <FileManager base={import.meta.env.BASE_URL} onClose={() => setFilesShown(false)} />}
       {showStats && (
         <div class="stats">
           <div>

@@ -24,6 +24,13 @@ https://maxwimber.ru:8444 {
 			roll_size 10MiB
 			roll_keep 5
 		}
+		# File paths are personal data (docs/SECURITY.md): the file API's ?path= is dropped from the logged address.
+		format filter {
+			wrap json
+			request>uri query {
+				delete path
+			}
+		}
 	}
 
 	# Deferred, so these replace what rcs-web sent instead of doubling it. includeSubDomains waits for a subdomain check.

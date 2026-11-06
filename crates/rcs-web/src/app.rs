@@ -20,6 +20,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use crate::agent;
 use crate::audit::Audit;
 use crate::auth::{self, Limiter, Policy, Sessions, Stage, json_error};
+use crate::files::{self, Files};
 use crate::secrets::Store;
 use crate::signal;
 
@@ -45,6 +46,7 @@ pub struct AppState {
     pub origin: String,
     /// `Path` of the cookie: the base path with a trailing slash.
     pub cookie_path: String,
+    pub files: Files,
 }
 
 pub struct Settings {
@@ -54,6 +56,7 @@ pub struct Settings {
     pub policy: Policy,
     pub store: Store,
     pub audit: Audit,
+    pub files: Files,
 }
 
 impl AppState {
@@ -70,6 +73,7 @@ impl AppState {
             audit: s.audit,
             origin: s.origin,
             cookie_path: format!("{}/", s.base),
+            files: s.files,
         }
     }
 }
@@ -98,6 +102,7 @@ pub fn router(state: Arc<AppState>, static_dir: &Path, base: &str) -> Router {
         .route("/signal", get(signal::signal))
         .route("/status", get(status))
         .route("/health", get(|| async { "ok" }))
+        .merge(files::routes())
         .fallback(|| async { json_error(StatusCode::NOT_FOUND, "not_found") })
         .layer(middleware::from_fn_with_state(state.clone(), auth::guard))
         .layer(DefaultBodyLimit::max(16 * 1024))

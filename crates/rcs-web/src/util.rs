@@ -45,12 +45,8 @@ pub fn unix_seconds(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// `2026-11-05T12:34:56.789Z`.
-pub fn rfc3339(time: SystemTime) -> String {
-    let since = time.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let secs = since.as_secs();
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
+/// Days since 1970-01-01 to (year, month, day).
+fn civil(days: i64) -> (i64, i64, i64) {
     // Days to civil date, from Howard Hinnant's algorithm.
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -61,12 +57,41 @@ pub fn rfc3339(time: SystemTime) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// `2026-11-05T12:34:56.789Z`.
+pub fn rfc3339(time: SystemTime) -> String {
+    let since = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = since.as_secs();
+    let (year, month, day) = civil((secs / 86_400) as i64);
+    let rem = secs % 86_400;
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
         rem / 3600,
         rem / 60 % 60,
         rem % 60,
         since.subsec_millis()
+    )
+}
+
+/// HTTP date, `Sun, 06 Nov 1994 08:49:37 GMT` (RFC 9110).
+pub fn http_date(time: SystemTime) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let days = (secs / 86_400) as i64;
+    let (year, month, day) = civil(days);
+    let rem = secs % 86_400;
+    format!(
+        "{}, {day:02} {} {year:04} {:02}:{:02}:{:02} GMT",
+        DAYS[(days % 7) as usize],
+        MONTHS[(month - 1) as usize],
+        rem / 3600,
+        rem / 60 % 60,
+        rem % 60
     )
 }
 
@@ -90,5 +115,10 @@ mod tests {
         assert_eq!(rfc3339(t), "2026-11-05T12:34:56.789Z");
         let leap = UNIX_EPOCH + Duration::from_secs(951_782_400);
         assert_eq!(rfc3339(leap), "2000-02-29T00:00:00.000Z");
+        assert_eq!(
+            http_date(UNIX_EPOCH + Duration::from_secs(784_111_777)),
+            "Sun, 06 Nov 1994 08:49:37 GMT"
+        );
+        assert_eq!(http_date(t), "Thu, 05 Nov 2026 12:34:56 GMT");
     }
 }
