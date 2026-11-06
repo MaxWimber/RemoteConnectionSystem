@@ -3,6 +3,7 @@
 import { ClockSync, sampleFromPong } from './clock';
 import { me } from '../api/auth';
 import { InputChannels } from '../input/channels';
+import { decodeServer, type ServerMessage as CursorMessage } from '../input/protocol';
 import { watchNetwork } from './network';
 import { CLOSE_SESSION_ENDED, Signaling, signalUrl, type ServerMessage } from './signaling';
 
@@ -14,6 +15,8 @@ export interface SessionEvents {
   stream(stream: MediaStream): void;
   /** The sign-in session ended (logout, expiry, a sign-in elsewhere): show the sign-in page. */
   signedOut(): void;
+  /** The server's pointer: shape on control, position on input-fast. */
+  cursor?(message: CursorMessage): void;
 }
 
 /** Wait before the n-th reconnect attempt: 1 s, 2 s, 4 s, then 5 s. */
@@ -174,7 +177,7 @@ export class StreamSession {
     }
     // The control channel carries the server clock now (PROTOCOL.md) and settings and input from phase 4.
     this.openControl(pc.createDataChannel('control', { ordered: true }));
-    this.inputChannels = new InputChannels(pc);
+    this.inputChannels = new InputChannels(pc, (m) => this.events.cursor?.(m));
     pc.ontrack = (e) => {
       const receiver = e.receiver as RTCRtpReceiver & {
         jitterBufferTarget?: number | null;
@@ -225,8 +228,14 @@ export class StreamSession {
       channel.send(JSON.stringify({ t: 'ping', id, client_ts: now }));
       this.pingTimer = window.setTimeout(ping, id < 10 ? 200 : 5000);
     };
+    channel.binaryType = 'arraybuffer';
     channel.onopen = ping;
     channel.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer) {
+        const m = decodeServer(new Uint8Array(e.data));
+        if (!('error' in m)) this.events.cursor?.(m);
+        return;
+      }
       if (typeof e.data !== 'string') return;
       let m: Record<string, unknown>;
       try {

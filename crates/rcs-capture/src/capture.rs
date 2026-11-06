@@ -3,6 +3,9 @@
 //! The duplicated desktop texture belongs to the OS and may change once the frame is released, so every new frame
 //! is copied on the GPU into the next texture of a small pool and the duplication frame is released right away.
 //! Nothing is mapped or read back: the pool textures have no CPU access.
+//!
+//! Desktop Duplication does not draw the pointer into the image. Its position and shape come with the frame info
+//! and are kept in [`Pointer`] for the browser to draw (P4-7).
 
 use std::time::{Duration, Instant};
 
@@ -13,8 +16,8 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter1, IDXGIOutputDuplication,
-    IDXGIResource,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    IDXGIAdapter1, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::core::{Error, Interface};
@@ -115,6 +118,39 @@ pub struct MemoryFacts {
     pub format: i32,
 }
 
+/// Pointer shape kinds, `DXGI_OUTDUPL_POINTER_SHAPE_TYPE`.
+pub const SHAPE_MONOCHROME: u32 = 1;
+pub const SHAPE_COLOR: u32 = 2;
+pub const SHAPE_MASKED_COLOR: u32 = 4;
+
+/// A pointer shape as Desktop Duplication gives it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PointerShape {
+    /// One of the `SHAPE_` constants.
+    pub kind: u32,
+    pub width: u32,
+    /// For monochrome shapes this is twice the visible height: the AND mask, then the XOR mask.
+    pub height: u32,
+    pub pitch: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+    pub data: Vec<u8>,
+}
+
+/// The pointer on the captured output.
+#[derive(Debug, Clone, Default)]
+pub struct Pointer {
+    pub visible: bool,
+    /// Top-left corner of the shape, in output pixels; the hot spot is `shape.hot_x` and `hot_y` from here.
+    pub x: i32,
+    pub y: i32,
+    /// Grows with every position report.
+    pub moves: u64,
+    pub shape: PointerShape,
+    /// Grows with every new shape.
+    pub shapes: u64,
+}
+
 pub struct DxgiCapture {
     adapter: IDXGIAdapter1,
     device: ID3D11Device,
@@ -129,6 +165,7 @@ pub struct DxgiCapture {
     last: Option<usize>,
     last_acquired: Option<Instant>,
     qpc_frequency: f64,
+    pointer: Pointer,
     pub counters: CaptureCounters,
     pub memory: MemoryFacts,
 }
@@ -165,6 +202,7 @@ impl DxgiCapture {
             last: None,
             last_acquired: None,
             qpc_frequency: frequency.max(1) as f64,
+            pointer: Pointer::default(),
             counters: CaptureCounters::default(),
             memory: MemoryFacts::default(),
         };
@@ -269,6 +307,55 @@ impl DxgiCapture {
     pub fn last_acquired(&self) -> Option<Instant> {
         self.last_acquired
     }
+
+    /// The pointer as last reported. Compare `moves` and `shapes` to see what changed.
+    pub fn pointer(&self) -> &Pointer {
+        &self.pointer
+    }
+
+    /// Reads the pointer from the frame info. Must run while the frame is held.
+    fn read_pointer(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO) {
+        if info.LastMouseUpdateTime != 0 {
+            self.pointer.visible = info.PointerPosition.Visible.as_bool();
+            self.pointer.x = info.PointerPosition.Position.x;
+            self.pointer.y = info.PointerPosition.Position.y;
+            self.pointer.moves += 1;
+        }
+        let size = info.PointerShapeBufferSize;
+        if size == 0 {
+            return;
+        }
+        let Some(duplication) = self.duplication.as_ref() else {
+            return;
+        };
+        // The buffer of the last shape is reused; it only grows when a bigger shape comes.
+        let data = &mut self.pointer.shape.data;
+        data.resize(size as usize, 0);
+        let mut required = 0;
+        let mut shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+        // SAFETY: the buffer holds `size` bytes as the call is told; the out pointers refer to live locals; a frame
+        // is held, as the call requires.
+        let read = unsafe {
+            duplication.GetFramePointerShape(
+                size,
+                data.as_mut_ptr().cast(),
+                &mut required,
+                &mut shape,
+            )
+        };
+        if read.is_err() {
+            return;
+        }
+        data.truncate(required as usize);
+        let s = &mut self.pointer.shape;
+        s.kind = shape.Type;
+        s.width = shape.Width;
+        s.height = shape.Height;
+        s.pitch = shape.Pitch;
+        s.hot_x = shape.HotSpot.x.max(0) as u32;
+        s.hot_y = shape.HotSpot.y.max(0) as u32;
+        self.pointer.shapes += 1;
+    }
 }
 
 fn classify(error: Error) -> CaptureError {
@@ -317,6 +404,8 @@ impl Capture for DxgiCapture {
         }
         let acquired_at = Instant::now();
         let acquired_qpc = qpc_now();
+        self.read_pointer(&info);
+        let duplication = self.duplication.as_ref().expect("checked above");
 
         if info.LastPresentTime == 0 {
             // Only the pointer moved: no new desktop image.

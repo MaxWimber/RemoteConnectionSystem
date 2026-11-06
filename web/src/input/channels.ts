@@ -1,6 +1,6 @@
 // The two input data channels of one RTCPeerConnection, docs/PROTOCOL.md.
 
-import { encodeClient, nextSeq, type ClientMessage } from './protocol';
+import { decodeServer, encodeClient, nextSeq, seqNewer, type ClientMessage, type ServerMessage } from './protocol';
 
 /** Over this much waiting data a mouse move is dropped: the next one carries the newer position anyway. */
 const FAST_BUFFER_LIMIT = 16 * 1024;
@@ -12,12 +12,22 @@ export class InputChannels {
   private relativeSeq = 0;
   /** Sums of relative movement since the session started, which the protocol sends (PROTOCOL.md). */
   private relativeSum = { dx: 0, dy: 0 };
+  private cursorSeq: number | null = null;
 
-  constructor(pc: RTCPeerConnection) {
+  /** `onServer` gets the server's pointer positions, newest only: input-fast is unordered. */
+  constructor(pc: RTCPeerConnection, onServer?: (m: ServerMessage) => void) {
     this.fast = pc.createDataChannel('input-fast', { ordered: false, maxRetransmits: 0 });
     this.reliable = pc.createDataChannel('input-reliable', { ordered: true });
     this.fast.binaryType = 'arraybuffer';
     this.reliable.binaryType = 'arraybuffer';
+    this.fast.onmessage = (e: MessageEvent) => {
+      if (!(e.data instanceof ArrayBuffer) || !onServer) return;
+      const m = decodeServer(new Uint8Array(e.data));
+      if ('error' in m || m.type !== 'cursor_state') return;
+      if (this.cursorSeq !== null && !seqNewer(m.seq, this.cursorSeq)) return;
+      this.cursorSeq = m.seq;
+      onServer(m);
+    };
   }
 
   get open(): boolean {

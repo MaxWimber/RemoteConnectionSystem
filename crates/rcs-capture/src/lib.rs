@@ -4,6 +4,7 @@ pub mod capture;
 pub mod dxgi;
 
 pub use capture::{
-    Capture, CaptureError, CaptureEvent, CapturedFrame, DxgiCapture, TimerResolution,
+    Capture, CaptureError, CaptureEvent, CapturedFrame, DxgiCapture, Pointer, PointerShape,
+    TimerResolution,
 };
 pub use dxgi::{AdapterInfo, DuplicationReport, OutputInfo};

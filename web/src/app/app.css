@@ -26,6 +26,12 @@ body,
   background: #000;
 }
 
+.cursor-overlay {
+  position: fixed;
+  pointer-events: none;
+  image-rendering: pixelated;
+}
+
 .status {
   position: absolute;
   inset: 0;

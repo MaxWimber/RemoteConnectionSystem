@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { logout } from '../api/auth';
 import { InputController } from '../input/controller';
+import { CursorView } from '../input/cursor';
 import { buildReport, download, installErrorCapture, logEvent, recordSample } from '../stream/diagnostics';
 import { LatencyMeter, type LatencySummary } from '../stream/latency';
 import { StreamSession, type SessionState } from '../stream/session';
@@ -30,6 +31,8 @@ interface Props {
 
 export function App({ onSignedOut }: Props) {
   const video = useRef<HTMLVideoElement>(null);
+  const cursorImage = useRef<HTMLImageElement>(null);
+  const cursor = useRef<CursorView | null>(null);
   const session = useRef<StreamSession | null>(null);
   const lastStats = useRef<StatsMap | null>(null);
   const agentStatus = useRef<unknown>(null);
@@ -54,14 +57,22 @@ export function App({ onSignedOut }: Props) {
         if (video.current) video.current.srcObject = stream;
       },
       signedOut: () => onSignedOut('Сессия завершена: выход, истечение срока или вход с другого устройства.'),
+      cursor: (m) => cursor.current?.handle(m),
     });
     session.current = s;
     s.start();
     if (video.current) {
       meter.current = new LatencyMeter(video.current, () => s.clock);
       meter.current.start();
-      input.current = new InputController(video.current, () => s.input, logEvent);
-      input.current.attach();
+      const controller = new InputController(video.current, () => s.input, logEvent);
+      input.current = controller;
+      controller.attach();
+      if (cursorImage.current) {
+        const view = new CursorView(video.current, cursorImage.current, () => controller.pointerLocked);
+        cursor.current = view;
+        document.addEventListener('pointerlockchange', () => view.render());
+        window.addEventListener('resize', () => view.render());
+      }
     }
     return () => {
       input.current?.detach();
@@ -149,6 +160,7 @@ export function App({ onSignedOut }: Props) {
   return (
     <div class="screen">
       <video ref={video} class="video" autoplay muted playsInline disablePictureInPicture />
+      <img ref={cursorImage} class="cursor-overlay" alt="" hidden />
       {message && (
         <div class="status">
           <div>{message}</div>
@@ -200,6 +212,9 @@ export function App({ onSignedOut }: Props) {
               ввод: {String(agent['input'] ?? '—')} · событий {String(agent['input_events'] ?? '—')} · отброшено{' '}
               {String(agent['input_dropped'] ?? '—')} · ошибок {String(agent['input_errors'] ?? '—')}
             </div>
+          )}
+          {cursor.current && (
+            <div class="detail">{cursor.current.describe()}</div>
           )}
         </div>
       )}

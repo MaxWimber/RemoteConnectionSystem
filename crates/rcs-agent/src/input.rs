@@ -3,6 +3,8 @@
 //! It lets go of every key, button and contact when the media session ends or changes, when the network thread
 //! asks for it (an input channel closed, a message was dropped), on `ReleaseAll` and when the agent stops. Messages
 //! of a session that is no longer open are dropped, so nothing presses a key after the release.
+//!
+//! It also turns new pointer shapes from the capture thread into `CursorShape` messages (P4-7, D-022).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -10,10 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use rcs_capture::PointerShape;
 use rcs_input::sendinput::{Geometry, SendInputSink};
 use rcs_input::{InputError, InputEvent, InputSink, RecordingSink};
-use rcs_protocol::input::{ClientMessage, SeqFilter};
-use rcs_webrtc::InputMessage;
+use rcs_protocol::input::{ClientMessage, SeqFilter, ServerMessage};
+use rcs_webrtc::{FrameSink, InputMessage};
 use tracing::{debug, info, warn};
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
@@ -151,6 +154,8 @@ pub struct Thread {
     pub monitor: Arc<dyn Fn() -> Option<[i32; 4]> + Send + Sync>,
     pub stats: Arc<Stats>,
     pub stop: Arc<AtomicBool>,
+    /// New pointer shapes from the capture thread, and where their messages go.
+    pub cursor: Option<(Receiver<PointerShape>, FrameSink)>,
 }
 
 impl Thread {
@@ -178,10 +183,12 @@ impl Thread {
         info!(mode = self.mode.name(), "input thread started");
         let mut session = Session::default();
         let mut held_anything = false;
+        let mut shape_id = 0u16;
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
+            self.forward_cursor_shape(&mut shape_id);
             match self.receiver.recv_timeout(POLL) {
                 Ok(m) => {
                     if m.session != self.live.load(Ordering::Relaxed) {
@@ -232,6 +239,39 @@ impl Thread {
                 self.stats.stale.fetch_add(1, Ordering::Relaxed);
             }
             Action::Ignored => debug!(?message, "input message not handled in this phase"),
+        }
+    }
+
+    /// Encodes the newest waiting pointer shape, if any. Older ones in the queue are skipped.
+    fn forward_cursor_shape(&self, shape_id: &mut u16) {
+        let Some((shapes, frames)) = &self.cursor else {
+            return;
+        };
+        let Some(shape) = shapes.try_iter().last() else {
+            return;
+        };
+        let Some(e) = crate::cursor::encode(&shape) else {
+            debug!(
+                kind = shape.kind,
+                width = shape.width,
+                height = shape.height,
+                "pointer shape skipped"
+            );
+            return;
+        };
+        *shape_id = shape_id.wrapping_add(1);
+        let mut message = Vec::with_capacity(11 + e.png.len());
+        let fits = ServerMessage::CursorShape {
+            shape_id: *shape_id,
+            hot_x: e.hot_x,
+            hot_y: e.hot_y,
+            width: e.width,
+            height: e.height,
+            png: e.png,
+        }
+        .encode(&mut message);
+        if fits {
+            frames.set_cursor_shape(message);
         }
     }
 
@@ -326,6 +366,7 @@ mod tests {
             monitor: Arc::new(|| None),
             stats: stats.clone(),
             stop: stop.clone(),
+            cursor: None,
         }
         .spawn()
         .unwrap();

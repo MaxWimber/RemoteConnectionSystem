@@ -5,11 +5,14 @@
 //! encoded only while a browser is connected. No network or disk I/O happens here.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use rcs_capture::{Capture, CaptureError, CaptureEvent, DxgiCapture, TimerResolution, dxgi};
+use rcs_capture::{
+    Capture, CaptureError, CaptureEvent, DxgiCapture, Pointer, PointerShape, TimerResolution, dxgi,
+};
 use rcs_encode::amf::EncoderConfig;
 use rcs_encode::{Backend, EncodedFrame, Encoder};
 use rcs_webrtc::{FrameSink, VideoFrame};
@@ -57,12 +60,58 @@ pub struct Stats {
 pub fn spawn(
     config: Config,
     sink: FrameSink,
+    shapes: SyncSender<PointerShape>,
     stats: Arc<Stats>,
     stop: Arc<AtomicBool>,
 ) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("capture-encode".into())
-        .spawn(move || run(&config, &sink, &stats, &stop))
+        .spawn(move || run(&config, &sink, &shapes, &stats, &stop))
+}
+
+/// The pointer's hot spot as 0..65535 over an output of `size`, and whether it is on that output.
+pub fn hot_spot(pointer: &Pointer, size: (u32, u32)) -> (bool, u16, u16) {
+    let x = i64::from(pointer.x) + i64::from(pointer.shape.hot_x);
+    let y = i64::from(pointer.y) + i64::from(pointer.shape.hot_y);
+    let (w, h) = (i64::from(size.0.max(1)), i64::from(size.1.max(1)));
+    let inside = (0..w).contains(&x) && (0..h).contains(&y);
+    let along = |v: i64, n: i64| {
+        if n <= 1 {
+            0
+        } else {
+            ((v.clamp(0, n - 1) * 65_535 + (n - 1) / 2) / (n - 1)) as u16
+        }
+    };
+    (pointer.visible && inside, along(x, w), along(y, h))
+}
+
+/// Passes pointer changes on: the position straight to the network thread, a new shape to the input thread.
+#[derive(Default)]
+struct PointerSeen {
+    moves: u64,
+    shapes: u64,
+}
+
+impl PointerSeen {
+    fn forward(
+        &mut self,
+        capture: &DxgiCapture,
+        sink: &FrameSink,
+        shapes: &SyncSender<PointerShape>,
+    ) {
+        let p = capture.pointer();
+        if p.moves == self.moves && p.shapes == self.shapes {
+            return;
+        }
+        let (visible, x, y) = hot_spot(p, capture.size());
+        sink.set_cursor(visible, x, y);
+        if p.shapes != self.shapes && p.shape.width > 0 {
+            // A full queue means the input thread is behind; the next shape replaces this one.
+            let _ = shapes.try_send(p.shape.clone());
+        }
+        self.moves = p.moves;
+        self.shapes = p.shapes;
+    }
 }
 
 fn note_error(stats: &Stats, error: String) {
@@ -72,7 +121,13 @@ fn note_error(stats: &Stats, error: String) {
     }
 }
 
-fn run(config: &Config, sink: &FrameSink, stats: &Stats, stop: &AtomicBool) {
+fn run(
+    config: &Config,
+    sink: &FrameSink,
+    shapes: &SyncSender<PointerShape>,
+    stats: &Stats,
+    stop: &AtomicBool,
+) {
     let _timer = TimerResolution::new(1);
     let mut first = true;
     while !stop.load(Ordering::Relaxed) {
@@ -82,7 +137,7 @@ fn run(config: &Config, sink: &FrameSink, stats: &Stats, stop: &AtomicBool) {
         first = false;
         match Pipeline::open(config, stats) {
             Ok(mut pipeline) => {
-                if let Err(e) = pipeline.run(config, sink, stats, stop) {
+                if let Err(e) = pipeline.run(config, sink, shapes, stats, stop) {
                     note_error(stats, e);
                     pipeline.capture.release();
                 }
@@ -160,9 +215,11 @@ impl Pipeline {
         &mut self,
         config: &Config,
         sink: &FrameSink,
+        shapes: &SyncSender<PointerShape>,
         stats: &Stats,
         stop: &AtomicBool,
     ) -> Result<(), String> {
+        let mut pointer = PointerSeen::default();
         let fps = f64::from(config.fps.max(1));
         let frame_interval = Duration::from_secs_f64(1.0 / fps);
         let repeat_interval = Duration::from_secs_f64(1.0 / REPEAT_FPS);
@@ -259,6 +316,7 @@ impl Pipeline {
                 }
                 Err(e) => return Err(e.to_string()),
             }
+            pointer.forward(&self.capture, sink, shapes);
             if repeat_due && let Some(frame) = self.capture.last_frame() {
                 last_submit = Instant::now();
                 let idr = std::mem::take(&mut force_idr);
@@ -325,4 +383,39 @@ fn encode(
     });
     stats.frames_encoded.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hot_spot_is_the_shape_corner_plus_the_hot_offset() {
+        let mut p = Pointer {
+            visible: true,
+            x: 958,
+            y: 530,
+            ..Pointer::default()
+        };
+        p.shape.hot_x = 2;
+        p.shape.hot_y = 10;
+        assert_eq!(hot_spot(&p, (1920, 1080)), (true, 32785, 32798));
+        p.x = 0;
+        p.y = 0;
+        p.shape.hot_x = 0;
+        p.shape.hot_y = 0;
+        assert_eq!(hot_spot(&p, (1920, 1080)), (true, 0, 0));
+        p.x = 1919;
+        p.y = 1079;
+        assert_eq!(hot_spot(&p, (1920, 1080)), (true, 65535, 65535));
+        // The corner may be off the output while the hot spot is on it, and the reverse.
+        p.x = -5;
+        p.shape.hot_x = 5;
+        assert!(hot_spot(&p, (1920, 1080)).0);
+        p.x = 1919;
+        assert!(!hot_spot(&p, (1920, 1080)).0, "on the next monitor");
+        p.x = 100;
+        p.visible = false;
+        assert!(!hot_spot(&p, (1920, 1080)).0);
+    }
 }

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rcs_protocol::input::{ClientMessage, ParseError};
+use rcs_protocol::input::{ClientMessage, ParseError, ServerMessage};
 use serde_json::{Value, json};
 use str0m::change::SdpOffer;
 use str0m::channel::ChannelId;
@@ -139,7 +139,20 @@ pub struct CountersSnapshot {
     pub input_dropped: u64,
 }
 
+/// A cursor position packed in a u64: x in bits 0-15, y in 16-31, visible in bit 32, bit 40 once set at all.
+fn pack_cursor(visible: bool, x: u16, y: u16) -> u64 {
+    1 << 40 | u64::from(visible) << 32 | u64::from(y) << 16 | u64::from(x)
+}
+
+fn unpack_cursor(v: u64) -> Option<(bool, u16, u16)> {
+    (v & 1 << 40 != 0).then_some((v & 1 << 32 != 0, v as u16, (v >> 16) as u16))
+}
+
 struct Shared {
+    /// The latest pointer position, `pack_cursor`; 0 before the first.
+    cursor_position: AtomicU64,
+    /// A new `CursorShape` message waiting for the network thread.
+    cursor_shape: Mutex<Option<Vec<u8>>>,
     queue: Mutex<VecDeque<VideoFrame>>,
     pool: Mutex<Vec<Vec<u8>>>,
     keyframe_wanted: AtomicBool,
@@ -201,6 +214,22 @@ impl FrameSink {
     pub fn connected(&self) -> bool {
         self.shared.connected.load(Ordering::Relaxed)
     }
+
+    /// The pointer's hot spot over the picture, 0..65535. Cheap: an atomic store, and a wake only on a change.
+    pub fn set_cursor(&self, visible: bool, x: u16, y: u16) {
+        let v = pack_cursor(visible, x, y);
+        if self.shared.cursor_position.swap(v, Ordering::Relaxed) != v {
+            self.shared.wake();
+        }
+    }
+
+    /// A new pointer shape as a whole `CursorShape` message. It is also sent to every browser that connects later.
+    pub fn set_cursor_shape(&self, message: Vec<u8>) {
+        if let Ok(mut slot) = self.shared.cursor_shape.lock() {
+            *slot = Some(message);
+        }
+        self.shared.wake();
+    }
 }
 
 /// The local address a datagram arrived on. ICE matches it against our candidates, so `0.0.0.0` will not do.
@@ -260,6 +289,8 @@ impl Server {
         let local = socket.local_addr()?;
         let waker = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
         let shared = Arc::new(Shared {
+            cursor_position: AtomicU64::new(0),
+            cursor_shape: Mutex::new(None),
             queue: Mutex::new(VecDeque::with_capacity(QUEUE_FRAMES + 1)),
             pool: Mutex::new(Vec::with_capacity(POOL_BUFFERS)),
             keyframe_wanted: AtomicBool::new(false),
@@ -356,6 +387,11 @@ struct Session {
     input_reliable: Option<ChannelId>,
     /// The session number given to input messages: the value of `Counters::sessions` when it opened.
     number: u64,
+    /// The current pointer shape has gone out on `control`.
+    shape_sent: bool,
+    /// The last position sent on `input-fast`, `pack_cursor`.
+    position_sent: u64,
+    cursor_seq: u16,
 }
 
 fn unix_ms(at: SystemTime) -> f64 {
@@ -370,6 +406,10 @@ struct NetworkLoop {
     shared: Arc<Shared>,
     commands: Receiver<Command>,
     session: Option<Session>,
+    /// The latest `CursorShape` message, for every session that connects.
+    cursor_shape: Option<Vec<u8>>,
+    /// Reused for `CursorState` messages.
+    cursor_message: Vec<u8>,
     buffer: Vec<u8>,
     local: SocketAddr,
     wake_source: SocketAddr,
@@ -390,6 +430,8 @@ impl NetworkLoop {
             shared,
             commands,
             session: None,
+            cursor_shape: None,
+            cursor_message: Vec::with_capacity(8),
             buffer: vec![0; RECV_BUFFER],
             local,
             wake_source,
@@ -414,6 +456,7 @@ impl NetworkLoop {
                 Err(TryRecvError::Empty) => {}
             }
             self.send_frames();
+            self.send_cursor();
             let deadline = self.drive();
             self.wait(deadline);
         }
@@ -462,6 +505,9 @@ impl NetworkLoop {
             input_fast: None,
             input_reliable: None,
             number,
+            shape_sent: false,
+            position_sent: 0,
+            cursor_seq: 0,
         });
         if let Some(link) = &self.config.input {
             link.live.store(number, Ordering::Relaxed);
@@ -538,6 +584,55 @@ impl NetworkLoop {
                 }
             }
             recycle(&self.shared, frame.data);
+        }
+    }
+
+    /// Sends a new pointer shape on `control` and a new position on `input-fast`, once each channel is open.
+    fn send_cursor(&mut self) {
+        if let Some(shape) = self
+            .shared
+            .cursor_shape
+            .lock()
+            .ok()
+            .and_then(|mut s| s.take())
+        {
+            self.cursor_shape = Some(shape);
+            if let Some(s) = self.session.as_mut() {
+                s.shape_sent = false;
+            }
+        }
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if !session.shape_sent
+            && let (Some(id), Some(shape)) = (session.control, self.cursor_shape.as_ref())
+        {
+            session.shape_sent = true;
+            if let Some(mut channel) = session.rtc.channel(id)
+                && let Err(e) = channel.write(true, shape)
+            {
+                debug!(error = %e, "cursor shape not sent");
+            }
+        }
+        let position = self.shared.cursor_position.load(Ordering::Relaxed);
+        if position != session.position_sent
+            && let (Some(id), Some((visible, x, y))) = (session.input_fast, unpack_cursor(position))
+        {
+            session.position_sent = position;
+            session.cursor_seq = session.cursor_seq.wrapping_add(1);
+            self.cursor_message.clear();
+            ServerMessage::CursorState {
+                seq: session.cursor_seq,
+                visible,
+                x,
+                y,
+            }
+            .encode(&mut self.cursor_message);
+            if let Some(mut channel) = session.rtc.channel(id)
+                && let Err(e) = channel.write(true, &self.cursor_message)
+            {
+                debug!(error = %e, "cursor position not sent");
+            }
         }
     }
 
@@ -683,10 +778,13 @@ fn handle_event(
             info!(%label, "data channel open");
             if label == INPUT_FAST_CHANNEL {
                 session.input_fast = Some(id);
+                // The browser draws the pointer from the next position sent.
+                session.position_sent = 0;
             } else if label == INPUT_RELIABLE_CHANNEL {
                 session.input_reliable = Some(id);
             } else if label == CONTROL_CHANNEL {
                 session.control = Some(id);
+                session.shape_sent = false;
                 let hello = json!({
                     "t": "hello",
                     "protocol": 1,
@@ -840,8 +938,19 @@ mod tests {
         assert!(control_reply(b"not json", 0.0).is_none());
     }
 
+    #[test]
+    fn cursor_positions_pack_and_unpack() {
+        assert_eq!(unpack_cursor(0), None, "nothing set yet");
+        for (v, x, y) in [(true, 0, 0), (false, 65535, 1), (true, 1234, 65535)] {
+            assert_eq!(unpack_cursor(pack_cursor(v, x, y)), Some((v, x, y)));
+        }
+        assert_ne!(pack_cursor(false, 0, 0), 0);
+    }
+
     fn shared() -> Shared {
         Shared {
+            cursor_position: AtomicU64::new(0),
+            cursor_shape: Mutex::new(None),
             queue: Mutex::new(VecDeque::new()),
             pool: Mutex::new(Vec::new()),
             keyframe_wanted: AtomicBool::new(false),

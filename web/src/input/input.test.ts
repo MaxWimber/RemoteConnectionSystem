@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { InputChannels } from './channels';
+import { cssCursor, overlayPlacement } from './cursor';
 import { buttonOf, contentBox, normalized, takeWhole, wheelUnits } from './pointer';
 import { mappedCodes, scancodeFor } from './scancodes';
 
@@ -113,5 +114,39 @@ describe('input channels', () => {
     input.send({ type: 'key', down: true, scancode: 0x1e });
     input.moveAbsolute(1, 2);
     expect(channels.every((c) => c.sent.length === 0)).toBe(true);
+  });
+});
+
+describe('cursor', () => {
+  const shape = { url: 'blob:x', width: 32, height: 32, hotX: 4, hotY: 2 };
+
+  it('is drawn where the server says, scaled like the video', () => {
+    // 1920 wide picture shown 960 wide: half size.
+    const box = { left: 100, top: 50, width: 960, height: 540 };
+    const p = overlayPlacement(box, 1920, 65535, 0, shape);
+    expect(p).toEqual({ left: 100 + 959 - 2, top: 50 - 1, width: 16, height: 16 });
+  });
+
+  it('becomes the CSS cursor when the browser can show it', () => {
+    expect(cssCursor(shape, true)).toBe('url("blob:x") 4 2, default');
+    expect(cssCursor(shape, false)).toBe('none');
+    expect(cssCursor(null, true)).toBe('default');
+    expect(cssCursor({ ...shape, width: 256 }, true)).toBe('none');
+  });
+
+  it('keeps only the newest position from the unordered channel', () => {
+    const { pc, channels } = fakePeer();
+    const got: number[] = [];
+    new InputChannels(pc, (m) => got.push(m.type === 'cursor_state' ? m.x : -1));
+    const fast = channels[0] as unknown as { onmessage: (e: { data: ArrayBuffer }) => void };
+    const state = (seq: number, x: number) => {
+      const b = new Uint8Array([0x21, seq & 0xff, seq >> 8, 1, x & 0xff, x >> 8, 0, 0]);
+      fast.onmessage({ data: b.buffer });
+    };
+    state(5, 10);
+    state(4, 20);
+    state(6, 30);
+    state(6, 40);
+    expect(got).toEqual([10, 30]);
   });
 });

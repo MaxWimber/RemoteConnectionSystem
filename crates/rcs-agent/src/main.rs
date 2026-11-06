@@ -3,6 +3,7 @@
 //! Phase 2: the agent runs as the current user, sends the desktop to one browser over WebRTC and answers `rcs-web`
 //! on `\\.\pipe\rcs-agent`. UDP listens on loopback unless `--udp` names another address.
 
+mod cursor;
 mod input;
 mod pipe;
 mod pipeline;
@@ -43,6 +44,8 @@ struct Options {
 
 /// Input messages waiting for the input thread (D-022).
 const INPUT_QUEUE: usize = 1024;
+/// New pointer shapes waiting for the input thread; a shape changes a few times a second at most.
+const SHAPE_QUEUE: usize = 4;
 
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut options = Options {
@@ -211,6 +214,7 @@ fn run(options: Options) -> Result<(), String> {
     let stats = Arc::new(pipeline::Stats::default());
     let stop = Arc::new(AtomicBool::new(false));
     let input_stats = Arc::new(input::Stats::default());
+    let (shape_sender, shape_receiver) = sync_channel(SHAPE_QUEUE);
     let monitor_stats = stats.clone();
     let input_thread = input::Thread {
         mode: options.input,
@@ -220,12 +224,14 @@ fn run(options: Options) -> Result<(), String> {
         monitor: Arc::new(move || monitor_stats.info.lock().ok().and_then(|i| i.monitor)),
         stats: input_stats.clone(),
         stop: stop.clone(),
+        cursor: Some((shape_receiver, server.sink())),
     }
     .spawn()
     .map_err(|e| format!("input thread: {e}"))?;
     let worker = pipeline::spawn(
         options.pipeline.clone(),
         server.sink(),
+        shape_sender,
         stats.clone(),
         stop.clone(),
     )
