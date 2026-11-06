@@ -49,6 +49,14 @@ function Native([string]$exe, [string[]]$arguments, [int[]]$Allow = @(0)) {
     $out
 }
 
+# sc.exe with its command line exactly as written: PowerShell 5.1 breaks arguments with inner quotes.
+function Sc([string]$line) {
+    $out = Join-Path $env:TEMP 'rcs-sc.txt'
+    $p = Start-Process -FilePath sc.exe -ArgumentList $line -NoNewWindow -Wait -PassThru -RedirectStandardOutput $out
+    $text = Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue
+    if ($p.ExitCode -ne 0) { throw "sc.exe ${line}: код $($p.ExitCode)`n$text" }
+}
+
 function Remove-ServiceIfPresent([string]$name) {
     $s = Get-Service -Name $name -ErrorAction SilentlyContinue
     if (-not $s) { return }
@@ -56,7 +64,7 @@ function Remove-ServiceIfPresent([string]$name) {
         Stop-Service -Name $name -Force
         $s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
     }
-    Native sc.exe @('delete', $name) | Out-Null
+    Sc "delete $name"
     Step "служба $name удалена"
 }
 
@@ -67,16 +75,16 @@ function Set-Service([string]$name, [string]$binPath, [string]$obj, [string]$dis
             Stop-Service -Name $name -Force
             $exists.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
         }
-        Native sc.exe @('config', $name, 'binPath=', $binPath, 'obj=', $obj, 'start=', 'auto', 'DisplayName=', $display) | Out-Null
+        Sc "config $name binPath= $binPath obj= `"$obj`" start= auto DisplayName= `"$display`""
         Step "служба $name обновлена"
     } else {
-        Native sc.exe @('create', $name, 'binPath=', $binPath, 'obj=', $obj, 'start=', 'auto', 'DisplayName=', $display) | Out-Null
+        Sc "create $name binPath= $binPath obj= `"$obj`" start= auto DisplayName= `"$display`""
         Step "служба $name создана"
     }
-    Native sc.exe @('description', $name, $description) | Out-Null
+    Sc "description $name `"$description`""
     # Restart after 5 s, 10 s, then every 30 s; the failure count resets after a day.
-    Native sc.exe @('failure', $name, 'reset=', '86400', 'actions=', 'restart/5000/restart/10000/restart/30000') | Out-Null
-    Native sc.exe @('failureflag', $name, '1') | Out-Null
+    Sc "failure $name reset= 86400 actions= restart/5000/restart/10000/restart/30000"
+    Sc "failureflag $name 1"
 }
 
 function Set-AgentFirewallProgram([string]$program) {
@@ -140,13 +148,13 @@ try {
 
     $web = Join-Path $InstallDir 'rcs-web.exe'
     $sup = Join-Path $InstallDir 'rcs-supervisor.exe'
-    $webBin = "`"$web`" service --static `"$(Join-Path $InstallDir 'web')`""
+    $webBin = "`"\`"$web\`" service --static \`"$(Join-Path $InstallDir 'web')\`"`""
     $agentLog = Join-Path $logs 'agent'
-    $supBin = "`"$sup`" service -- --udp 0.0.0.0:8443 --advertise $Advertise --input $InputMode --log `"$agentLog`""
+    $supBin = "`"\`"$sup\`" service -- --udp 0.0.0.0:8443 --advertise $Advertise --input $InputMode --log \`"$agentLog\`"`""
     Set-Service 'rcs-web' $webBin $account 'RCS web' 'RemoteConnectionSystem: вход, сигналинг, веб-клиент на 127.0.0.1:8080.'
     Set-Service 'rcs-supervisor' $supBin 'LocalSystem' 'RCS supervisor' 'RemoteConnectionSystem: запускает агента захвата и ввода в консольной сессии.'
     # The supervisor follows console sessions.
-    Native sc.exe @('sidtype', 'rcs-web', 'unrestricted') | Out-Null
+    Sc 'sidtype rcs-web unrestricted'
 
     Native icacls.exe @($secrets, '/grant', "${account}:(OI)(CI)F", '/T', '/C', '/Q') | Out-Null
     Native icacls.exe @($logs, '/grant', "${account}:(OI)(CI)M", '/T', '/C', '/Q') | Out-Null
