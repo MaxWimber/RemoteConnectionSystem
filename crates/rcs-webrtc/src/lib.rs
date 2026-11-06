@@ -4,16 +4,21 @@
 //! [`FrameSink`]: a queue of two frames. When it overflows, the oldest frame is dropped and an IDR is requested, so the
 //! capture thread never waits for the network. A one-byte datagram from a loopback socket wakes the network thread
 //! when a frame or a command arrives.
+//!
+//! Messages on `input-fast` and `input-reliable` are parsed here and handed to the agent's input thread through
+//! [`InputLink`] without waiting (D-022). When that queue is full, or a session or an input channel ends, the link's
+//! `release` flag asks the input thread to let go of everything.
 
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rcs_protocol::input::{ClientMessage, ParseError};
 use serde_json::{Value, json};
 use str0m::change::SdpOffer;
 use str0m::channel::ChannelId;
@@ -45,6 +50,32 @@ pub struct Config {
     pub advertise: Vec<SocketAddr>,
     /// Testing only (P2-4): every `every` the server sends nothing for `burst`, like a short network outage.
     pub simulate_loss: Option<LossTest>,
+    /// Where input messages go. Without it they are parsed, counted and dropped.
+    pub input: Option<InputLink>,
+}
+
+/// One input message and the media session it came from: a new session number means new `seq` counters.
+#[derive(Debug)]
+pub struct InputMessage {
+    pub session: u64,
+    pub message: ClientMessage,
+}
+
+/// The network thread's end of the input queue.
+#[derive(Debug, Clone)]
+pub struct InputLink {
+    pub sender: SyncSender<InputMessage>,
+    /// Set when an input channel ends or a message was dropped: release every key and button.
+    pub release: Arc<AtomicBool>,
+    /// The number of the session that is open now, 0 when none is. Messages of any other session are stale: the
+    /// input thread drops them and lets go of what the ended session held.
+    pub live: Arc<AtomicU64>,
+}
+
+impl InputLink {
+    fn release(&self) {
+        self.release.store(true, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +116,12 @@ pub struct Counters {
     pub write_errors: AtomicU64,
     /// Datagrams held back by `Config::simulate_loss`.
     pub datagrams_dropped_test: AtomicU64,
+    /// Input messages handed to the input thread.
+    pub input_messages: AtomicU64,
+    /// Input messages of an unknown type, or malformed: wrong length, a field out of range, text on a binary channel.
+    pub input_rejected: AtomicU64,
+    /// Input messages dropped because the input queue was full.
+    pub input_dropped: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -97,6 +134,9 @@ pub struct CountersSnapshot {
     pub keyframe_requests: u64,
     pub write_errors: u64,
     pub datagrams_dropped_test: u64,
+    pub input_messages: u64,
+    pub input_rejected: u64,
+    pub input_dropped: u64,
 }
 
 struct Shared {
@@ -285,6 +325,9 @@ impl Server {
             keyframe_requests: load(&c.keyframe_requests),
             write_errors: load(&c.write_errors),
             datagrams_dropped_test: load(&c.datagrams_dropped_test),
+            input_messages: load(&c.input_messages),
+            input_rejected: load(&c.input_rejected),
+            input_dropped: load(&c.input_dropped),
         }
     }
 }
@@ -309,6 +352,10 @@ struct Session {
     /// The same moment in Unix milliseconds, for the `hello` on the control channel.
     epoch_unix_ms: f64,
     control: Option<ChannelId>,
+    input_fast: Option<ChannelId>,
+    input_reliable: Option<ChannelId>,
+    /// The session number given to input messages: the value of `Counters::sessions` when it opened.
+    number: u64,
 }
 
 fn unix_ms(at: SystemTime) -> f64 {
@@ -399,10 +446,12 @@ impl NetworkLoop {
             .sdp_api()
             .accept_offer(offer)
             .map_err(|e| format!("cannot accept the offer: {e}"))?;
-        self.shared
+        let number = self
+            .shared
             .counters
             .sessions
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         self.session = Some(Session {
             rtc,
             video: None,
@@ -410,7 +459,13 @@ impl NetworkLoop {
             epoch: now,
             epoch_unix_ms: unix_ms(SystemTime::now()) - now.elapsed().as_secs_f64() * 1000.0,
             control: None,
+            input_fast: None,
+            input_reliable: None,
+            number,
         });
+        if let Some(link) = &self.config.input {
+            link.live.store(number, Ordering::Relaxed);
+        }
         info!("session opened");
         Ok(answer.to_sdp_string())
     }
@@ -419,6 +474,10 @@ impl NetworkLoop {
         if let Some(mut s) = self.session.take() {
             s.rtc.disconnect();
             info!(why, "session ended");
+            if let Some(link) = &self.config.input {
+                link.live.store(0, Ordering::Relaxed);
+                link.release();
+            }
         }
         self.shared.connected.store(false, Ordering::Relaxed);
     }
@@ -507,7 +566,9 @@ impl NetworkLoop {
                     }
                 }
                 Ok(Output::Event(event)) => {
-                    if let Some(why) = handle_event(session, &self.shared, event) {
+                    if let Some(why) =
+                        handle_event(session, &self.shared, self.config.input.as_ref(), event)
+                    {
                         ended = Some(why);
                     }
                 }
@@ -574,7 +635,12 @@ impl NetworkLoop {
 }
 
 /// Returns why the session ended, if it did.
-fn handle_event(session: &mut Session, shared: &Shared, event: Event) -> Option<&'static str> {
+fn handle_event(
+    session: &mut Session,
+    shared: &Shared,
+    input: Option<&InputLink>,
+    event: Event,
+) -> Option<&'static str> {
     match event {
         Event::MediaAdded(added) if added.kind == MediaKind::Video => {
             let pt = session
@@ -615,7 +681,11 @@ fn handle_event(session: &mut Session, shared: &Shared, event: Event) -> Option<
         }
         Event::ChannelOpen(id, label) => {
             info!(%label, "data channel open");
-            if label == CONTROL_CHANNEL {
+            if label == INPUT_FAST_CHANNEL {
+                session.input_fast = Some(id);
+            } else if label == INPUT_RELIABLE_CHANNEL {
+                session.input_reliable = Some(id);
+            } else if label == CONTROL_CHANNEL {
                 session.control = Some(id);
                 let hello = json!({
                     "t": "hello",
@@ -632,9 +702,29 @@ fn handle_event(session: &mut Session, shared: &Shared, event: Event) -> Option<
                 send_control(session, &reply);
             }
         }
+        Event::ChannelData(data)
+            if Some(data.id) == session.input_fast || Some(data.id) == session.input_reliable =>
+        {
+            let parsed = if data.binary {
+                ClientMessage::parse(&data.data)
+            } else {
+                Err(ParseError::Malformed(0))
+            };
+            pass_input(shared, input, session.number, parsed);
+        }
         Event::ChannelClose(id) => {
             if Some(id) == session.control {
                 session.control = None;
+            }
+            if Some(id) == session.input_fast || Some(id) == session.input_reliable {
+                if Some(id) == session.input_fast {
+                    session.input_fast = None;
+                } else {
+                    session.input_reliable = None;
+                }
+                if let Some(link) = input {
+                    link.release();
+                }
             }
             debug!("data channel closed");
         }
@@ -643,8 +733,42 @@ fn handle_event(session: &mut Session, shared: &Shared, event: Event) -> Option<
     None
 }
 
-/// The label of the control channel, `docs/PROTOCOL.md`.
+/// Labels of the data channels, `docs/PROTOCOL.md`.
 const CONTROL_CHANNEL: &str = "control";
+const INPUT_FAST_CHANNEL: &str = "input-fast";
+const INPUT_RELIABLE_CHANNEL: &str = "input-reliable";
+
+/// Hands a parsed input message to the input thread without waiting, or counts why it could not.
+fn pass_input(
+    shared: &Shared,
+    input: Option<&InputLink>,
+    session: u64,
+    parsed: Result<ClientMessage, ParseError>,
+) {
+    let counters = &shared.counters;
+    let message = match parsed {
+        Ok(m) => m,
+        Err(e) => {
+            counters.input_rejected.fetch_add(1, Ordering::Relaxed);
+            debug!(error = %e, "input message rejected");
+            return;
+        }
+    };
+    let Some(link) = input else {
+        counters.input_dropped.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    match link.sender.try_send(InputMessage { session, message }) {
+        Ok(()) => {
+            counters.input_messages.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+            // A lost key release would leave the key down: let go of everything instead.
+            counters.input_dropped.fetch_add(1, Ordering::Relaxed);
+            link.release();
+        }
+    }
+}
 
 fn send_control(session: &mut Session, message: &Value) {
     let Some(id) = session.control else { return };
@@ -716,6 +840,55 @@ mod tests {
         assert!(control_reply(b"not json", 0.0).is_none());
     }
 
+    fn shared() -> Shared {
+        Shared {
+            queue: Mutex::new(VecDeque::new()),
+            pool: Mutex::new(Vec::new()),
+            keyframe_wanted: AtomicBool::new(false),
+            connected: AtomicBool::new(false),
+            counters: Counters::default(),
+            waker: UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            wake_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+        }
+    }
+
+    #[test]
+    fn input_goes_to_the_queue_and_a_full_queue_asks_for_release() {
+        let shared = shared();
+        let (sender, receiver) = sync_channel(1);
+        let link = InputLink {
+            sender,
+            release: Arc::new(AtomicBool::new(false)),
+            live: Arc::new(AtomicU64::new(4)),
+        };
+        let key = ClientMessage::Key {
+            down: true,
+            scancode: 0x1e,
+        };
+        pass_input(&shared, Some(&link), 4, Ok(key.clone()));
+        pass_input(&shared, Some(&link), 4, Ok(ClientMessage::ReleaseAll));
+        pass_input(&shared, Some(&link), 4, Err(ParseError::Unknown(0x7f)));
+        let got = receiver.try_recv().unwrap();
+        assert_eq!((got.session, got.message), (4, key));
+        assert!(
+            receiver.try_recv().is_err(),
+            "the second message did not fit"
+        );
+        assert!(link.release.load(Ordering::Relaxed));
+        let c = &shared.counters;
+        let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        assert_eq!(
+            (
+                load(&c.input_messages),
+                load(&c.input_dropped),
+                load(&c.input_rejected)
+            ),
+            (1, 1, 1)
+        );
+        pass_input(&shared, None, 4, Ok(ClientMessage::ReleaseAll));
+        assert_eq!(load(&c.input_dropped), 2, "no input thread");
+    }
+
     #[test]
     fn loss_test_drops_only_inside_the_burst() {
         let test = LossTest {
@@ -758,6 +931,7 @@ mod tests {
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             advertise: Vec::new(),
             simulate_loss: None,
+            input: None,
         })
         .expect("bind on loopback");
         assert!(server.open("not an sdp".into()).is_err());

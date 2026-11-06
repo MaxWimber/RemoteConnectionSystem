@@ -3,6 +3,7 @@
 //! Phase 2: the agent runs as the current user, sends the desktop to one browser over WebRTC and answers `rcs-web`
 //! on `\\.\pipe\rcs-agent`. UDP listens on loopback unless `--udp` names another address.
 
+mod input;
 mod pipe;
 mod pipeline;
 
@@ -10,7 +11,8 @@ use std::fs::{self, OpenOptions};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 
 use rcs_encode::Backend;
@@ -21,8 +23,11 @@ use tracing::{Level, error, info, info_span};
 const USAGE: &str = "\
 Usage: rcs-agent [--udp ADDR] [--advertise ADDR,ADDR] [--pipe NAME] [--log DIR]
                  [--encoder auto|amf|mf] [--width W] [--height H] [--fps F] [--bitrate-mbps B] [--display N]
+                 [--input record|sendinput]
                  [--simulate-loss EVERY_MS:BURST_MS]   testing only: stop sending for BURST_MS every EVERY_MS
   --udp        UDP address for WebRTC, default 127.0.0.1:8443
+  --input      record (default) checks and counts input without sending it to Windows; sendinput controls this
+               computer (D-022)
   --advertise  addresses written into the answer, default the --udp address, or the LAN address and loopback
                when --udp is 0.0.0.0";
 
@@ -33,7 +38,11 @@ struct Options {
     log: PathBuf,
     pipeline: pipeline::Config,
     simulate_loss: Option<rcs_webrtc::LossTest>,
+    input: input::Mode,
 }
+
+/// Input messages waiting for the input thread (D-022).
+const INPUT_QUEUE: usize = 1024;
 
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut options = Options {
@@ -42,6 +51,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         pipe: PIPE_NAME.into(),
         log: PathBuf::from("out").join("agent"),
         simulate_loss: None,
+        input: input::Mode::Record,
         pipeline: pipeline::Config {
             display: 0,
             backend: Backend::Auto,
@@ -70,6 +80,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
                     .collect::<Result<_, _>>()?
             }
             "--pipe" => options.pipe = value.clone(),
+            "--input" => {
+                options.input = input::Mode::parse(value)
+                    .ok_or_else(|| format!("{flag}: record or sendinput"))?
+            }
             "--log" => options.log = PathBuf::from(value),
             "--encoder" => {
                 options.pipeline.backend =
@@ -171,22 +185,44 @@ fn main() -> ExitCode {
 fn run(options: Options) -> Result<(), String> {
     let _span = info_span!("rcs", build = BUILD_ID, tool = "agent").entered();
     let _ = rcs_capture::dxgi::set_dpi_awareness();
+    let (input_sender, input_receiver) = sync_channel(INPUT_QUEUE);
+    let link = rcs_webrtc::InputLink {
+        sender: input_sender,
+        release: Arc::new(AtomicBool::new(false)),
+        live: Arc::new(AtomicU64::new(0)),
+    };
     let server = rcs_webrtc::Server::start(rcs_webrtc::Config {
         bind: options.udp,
         advertise: options.advertise.clone(),
         simulate_loss: options.simulate_loss,
+        input: Some(link.clone()),
     })
     .map_err(|e| format!("UDP {}: {e}", options.udp))?;
-    info!(udp = %server.local_addr(), advertise = ?options.advertise, pipe = %options.pipe, "agent started");
+    info!(udp = %server.local_addr(), advertise = ?options.advertise, pipe = %options.pipe,
+        input = options.input.name(), "agent started");
     println!(
-        "rcs-agent {BUILD_ID}: WebRTC {} ({:?}), канал {}",
+        "rcs-agent {BUILD_ID}: WebRTC {} ({:?}), канал {}, ввод {}",
         server.local_addr(),
         options.advertise,
-        options.pipe
+        options.pipe,
+        options.input.name()
     );
 
     let stats = Arc::new(pipeline::Stats::default());
     let stop = Arc::new(AtomicBool::new(false));
+    let input_stats = Arc::new(input::Stats::default());
+    let monitor_stats = stats.clone();
+    let input_thread = input::Thread {
+        mode: options.input,
+        receiver: input_receiver,
+        release: link.release.clone(),
+        live: link.live.clone(),
+        monitor: Arc::new(move || monitor_stats.info.lock().ok().and_then(|i| i.monitor)),
+        stats: input_stats.clone(),
+        stop: stop.clone(),
+    }
+    .spawn()
+    .map_err(|e| format!("input thread: {e}"))?;
     let worker = pipeline::spawn(
         options.pipeline.clone(),
         server.sink(),
@@ -217,10 +253,17 @@ fn run(options: Options) -> Result<(), String> {
             server.close();
             Response::SessionClosed { session_id }
         }
-        Request::Status => Response::AgentStatus(status(&server, &stats, &config)),
+        Request::Status => Response::AgentStatus(status(
+            &server,
+            &stats,
+            &config,
+            options.input,
+            &input_stats,
+        )),
     });
     stop.store(true, Ordering::Relaxed);
     let _ = worker.join();
+    let _ = input_thread.join();
     served
 }
 
@@ -228,9 +271,13 @@ fn status(
     server: &rcs_webrtc::Server,
     stats: &pipeline::Stats,
     config: &pipeline::Config,
+    mode: input::Mode,
+    input: &input::Stats,
 ) -> AgentStatus {
     let c = server.counters();
     let info = stats.info.lock().map(|i| i.clone()).unwrap_or_default();
+    let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
+    let input_error = input.last_error.lock().ok().and_then(|e| e.clone());
     AgentStatus {
         build: BUILD_ID.into(),
         connected: server.sink().connected(),
@@ -248,6 +295,12 @@ fn status(
         keyframe_requests: c.keyframe_requests,
         datagrams_dropped_test: c.datagrams_dropped_test,
         pipeline_restarts: stats.restarts.load(Ordering::Relaxed),
-        last_error: info.last_error,
+        last_error: info.last_error.or(input_error),
+        input: mode.name().into(),
+        input_events: load(&input.events),
+        input_rejected: c.input_rejected,
+        input_dropped: c.input_dropped + load(&input.stale),
+        input_errors: load(&input.errors),
+        input_releases: load(&input.releases),
     }
 }

@@ -42,6 +42,8 @@ pub struct Info {
     pub encoder: String,
     pub adapter: String,
     pub input: (u32, u32),
+    /// The captured monitor in desktop pixels: left, top, right, bottom. The input thread maps positions onto it.
+    pub monitor: Option<[i32; 4]>,
     pub last_error: Option<String>,
 }
 
@@ -101,7 +103,16 @@ fn encoder_config(config: &Config, input: (u32, u32)) -> EncoderConfig {
     c
 }
 
+fn monitor_of(adapter: &dxgi::AdapterInfo, display: u32) -> Option<[i32; 4]> {
+    adapter
+        .outputs
+        .iter()
+        .find(|o| o.index == display)
+        .map(|o| o.desktop)
+}
+
 struct Pipeline {
+    adapter_luid: u64,
     device: ID3D11Device,
     capture: DxgiCapture,
     encoder: Box<dyn Encoder>,
@@ -133,8 +144,10 @@ impl Pipeline {
             info.encoder = encoder.backend().into();
             info.adapter = adapter.info.name.clone();
             info.input = input;
+            info.monitor = monitor_of(&adapter.info, config.display);
         }
         Ok(Self {
+            adapter_luid: adapter.info.luid,
             device,
             capture,
             encoder,
@@ -227,8 +240,17 @@ impl Pipeline {
                         )
                         .map_err(|e| format!("encoder after a mode change: {e}"))?;
                         self.input = size;
+                        // A mode change moves the monitor's corners; reading them again is rare and cheap.
+                        let monitor = dxgi::enumerate_adapters().ok().and_then(|list| {
+                            list.iter()
+                                .find(|a| a.info.luid == self.adapter_luid)
+                                .and_then(|a| monitor_of(&a.info, config.display))
+                        });
                         if let Ok(mut info) = stats.info.lock() {
                             info.input = size;
+                            if monitor.is_some() {
+                                info.monitor = monitor;
+                            }
                         }
                     }
                 }

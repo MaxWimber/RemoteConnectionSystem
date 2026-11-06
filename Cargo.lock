@@ -677,6 +677,7 @@ version = "0.1.0"
 dependencies = [
  "rcs-capture",
  "rcs-encode",
+ "rcs-input",
  "rcs-protocol",
  "rcs-webrtc",
  "tracing",
@@ -767,6 +768,7 @@ dependencies = [
 name = "rcs-webrtc"
 version = "0.1.0"
 dependencies = [
+ "rcs-protocol",
  "serde_json",
  "str0m",
  "tracing",

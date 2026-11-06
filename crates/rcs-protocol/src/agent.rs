@@ -65,6 +65,23 @@ pub struct AgentStatus {
     pub datagrams_dropped_test: u64,
     pub pipeline_restarts: u64,
     pub last_error: Option<String>,
+    /// `record` or `sendinput`, the agent's `--input` (D-022).
+    #[serde(default)]
+    pub input: String,
+    /// Input events handed to Windows, or only counted in `record`.
+    #[serde(default)]
+    pub input_events: u64,
+    /// Unknown or malformed input messages.
+    #[serde(default)]
+    pub input_rejected: u64,
+    /// Dropped: the queue was full, or the message was from an ended session or had an old `seq`.
+    #[serde(default)]
+    pub input_dropped: u64,
+    /// Events Windows did not take, for example while an elevated window is in front.
+    #[serde(default)]
+    pub input_errors: u64,
+    #[serde(default)]
+    pub input_releases: u64,
 }
 
 #[derive(Debug)]
