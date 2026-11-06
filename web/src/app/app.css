@@ -106,6 +106,19 @@ button {
   pointer-events: none;
 }
 
+.notice {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  max-width: calc(100% - 32px);
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: rgba(60, 20, 20, 0.9);
+  font-size: 14px;
+  pointer-events: none;
+}
+
 .stats .probe {
   pointer-events: auto;
 }

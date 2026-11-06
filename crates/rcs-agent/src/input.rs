@@ -4,18 +4,23 @@
 //! asks for it (an input channel closed, a message was dropped), on `ReleaseAll` and when the agent stops. Messages
 //! of a session that is no longer open are dropped, so nothing presses a key after the release.
 //!
-//! It also turns new pointer shapes from the capture thread into `CursorShape` messages (P4-7, D-022).
+//! It also turns new pointer shapes from the capture thread into `CursorShape` messages (P4-7, D-022), and drives
+//! the gamepads (phase 5, D-024): neutral after 500 ms of silence and on every release, unplugged when the session
+//! ends. Without ViGEmBus the gamepads are only counted, and the bus is tried again with every new session.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rcs_capture::PointerShape;
+use rcs_input::gamepad::{
+    GamepadBackend, PadManager, PadOutcome, RecordingGamepads, VigemGamepads,
+};
 use rcs_input::sendinput::{Geometry, SendInputSink};
 use rcs_input::{InputError, InputEvent, InputSink, RecordingSink};
-use rcs_protocol::input::{ClientMessage, SeqFilter, ServerMessage};
+use rcs_protocol::input::{ClientMessage, GamepadState, SeqFilter, ServerMessage};
 use rcs_webrtc::{FrameSink, InputMessage};
 use tracing::{debug, info, warn};
 use windows::Win32::System::Threading::{
@@ -60,6 +65,10 @@ pub struct Stats {
     pub errors: AtomicU64,
     pub releases: AtomicU64,
     pub last_error: Mutex<Option<String>>,
+    /// Gamepad states applied.
+    pub gamepad_events: AtomicU64,
+    /// `vigem`, `record`, or why there are no virtual gamepads.
+    pub gamepad: Mutex<String>,
 }
 
 /// `seq` filters and relative sums of one media session.
@@ -81,15 +90,23 @@ impl Session {
     }
 }
 
-/// What one message does: an event for the sink, a release, or nothing.
+/// What one message does: an event for the sink, a gamepad state, a release, or nothing.
 #[derive(Debug, PartialEq, Eq)]
 enum Action<'a> {
     Event(InputEvent<'a>),
+    Gamepad(&'a GamepadState),
     ReleaseAll,
     /// An old `seq`.
     Stale,
-    /// Not for this phase: gamepads (phase 5), Ctrl+Alt+Del (phase 6), monitor switching.
+    /// Not for this phase: Ctrl+Alt+Del (phase 6), monitor switching.
     Ignored,
+}
+
+/// Where input goes: the sink for mouse, keyboard and touch, the backend and rules for gamepads.
+struct Outputs {
+    sink: Box<dyn InputSink>,
+    gamepads: Box<dyn GamepadBackend>,
+    pads: PadManager,
 }
 
 fn action<'a>(session: &mut Session, message: &'a ClientMessage) -> Action<'a> {
@@ -128,7 +145,8 @@ fn action<'a>(session: &mut Session, message: &'a ClientMessage) -> Action<'a> {
         ClientMessage::Touch { points } => Action::Event(InputEvent::Touch(points.as_slice())),
         ClientMessage::Text { text } => Action::Event(InputEvent::Text(text)),
         ClientMessage::ReleaseAll => Action::ReleaseAll,
-        ClientMessage::GamepadState(_) | ClientMessage::Special { .. } => Action::Ignored,
+        ClientMessage::GamepadState(g) => Action::Gamepad(g),
+        ClientMessage::Special { .. } => Action::Ignored,
     }
 }
 
@@ -169,6 +187,22 @@ impl Thread {
         Geometry::with_current_desktop((self.monitor)().unwrap_or_else(primary_monitor))
     }
 
+    /// ViGEm with `--input sendinput`, else a recorder. The status tells which, or why not ViGEm.
+    fn open_gamepads(&self) -> Box<dyn GamepadBackend> {
+        let (backend, status): (Box<dyn GamepadBackend>, String) = match self.mode {
+            Mode::Record => (Box::new(RecordingGamepads::default()), "record".into()),
+            Mode::SendInput => match VigemGamepads::connect() {
+                Ok(v) => (Box::new(v), "vigem".into()),
+                Err(reason) => (Box::new(RecordingGamepads::default()), reason),
+            },
+        };
+        info!(gamepad = %status, "gamepads");
+        if let Ok(mut s) = self.stats.gamepad.lock() {
+            *s = status;
+        }
+        backend
+    }
+
     fn run(self) {
         // SAFETY: the pseudo handle of the current thread needs no closing.
         if let Err(e) =
@@ -176,9 +210,14 @@ impl Thread {
         {
             warn!(error = %e, "input thread priority");
         }
-        let mut sink: Box<dyn InputSink> = match self.mode {
+        let sink: Box<dyn InputSink> = match self.mode {
             Mode::Record => Box::new(RecordingSink::default()),
             Mode::SendInput => Box::new(SendInputSink::new(self.geometry())),
+        };
+        let mut out = Outputs {
+            sink,
+            gamepads: self.open_gamepads(),
+            pads: PadManager::default(),
         };
         info!(mode = self.mode.name(), "input thread started");
         let mut session = Session::default();
@@ -189,7 +228,10 @@ impl Thread {
                 break;
             }
             self.forward_cursor_shape(&mut shape_id);
-            if let Err(e) = sink.tick() {
+            if let Err(e) = out.sink.tick() {
+                self.note_error(&e);
+            }
+            if let Err(e) = out.pads.tick(Instant::now(), out.gamepads.as_mut()) {
                 self.note_error(&e);
             }
             match self.receiver.recv_timeout(POLL) {
@@ -199,16 +241,20 @@ impl Thread {
                     } else {
                         if m.session != session.number {
                             // A new browser session: nothing from the old one stays down, and its seq starts over.
-                            self.release_all(sink.as_mut());
+                            self.end_session(&mut out);
                             session = Session::new(m.session);
                             if self.mode == Mode::SendInput {
                                 let g = self.geometry();
                                 info!(monitor = ?g.monitor, desktop = ?g.desktop, "input geometry");
-                                sink = Box::new(SendInputSink::new(g));
+                                out.sink = Box::new(SendInputSink::new(g));
+                                if out.gamepads.name() != "vigem" {
+                                    // ViGEmBus may have been installed since.
+                                    out.gamepads = self.open_gamepads();
+                                }
                             }
                         }
                         held_anything = true;
-                        self.apply(sink.as_mut(), &mut session, &m.message);
+                        self.apply(&mut out, &mut session, &m.message);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -217,27 +263,38 @@ impl Thread {
             let ended = session.number != 0 && self.live.load(Ordering::Relaxed) != session.number;
             if ended {
                 session = Session::default();
+                self.end_session(&mut out);
+                held_anything = false;
             }
-            if self.release.swap(false, Ordering::Relaxed) || ended {
+            if self.release.swap(false, Ordering::Relaxed) {
                 if held_anything {
-                    self.release_all(sink.as_mut());
+                    self.release_all(&mut out);
                 }
                 held_anything = false;
             }
         }
-        self.release_all(sink.as_mut());
+        self.end_session(&mut out);
         info!("input thread stopped");
     }
 
-    fn apply(&self, sink: &mut dyn InputSink, session: &mut Session, message: &ClientMessage) {
+    fn apply(&self, out: &mut Outputs, session: &mut Session, message: &ClientMessage) {
         match action(session, message) {
             Action::Event(event) => {
                 self.stats.events.fetch_add(1, Ordering::Relaxed);
-                if let Err(e) = sink.handle(&event) {
+                if let Err(e) = out.sink.handle(&event) {
                     self.note_error(&e);
                 }
             }
-            Action::ReleaseAll => self.release_all(sink),
+            Action::Gamepad(g) => match out.pads.state(g, Instant::now(), out.gamepads.as_mut()) {
+                Ok(PadOutcome::Applied) => {
+                    self.stats.gamepad_events.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(PadOutcome::Dropped) => {
+                    self.stats.stale.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => self.note_error(&e),
+            },
+            Action::ReleaseAll => self.release_all(out),
             Action::Stale => {
                 self.stats.stale.fetch_add(1, Ordering::Relaxed);
             }
@@ -278,9 +335,21 @@ impl Thread {
         }
     }
 
-    fn release_all(&self, sink: &mut dyn InputSink) {
+    /// Lets go of keys, buttons and touches, and sets the gamepads to neutral.
+    fn release_all(&self, out: &mut Outputs) {
         self.stats.releases.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = sink.release_all() {
+        if let Err(e) = out.sink.release_all() {
+            self.note_error(&e);
+        }
+        if let Err(e) = out.pads.release(out.gamepads.as_mut()) {
+            self.note_error(&e);
+        }
+    }
+
+    /// The media session is over: everything released, the virtual gamepads unplugged.
+    fn end_session(&self, out: &mut Outputs) {
+        self.release_all(out);
+        if let Err(e) = out.pads.end(out.gamepads.as_mut()) {
             self.note_error(&e);
         }
     }
@@ -339,6 +408,21 @@ mod tests {
         assert_eq!(
             action(&mut s, &ClientMessage::Special { code: 1 }),
             Action::Ignored
+        );
+        let pad = GamepadState {
+            seq: 1,
+            pad: 0,
+            buttons: 0,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        };
+        assert_eq!(
+            action(&mut s, &ClientMessage::GamepadState(pad)),
+            Action::Gamepad(&pad)
         );
     }
 

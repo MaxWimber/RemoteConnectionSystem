@@ -4,6 +4,7 @@
 //! [`Held`] remembers every key, button and touch contact that is down, so `release_all` can let go of them after
 //! a disconnect, a lost focus or a dropped message.
 
+pub mod gamepad;
 pub mod sendinput;
 pub mod touch;
 

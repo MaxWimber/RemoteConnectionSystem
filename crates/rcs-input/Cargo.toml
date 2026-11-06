@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 rcs-protocol.workspace = true
+vigem-client = "0.1.4"
 windows.workspace = true
 
 [lints]

@@ -259,13 +259,13 @@ fn run(options: Options) -> Result<(), String> {
             server.close();
             Response::SessionClosed { session_id }
         }
-        Request::Status => Response::AgentStatus(status(
+        Request::Status => Response::AgentStatus(Box::new(status(
             &server,
             &stats,
             &config,
             options.input,
             &input_stats,
-        )),
+        ))),
     });
     stop.store(true, Ordering::Relaxed);
     let _ = worker.join();
@@ -284,6 +284,7 @@ fn status(
     let info = stats.info.lock().map(|i| i.clone()).unwrap_or_default();
     let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
     let input_error = input.last_error.lock().ok().and_then(|e| e.clone());
+    let gamepad = input.gamepad.lock().map(|g| g.clone()).unwrap_or_default();
     AgentStatus {
         build: BUILD_ID.into(),
         connected: server.sink().connected(),
@@ -308,5 +309,7 @@ fn status(
         input_dropped: c.input_dropped + load(&input.stale),
         input_errors: load(&input.errors),
         input_releases: load(&input.releases),
+        gamepad,
+        gamepad_events: load(&input.gamepad_events),
     }
 }

@@ -35,7 +35,8 @@ pub enum Response {
     SessionClosed {
         session_id: String,
     },
-    AgentStatus(AgentStatus),
+    /// Boxed: it is far bigger than the other replies. Serde writes it the same as unboxed.
+    AgentStatus(Box<AgentStatus>),
     Error {
         code: String,
         message: String,
@@ -82,6 +83,11 @@ pub struct AgentStatus {
     pub input_errors: u64,
     #[serde(default)]
     pub input_releases: u64,
+    /// `vigem`, `record`, or why there are no virtual gamepads (phase 5).
+    #[serde(default)]
+    pub gamepad: String,
+    #[serde(default)]
+    pub gamepad_events: u64,
 }
 
 #[derive(Debug)]

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { logout } from '../api/auth';
 import { InputController } from '../input/controller';
 import { CursorView } from '../input/cursor';
+import { GamepadPoller } from '../input/gamepads';
 import { probeInputLatency } from '../input/probe';
 import { TouchController } from '../input/touch';
 import { buildReport, download, installErrorCapture, logEvent, recordSample } from '../stream/diagnostics';
@@ -44,6 +45,8 @@ export function App({ onSignedOut }: Props) {
   const keyboardField = useRef<HTMLTextAreaElement>(null);
   const touch = useRef<TouchController | null>(null);
   const [probe, setProbe] = useState('');
+  const gamepads = useRef<GamepadPoller | null>(null);
+  const [notice, setNotice] = useState('');
   const session = useRef<StreamSession | null>(null);
   const lastStats = useRef<StatsMap | null>(null);
   const agentStatus = useRef<unknown>(null);
@@ -78,6 +81,23 @@ export function App({ onSignedOut }: Props) {
       const controller = new InputController(video.current, () => s.input, logEvent);
       input.current = controller;
       controller.attach();
+      // P5-2: a gamepad that the server cannot take is said so, the picture goes on.
+      const checkGamepads = async () => {
+        try {
+          const r = await fetch(`${import.meta.env.BASE_URL}api/status`, { cache: 'no-store' });
+          const status = r.ok ? ((await r.json()) as Record<string, unknown>) : null;
+          const g = String(status?.['gamepad'] ?? '');
+          if (g && g !== 'vigem' && g !== 'record') {
+            setNotice(`Геймпад не передаётся: ${g}`);
+            logEvent(`геймпад: ${g}`);
+            window.setTimeout(() => setNotice(''), 8000);
+          }
+        } catch (e) {
+          logEvent(`геймпад: статус: ${String(e)}`);
+        }
+      };
+      gamepads.current = new GamepadPoller(() => s.input, logEvent, () => void checkGamepads());
+      gamepads.current.attach();
       if (touchDevice && keyboardField.current) {
         touch.current = new TouchController(video.current, keyboardField.current, () => s.input);
         touch.current.attach();
@@ -92,6 +112,7 @@ export function App({ onSignedOut }: Props) {
       }
     }
     return () => {
+      gamepads.current?.detach();
       touch.current?.detach();
       input.current?.detach();
       meter.current?.stop();
@@ -252,6 +273,7 @@ export function App({ onSignedOut }: Props) {
           {(state === 'replaced' || state === 'stopped') && <button onClick={reconnect}>Подключиться</button>}
         </div>
       )}
+      {notice && <div class="notice">{notice}</div>}
       <div class="toolbar" aria-label={appTitle}>
         <button onClick={fullscreen} title="Полный экран">⛶</button>
         {touchDevice ? (
@@ -309,6 +331,12 @@ export function App({ onSignedOut }: Props) {
             </button>{' '}
             {probe}
           </div>
+          {agent && (
+            <div class="detail">
+              геймпад: сервер {String(agent['gamepad'] || '—')} · состояний {String(agent['gamepad_events'] ?? '—')} ·
+              в браузере {gamepads.current?.connected ?? 0}
+            </div>
+          )}
           {cursor.current && (
             <div class="detail">{cursor.current.describe()}</div>
           )}

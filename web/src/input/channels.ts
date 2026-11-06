@@ -1,6 +1,14 @@
 // The two input data channels of one RTCPeerConnection, docs/PROTOCOL.md.
 
-import { decodeServer, encodeClient, nextSeq, seqNewer, type ClientMessage, type ServerMessage } from './protocol';
+import {
+  decodeServer,
+  encodeClient,
+  nextSeq,
+  seqNewer,
+  type ClientMessage,
+  type GamepadState,
+  type ServerMessage,
+} from './protocol';
 
 /** Over this much waiting data a mouse move is dropped: the next one carries the newer position anyway. */
 const FAST_BUFFER_LIMIT = 16 * 1024;
@@ -13,6 +21,7 @@ export class InputChannels {
   /** Sums of relative movement since the session started, which the protocol sends (PROTOCOL.md). */
   private relativeSum = { dx: 0, dy: 0 };
   private cursorSeq: number | null = null;
+  private padSeq = [0, 0, 0, 0];
 
   /** `onServer` gets the server's pointer positions, newest only: input-fast is unordered. */
   constructor(pc: RTCPeerConnection, onServer?: (m: ServerMessage) => void) {
@@ -45,6 +54,13 @@ export class InputChannels {
     this.relativeSum.dy = (this.relativeSum.dy + dy) | 0;
     this.relativeSeq = nextSeq(this.relativeSeq);
     this.sendFast({ type: 'mouse_move_relative', seq: this.relativeSeq, ...this.relativeSum });
+  }
+
+  /** One pad's whole state on input-fast, with that pad's own seq (PROTOCOL.md). */
+  sendGamepad(pad: number, state: Omit<GamepadState, 'type' | 'seq' | 'pad'>): void {
+    const seq = nextSeq(this.padSeq[pad] ?? 0);
+    this.padSeq[pad] = seq;
+    this.sendFast({ type: 'gamepad_state', seq, pad, ...state });
   }
 
   send(m: ClientMessage): void {
