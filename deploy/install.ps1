@@ -112,6 +112,10 @@ try {
             if (Test-Path $dir) { Native icacls.exe @($dir, '/remove:g', $account, '/T', '/C', '/Q') -Allow @(0, 1332) | Out-Null }
         }
         Step 'права учётной записи службы на секреты и журналы сняты'
+        # The service rewrote the secrets' DACL for its own account; manual mode needs the user who runs it back.
+        $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        if (Test-Path $secrets) { Native icacls.exe @($secrets, '/grant', "${user}:(OI)(CI)F", '/T', '/C', '/Q') | Out-Null }
+        Step "права на секреты возвращены $user"
         if (Test-Path $InstallDir) {
             Remove-Item -LiteralPath $InstallDir -Recurse -Force
             Step "$InstallDir удалён"
