@@ -382,3 +382,40 @@ mod tests {
         );
     }
 }
+
+/// Needs ViGEmBus. Plugs one neutral controller, checks that XInput sees one more, unplugs it.
+/// `cargo test -p rcs-input vigem -- --ignored --nocapture`
+#[cfg(test)]
+mod vigem_check {
+    use windows::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
+
+    use super::*;
+
+    fn connected() -> Vec<u32> {
+        (0..4)
+            .filter(|&i| {
+                let mut s = XINPUT_STATE::default();
+                // SAFETY: the out pointer refers to a live local.
+                (unsafe { XInputGetState(i, &mut s) }) == 0
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "needs ViGEmBus and adds a controller to this computer for a moment"]
+    fn vigem_controller_appears_in_xinput() {
+        let before = connected();
+        let mut pads = VigemGamepads::connect().expect("ViGEmBus");
+        pads.update(0, &PadState::default()).expect("plug in");
+        std::thread::sleep(Duration::from_millis(500));
+        let during = connected();
+        pads.disconnect(0).expect("unplug");
+        std::thread::sleep(Duration::from_millis(500));
+        let after = connected();
+        println!(
+            "XInput slots before {before:?}, with the virtual pad {during:?}, after {after:?}"
+        );
+        assert_eq!(during.len(), before.len() + 1);
+        assert_eq!(after, before);
+    }
+}
