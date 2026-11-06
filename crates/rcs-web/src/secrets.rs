@@ -462,13 +462,15 @@ pub mod tests {
         let loaded = store.load().unwrap();
         assert!(loaded.is_complete());
         assert_eq!(loaded.totp_last_step, Some(7));
-        // Only the three full-control entries remain, none of them inherited.
+        // Only the full-control entries remain, none of them inherited: SYSTEM, Administrators, this account, and
+        // the rcs-web service account once the service is installed (phase 6).
         let acl = std::process::Command::new("icacls")
             .arg(&dir)
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&acl.stdout).to_string();
-        assert_eq!(text.matches("(OI)(CI)(F)").count(), 3, "{text}");
+        let expected = 3 + usize::from(account_sid(SERVICE_ACCOUNT).is_some());
+        assert_eq!(text.matches("(OI)(CI)(F)").count(), expected, "{text}");
         assert!(!text.contains("(I)") && !text.contains("(RX)"), "{text}");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }

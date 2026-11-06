@@ -6,6 +6,7 @@
 //!
 //! The agent is `rcs-agent.exe` next to this program unless `--agent` names another.
 
+mod sas;
 mod supervise;
 mod system;
 
@@ -123,6 +124,16 @@ fn run(
     commands: &std::sync::mpsc::Receiver<Command>,
 ) -> Result<(), String> {
     info!(build = BUILD_ID, agent = %options.agent.display(), args = ?options.agent_args, "supervisor started");
+    if matches!(launch, Launch::System) {
+        // Ctrl+Alt+Del for the agent (P6-7); the thread ends with the process.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        sas::serve(stop, |sent| {
+            if sent {
+                system::report_text(1, "Ctrl+Alt+Del отправлен по запросу агента.");
+            }
+        })
+        .map_err(|e| format!("sas thread: {e}"))?;
+    }
     let mut platform =
         WindowsPlatform::new(options.agent.clone(), options.agent_args.clone(), launch)?;
     supervise(&mut platform, commands, Instant::now);

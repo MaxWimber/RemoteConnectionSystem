@@ -20,7 +20,9 @@ use rcs_input::gamepad::{
 };
 use rcs_input::sendinput::{Geometry, SendInputSink};
 use rcs_input::{InputError, InputEvent, InputSink, RecordingSink};
-use rcs_protocol::input::{ClientMessage, GamepadState, SeqFilter, ServerMessage};
+use rcs_protocol::input::{
+    ClientMessage, GamepadState, SPECIAL_CTRL_ALT_DEL, SeqFilter, ServerMessage,
+};
 use rcs_webrtc::{FrameSink, InputMessage};
 use tracing::{debug, info, warn};
 use windows::Win32::System::Threading::{
@@ -97,11 +99,46 @@ impl Session {
 enum Action<'a> {
     Event(InputEvent<'a>),
     Gamepad(&'a GamepadState),
+    /// Ctrl+Alt+Del through the supervisor (P6-7).
+    SecureAttention,
     ReleaseAll,
     /// An old `seq`.
     Stale,
-    /// Not for this phase: Ctrl+Alt+Del (phase 6), monitor switching.
+    /// Not handled yet: monitor switching.
     Ignored,
+}
+
+/// The supervisor's pipe for Ctrl+Alt+Del (`rcs-supervisor`, D-025).
+const SAS_PIPE: &str = r"\\.\pipe\rcs-supervisor";
+/// Ctrl+Alt+Del no more often than this: a repeat would only bounce the secure screen.
+const SAS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Asks the supervisor for Ctrl+Alt+Del on a short thread of its own: the input thread does no blocking I/O.
+fn request_sas() {
+    let spawned = std::thread::Builder::new()
+        .name("sas-request".into())
+        .spawn(|| {
+            use std::io::{Read, Write};
+            let result = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(SAS_PIPE)
+                .and_then(|mut pipe| {
+                    pipe.write_all(&[1])?;
+                    let mut answer = [0u8; 1];
+                    pipe.read_exact(&mut answer)?;
+                    Ok(answer[0])
+                });
+            match result {
+                Ok(0) => info!("Ctrl+Alt+Del sent by the supervisor"),
+                Ok(code) => warn!(code, "Ctrl+Alt+Del refused by the supervisor"),
+                // Without the service (phases 3 to 5, --as-user) there is no supervisor pipe.
+                Err(e) => warn!(error = %e, "Ctrl+Alt+Del: no supervisor"),
+            }
+        });
+    if let Err(e) = spawned {
+        warn!(error = %e, "Ctrl+Alt+Del thread");
+    }
 }
 
 /// Where input goes: the sink for mouse, keyboard and touch, the backend and rules for gamepads.
@@ -109,6 +146,7 @@ struct Outputs {
     sink: Box<dyn InputSink>,
     gamepads: Box<dyn GamepadBackend>,
     pads: PadManager,
+    last_sas: Option<Instant>,
 }
 
 fn action<'a>(session: &mut Session, message: &'a ClientMessage) -> Action<'a> {
@@ -148,6 +186,9 @@ fn action<'a>(session: &mut Session, message: &'a ClientMessage) -> Action<'a> {
         ClientMessage::Text { text } => Action::Event(InputEvent::Text(text)),
         ClientMessage::ReleaseAll => Action::ReleaseAll,
         ClientMessage::GamepadState(g) => Action::Gamepad(g),
+        ClientMessage::Special {
+            code: SPECIAL_CTRL_ALT_DEL,
+        } => Action::SecureAttention,
         ClientMessage::Special { .. } => Action::Ignored,
     }
 }
@@ -220,6 +261,7 @@ impl Thread {
             sink,
             gamepads: self.open_gamepads(),
             pads: PadManager::default(),
+            last_sas: None,
         };
         info!(mode = self.mode.name(), "input thread started");
         let mut session = Session::default();
@@ -306,6 +348,14 @@ impl Thread {
                 }
                 Err(e) => self.note_error(&e),
             },
+            Action::SecureAttention => {
+                if out.last_sas.is_none_or(|t| t.elapsed() >= SAS_INTERVAL) {
+                    out.last_sas = Some(Instant::now());
+                    // Keys held for the old screen would stay down on the secure one.
+                    self.release_all(out);
+                    request_sas();
+                }
+            }
             Action::ReleaseAll => self.release_all(out),
             Action::Stale => {
                 self.stats.stale.fetch_add(1, Ordering::Relaxed);
@@ -419,6 +469,10 @@ mod tests {
         );
         assert_eq!(
             action(&mut s, &ClientMessage::Special { code: 1 }),
+            Action::SecureAttention
+        );
+        assert_eq!(
+            action(&mut s, &ClientMessage::Special { code: 2 }),
             Action::Ignored
         );
         let pad = GamepadState {

@@ -301,6 +301,12 @@ export function App({ onSignedOut }: Props) {
       {notice && <div class="notice">{notice}</div>}
       <div class="toolbar" aria-label={appTitle}>
         <button onClick={fullscreen} title="Полный экран">⛶</button>
+        <button
+          onClick={() => session.current?.input?.send({ type: 'special', code: 1 })}
+          title="Ctrl+Alt+Del: экран безопасности Windows"
+        >
+          🔐
+        </button>
         {touchDevice ? (
           <>
             <button onClick={() => touch.current?.showKeyboard()} title="Клавиатура">

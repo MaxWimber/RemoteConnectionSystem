@@ -134,6 +134,32 @@ pub fn kill_on_close_job() -> Result<Owned, String> {
     Ok(job)
 }
 
+/// One line in the Windows event log, for threads that do not own the platform.
+pub fn report_text(id: u32, text: &str) {
+    // SAFETY: the source name is a static string; the handle is deregistered below.
+    let Ok(source) = (unsafe { RegisterEventSourceW(None, &HSTRING::from("RCS Supervisor")) })
+    else {
+        return;
+    };
+    let wide = HSTRING::from(text);
+    let strings = [PCWSTR(wide.as_ptr())];
+    // SAFETY: the source handle is live; the string array and its string outlive the call.
+    let _ = unsafe {
+        ReportEventW(
+            source,
+            EVENTLOG_INFORMATION_TYPE,
+            0,
+            id,
+            None,
+            0,
+            Some(&strings),
+            None,
+        )
+    };
+    // SAFETY: the handle came from RegisterEventSourceW and is deregistered once.
+    let _ = unsafe { DeregisterEventSource(source) };
+}
+
 /// A running agent: its process handle and the stop event it watches.
 pub struct ProcessAgent {
     process: HANDLE,
