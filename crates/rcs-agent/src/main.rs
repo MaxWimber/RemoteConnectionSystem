@@ -8,6 +8,7 @@ mod input;
 mod pipe;
 mod pipeline;
 mod recovery;
+mod resources;
 
 use std::fs::{self, OpenOptions};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -58,6 +59,8 @@ struct Options {
 
 /// Input messages waiting for the input thread (D-022).
 const INPUT_QUEUE: usize = 1024;
+/// How often the agent logs what it holds (P8-7).
+const RESOURCES_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 /// New pointer shapes waiting for the input thread; a shape changes a few times a second at most.
 const SHAPE_QUEUE: usize = 4;
 
@@ -298,6 +301,10 @@ fn run(options: Options) -> Result<(), String> {
         stop.clone(),
     )
     .map_err(|e| format!("pipeline thread: {e}"))?;
+    // Memory, handles and video memory every 10 s, for long runs (P8-7).
+    let held = Arc::new(Mutex::new(resources::Sample::default()));
+    let resources_thread = resources::spawn(RESOURCES_EVERY, held.clone(), stop.clone())
+        .map_err(|e| format!("resources thread: {e}"))?;
 
     let config = options.pipeline.clone();
     let served = pipe::serve(&options.pipe, |request| match request {
@@ -327,10 +334,12 @@ fn run(options: Options) -> Result<(), String> {
             &config,
             options.input,
             &input_stats,
+            &held,
         ))),
     });
     stop.store(true, Ordering::Relaxed);
     let _ = worker.join();
+    let _ = resources_thread.join();
     if let Some(t) = input_thread.lock().ok().and_then(|mut t| t.take()) {
         let _ = t.join();
     }
@@ -382,7 +391,9 @@ fn status(
     config: &pipeline::Config,
     mode: input::Mode,
     input: &input::Stats,
+    held: &Mutex<resources::Sample>,
 ) -> AgentStatus {
+    let held = held.lock().map(|h| *h).unwrap_or_default();
     let c = server.counters();
     let rate = server.rate();
     let info = stats.info.lock().map(|i| i.clone()).unwrap_or_default();
@@ -421,5 +432,8 @@ fn status(
         loss: rate.loss,
         rtt_ms: rate.rtt.map(|r| r.as_secs_f64() * 1000.0),
         rate_changes: c.rate_changes,
+        private_bytes: held.private_bytes,
+        handles: held.handles,
+        gpu_memory_bytes: held.gpu_local,
     }
 }

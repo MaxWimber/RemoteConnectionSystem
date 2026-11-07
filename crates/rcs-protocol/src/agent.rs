@@ -104,6 +104,14 @@ pub struct AgentStatus {
     pub rtt_ms: Option<f64>,
     #[serde(default)]
     pub rate_changes: u64,
+    /// Committed memory of the agent process (P8-7).
+    #[serde(default)]
+    pub private_bytes: u64,
+    #[serde(default)]
+    pub handles: u32,
+    /// Video memory the agent uses on the AMD card.
+    #[serde(default)]
+    pub gpu_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
