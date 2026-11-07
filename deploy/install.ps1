@@ -3,7 +3,10 @@
   Phase 6 (P6-8, D-025): installs RCS as Windows services, or removes them with -Uninstall. Run as administrator.
 .DESCRIPTION
   Install (safe to run again, it updates):
-    1. Copies rcs-supervisor.exe, rcs-agent.exe, rcs-web.exe from target\release and web\dist to C:\Program Files\RCS.
+    1. Copies rcs-supervisor.exe, rcs-agent.exe, rcs-web.exe and the web client to C:\Program Files\RCS: from bin\ and
+       web\ next to deploy\ when run from a release package (D-035), otherwise from target\release and web\dist. The
+       version installed before is kept in C:\Program Files\RCS.previous; -Rollback puts it back.
+       Secrets are never copied: they stay in %ProgramData%\RCS\secrets, the report says whether auth.json changed.
     2. Creates or updates the services: rcs-web under NT SERVICE\rcs-web, rcs-supervisor under LocalSystem; both start
        automatically and restart after a failure.
     3. Gives NT SERVICE\rcs-web full control of the secrets, modify on the logs and on files.root (-FilesRoot, phase 7),
@@ -19,9 +22,11 @@
 
     powershell -ExecutionPolicy Bypass -File deploy\install.ps1
     powershell -ExecutionPolicy Bypass -File deploy\install.ps1 -Uninstall
+    powershell -ExecutionPolicy Bypass -File deploy\install.ps1 -Rollback
 #>
 param(
     [switch]$Uninstall,
+    [switch]$Rollback,
     [string]$InstallDir = 'C:\Program Files\RCS',
     [string]$Advertise = '95.31.119.180:8443,192.168.1.12:8443,127.0.0.1:8443',
     [ValidateSet('record', 'sendinput')][string]$InputMode = 'sendinput',
@@ -37,7 +42,14 @@ $secrets = Join-Path $data 'secrets'
 $logs = Join-Path $data 'logs'
 $account = 'NT SERVICE\rcs-web'
 $ruleName = 'RCS agent media UDP 8443'
-$report = [ordered]@{ action = $(if ($Uninstall) { 'uninstall' } else { 'install' }); steps = @(); checks = [ordered]@{}; error = $null }
+$previous = "$InstallDir.previous"
+$authFile = Join-Path $secrets 'auth.json'
+$action = if ($Uninstall) { 'uninstall' } elseif ($Rollback) { 'rollback' } else { 'install' }
+$report = [ordered]@{ action = $action; build = $null; steps = @(); checks = [ordered]@{}; error = $null }
+
+function Get-AuthHash {
+    if (Test-Path -LiteralPath $authFile) { (Get-FileHash -LiteralPath $authFile -Algorithm SHA256).Hash } else { $null }
+}
 
 function Step([string]$text) {
     Write-Host "• $text"
@@ -134,11 +146,35 @@ try {
     }
 
     $release = Join-Path $repo 'target\release'
-    $dist = Join-Path $repo 'web\dist'
+    # Where the programs come from: the version kept before (-Rollback), a release package, or this repository.
+    $packageBin = Join-Path $repo 'bin'
+    if ($Rollback) {
+        if (-not (Test-Path (Join-Path $previous 'rcs-agent.exe'))) { throw "Нет прежней версии в ${previous}: откатывать не на что." }
+        $binDir = $previous
+        $dist = Join-Path $previous 'web'
+        $buildInfo = Get-Content -LiteralPath (Join-Path $previous 'build.json') -Raw -ErrorAction SilentlyContinue
+    } elseif (Test-Path (Join-Path $packageBin 'rcs-agent.exe')) {
+        $binDir = $packageBin
+        $dist = Join-Path $repo 'web'
+        $buildInfo = Get-Content -LiteralPath (Join-Path $repo 'build.json') -Raw -ErrorAction SilentlyContinue
+    } else {
+        $binDir = $release
+        $dist = Join-Path $repo 'web\dist'
+        $buildInfo = $null
+    }
+    if (-not $buildInfo) {
+        $old = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { $commit = & git -C $repo rev-parse --short HEAD 2>$null } finally { $ErrorActionPreference = $old }
+        $buildInfo = [ordered]@{ build = 'dev'; commit = "$commit"; source = $repo } | ConvertTo-Json
+    }
+    $build = ($buildInfo | ConvertFrom-Json).build
+    $report.build = $build
     foreach ($f in @('rcs-supervisor.exe', 'rcs-agent.exe', 'rcs-web.exe')) {
-        if (-not (Test-Path (Join-Path $release $f))) { throw "Нет $f в ${release}: соберите cargo build --release --workspace." }
+        if (-not (Test-Path (Join-Path $binDir $f))) { throw "Нет $f в ${binDir}: соберите cargo build --release --workspace." }
     }
     if (-not (Test-Path (Join-Path $dist 'index.html'))) { throw "Нет собранного клиента в ${dist}: npm run build." }
+    $authBefore = Get-AuthHash
     if (-not (Test-Path (Join-Path $secrets 'auth.json'))) { throw 'Секреты не настроены: rcs-web set-password и enroll-totp.' }
     if (-not (Test-Path -LiteralPath $FilesRoot -PathType Container)) { throw "Нет папки files.root: $FilesRoot." }
     $manual = Get-Process rcs-agent, rcs-web -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$release*" }
@@ -149,13 +185,22 @@ try {
         $s = Get-Service -Name $name -ErrorAction SilentlyContinue
         if ($s -and $s.Status -ne 'Stopped') { Stop-Service -Name $name -Force; $s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30)) }
     }
+    # The version installed now becomes the one to roll back to; a rollback leaves it as it is.
+    if (-not $Rollback -and (Test-Path (Join-Path $InstallDir 'rcs-agent.exe'))) {
+        if (Test-Path $previous) { Remove-Item -LiteralPath $previous -Recurse -Force }
+        Copy-Item -LiteralPath $InstallDir -Destination $previous -Recurse -Force
+        Step "прежняя версия сохранена в $previous"
+    }
     New-Item -ItemType Directory -Force -Path $InstallDir, (Join-Path $InstallDir 'web'), $logs | Out-Null
     foreach ($f in @('rcs-supervisor.exe', 'rcs-agent.exe', 'rcs-web.exe')) {
-        Copy-Item -LiteralPath (Join-Path $release $f) -Destination $InstallDir -Force
+        Copy-Item -LiteralPath (Join-Path $binDir $f) -Destination $InstallDir -Force
+        $symbols = Join-Path $binDir (($f -replace '-', '_') -replace '\.exe$', '.pdb')
+        if (Test-Path $symbols) { Copy-Item -LiteralPath $symbols -Destination $InstallDir -Force }
     }
     Remove-Item -Path (Join-Path $InstallDir 'web\*') -Recurse -Force -ErrorAction SilentlyContinue
     Copy-Item -Path (Join-Path $dist '*') -Destination (Join-Path $InstallDir 'web') -Recurse -Force
-    Step "файлы скопированы в $InstallDir"
+    Set-Content -LiteralPath (Join-Path $InstallDir 'build.json') -Value $buildInfo -Encoding UTF8
+    Step "сборка $build скопирована в $InstallDir из $binDir"
 
     $web = Join-Path $InstallDir 'rcs-web.exe'
     $sup = Join-Path $InstallDir 'rcs-supervisor.exe'
@@ -234,16 +279,20 @@ try {
     $report.checks.caddy_files_without_session = "$filesCode"
     $acl = (Get-Acl -LiteralPath $FilesRoot).Access | Where-Object { $_.IdentityReference -eq $account }
     $report.checks.files_root_rights = @($acl | ForEach-Object { "$($_.FileSystemRights)" })
-    if (-not $listening -or -not $agent -or "$code" -ne '401' -or "$filesCode" -ne '401') {
+    $report.checks.secrets_unchanged = ($null -ne $authBefore) -and ($authBefore -eq (Get-AuthHash))
+    $report.checks.previous_kept = Test-Path (Join-Path $previous 'rcs-agent.exe')
+    if (-not $listening -or -not $agent -or "$code" -ne '401' -or "$filesCode" -ne '401' -or -not $report.checks.secrets_unchanged) {
         throw "Проверка после установки не прошла: $($report.checks | ConvertTo-Json -Compress)"
     }
-    Write-Host 'Установлено: rcs-web и rcs-supervisor работают, агент запущен.' -ForegroundColor Green
+    [ordered]@{ build = $build; action = $action; installed_at = (Get-Date).ToUniversalTime().ToString('o'); from = $binDir } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $data 'installed.json') -Encoding UTF8
+    Write-Host "Установлено: сборка $build, rcs-web и rcs-supervisor работают, агент запущен." -ForegroundColor Green
 } catch {
     $report.error = $_.Exception.Message
     Write-Host "Ошибка: $($report.error)" -ForegroundColor Red
 } finally {
     New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-    $name = if ($Uninstall) { 'report-uninstall.json' } else { 'report-install.json' }
+    $name = "report-$action.json"
     $report | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $OutDir $name) -Encoding UTF8
     $report | ConvertTo-Json -Depth 4 | Write-Host
 }

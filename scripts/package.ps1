@@ -2,9 +2,12 @@
 .SYNOPSIS
   Builds the test package for one phase into dist\.
 .DESCRIPTION
-  The content comes from deploy\phases\NN\manifest.txt. Lines have one of two forms:
+  The content comes from deploy\phases\NN\manifest.txt. Lines have one of these forms:
     file: repo\relative\path => path\inside\package
+    dir: repo\relative\folder => folder\inside\package      the whole folder
     bin: crate-name
+    web: folder\inside\package                               npm ci, npm run build, then web\dist goes there
+  Programs get RCS_BUILD_ID, the build number (date, time, commit) shown instead of "dev" (D-035).
 #>
 param(
     [Parameter(Mandatory = $true)][int]$Phase
@@ -59,6 +62,30 @@ if ($binaries.Count -gt 0) {
         $symbols = Join-Path $root ("target\release\{0}.pdb" -f ($binary -replace '-', '_'))
         if (Test-Path $symbols) { Copy-Item -LiteralPath $symbols -Destination $binDir }
     }
+}
+
+foreach ($entry in ($entries | Where-Object { $_ -like 'web:*' })) {
+    $web = Join-Path $root 'web'
+    Push-Location $web
+    try {
+        & npm ci --no-audit --no-fund
+        if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+        & npm run build
+        if ($LASTEXITCODE -ne 0) { throw 'npm run build failed' }
+    } finally {
+        Pop-Location
+    }
+    $target = Join-Path $stage $entry.Substring(4).Trim()
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    Copy-Item -Path (Join-Path $web 'dist\*') -Destination $target -Recurse
+}
+
+foreach ($entry in ($entries | Where-Object { $_ -like 'dir:*' })) {
+    $parts = $entry.Substring(4) -split '=>'
+    if ($parts.Count -ne 2) { throw "Bad manifest line: $entry" }
+    $target = Join-Path $stage $parts[1].Trim()
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    Copy-Item -Path (Join-Path (Join-Path $root $parts[0].Trim()) '*') -Destination $target -Recurse
 }
 
 foreach ($entry in ($entries | Where-Object { $_ -like 'file:*' })) {

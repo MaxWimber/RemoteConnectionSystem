@@ -1,0 +1,14 @@
+# Phase 8, release package (P8-8, D-035): the three programs with the build number, the web client, the install
+# and update scripts and the recovery guide. Secrets are not part of it.
+bin: rcs-web
+bin: rcs-agent
+bin: rcs-supervisor
+web: web
+file: deploy\install.ps1 => deploy\install.ps1
+file: deploy\Caddyfile => deploy\Caddyfile
+file: deploy\install-caddy.ps1 => deploy\install-caddy.ps1
+file: deploy\update-caddy.ps1 => deploy\update-caddy.ps1
+file: deploy\install-vigembus.ps1 => deploy\install-vigembus.ps1
+file: scripts\collect-logs.ps1 => scripts\collect-logs.ps1
+file: docs\RECOVERY.md => docs\RECOVERY.md
+file: deploy\phases\08\README.txt => README.txt
