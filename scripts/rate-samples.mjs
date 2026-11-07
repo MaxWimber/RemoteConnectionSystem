@@ -40,10 +40,10 @@ for (const line of readFileSync(file, 'utf8').split('\n')) {
   const t = (at - connected) / 1000;
   rows.push({ t, link: stepAt(t), ...f });
 }
-console.log('t,s\tlink\ttarget\testimate\tsent\tdropped\tloss\trtt,ms');
+console.log('t,s\tlink\ttarget\testimate\tsent\tout\tdropped\tloss\trtt,ms');
 for (const r of rows) {
   const k = (v) => (v === undefined || v === null ? '' : Math.round(v / 100) / 10);
   console.log(
-    [r.t.toFixed(0), r.link, k(r.target_kbps), k(r.estimate_kbps), k(r.sent_kbps), r.dropped_test, r.loss ?? '', r.rtt_ms ?? ''].join('\t'),
+    [r.t.toFixed(0), r.link, k(r.target_kbps), k(r.estimate_kbps), k(r.sent_kbps), k(r.out_kbps), r.dropped_test, r.loss ?? '', r.rtt_ms ?? ''].join('\t'),
   );
 }

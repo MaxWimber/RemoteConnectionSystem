@@ -43,6 +43,8 @@ const QUEUE_FRAMES: usize = 2;
 const POOL_BUFFERS: usize = 4;
 /// Longest wait of the network thread when nothing is scheduled.
 const IDLE_WAIT: Duration = Duration::from_millis(50);
+/// Timeouts handled at once in one pass of the loop, so frames and commands still get their turn.
+const DUE_NOW_LIMIT: u32 = 4096;
 const WAKE: [u8; 1] = [0x5a];
 /// Free in the standard map of str0m; the answer follows the ids of the offer anyway.
 const PLAYOUT_DELAY_ID: u8 = 6;
@@ -123,6 +125,9 @@ pub struct Counters {
     pub sessions: AtomicU64,
     pub frames_sent: AtomicU64,
     pub bytes_sent: AtomicU64,
+    /// Datagram bytes `str0m` let out of its pacer: media with retransmissions, padding and RTCP. Read against
+    /// `bytes_sent` it shows whether a queue grows inside the session.
+    pub bytes_out: AtomicU64,
     /// Dropped because the queue was full: the network thread fell behind.
     pub frames_dropped_queue: AtomicU64,
     /// Dropped because no browser was connected yet.
@@ -497,8 +502,8 @@ struct NetworkLoop {
     buffer: Vec<u8>,
     local: SocketAddr,
     wake_source: SocketAddr,
-    /// The last once-a-second rate line: when, bytes sent and test drops by then.
-    sampled: (Instant, u64, u64),
+    /// The last once-a-second rate line: when, bytes sent, datagram bytes out and test drops by then.
+    sampled: (Instant, u64, u64, u64),
 }
 
 /// How often a connected session logs its rate: estimate, target and what actually went out.
@@ -524,7 +529,21 @@ impl NetworkLoop {
             buffer: vec![0; RECV_BUFFER],
             local,
             wake_source,
-            sampled: (Instant::now(), 0, 0),
+            sampled: (Instant::now(), 0, 0, 0),
+        }
+    }
+
+    /// The rate control climbs on the clock too: `str0m` reports an estimate only when it changes (D-027).
+    fn tick_rate(&mut self) {
+        if !self.config.adaptive {
+            return;
+        }
+        if let Some(session) = self.session.as_mut().filter(|s| s.connected) {
+            let before = session.rate.target();
+            session.rate.on_tick(Instant::now());
+            if session.rate.target() != before {
+                rate_changed(session, &self.shared, before, true);
+            }
         }
     }
 
@@ -537,9 +556,11 @@ impl NetworkLoop {
         }
         let c = &self.shared.counters;
         let bytes = c.bytes_sent.load(Ordering::Relaxed);
+        let out = c.bytes_out.load(Ordering::Relaxed);
         let dropped = c.datagrams_dropped_test.load(Ordering::Relaxed);
-        let (_, last_bytes, last_dropped) =
-            std::mem::replace(&mut self.sampled, (now, bytes, dropped));
+        let (_, last_bytes, last_out, last_dropped) =
+            std::mem::replace(&mut self.sampled, (now, bytes, out, dropped));
+        let kbps = |b: u64| (b as f64 * 8.0 / elapsed.as_secs_f64() / 1000.0) as u64;
         if !self.session.as_ref().is_some_and(|s| s.connected) {
             return;
         }
@@ -547,9 +568,8 @@ impl NetworkLoop {
         info!(
             target_kbps = r.target_bps / 1000,
             estimate_kbps = r.estimate_bps.map(|v| v / 1000),
-            sent_kbps = (bytes.saturating_sub(last_bytes) as f64 * 8.0
-                / elapsed.as_secs_f64()
-                / 1000.0) as u64,
+            sent_kbps = kbps(bytes.saturating_sub(last_bytes)),
+            out_kbps = kbps(out.saturating_sub(last_out)),
             dropped_test = dropped.saturating_sub(last_dropped),
             loss = r.loss,
             rtt_ms = r.rtt.map(|d| (d.as_secs_f64() * 10_000.0).round() / 10.0),
@@ -576,6 +596,7 @@ impl NetworkLoop {
             }
             self.send_frames();
             self.send_cursor();
+            self.tick_rate();
             self.sample();
             let deadline = self.drive();
             self.wait(deadline);
@@ -776,10 +797,25 @@ impl NetworkLoop {
             return idle;
         };
         let mut ended = None;
+        let mut due_now = 0;
         let deadline = loop {
             match session.rtc.poll_output() {
+                // The pacer asks for a timeout right away after every packet it lets out. Sleeping first, even for
+                // the shortest socket timeout of 1 ms, let out one packet per millisecond: about 8 Mbit/s, the rest
+                // waited in its queue for up to 2 s (P8-1, `bwe-mf2`).
+                Ok(Output::Timeout(t)) if due_now < DUE_NOW_LIMIT && t <= Instant::now() => {
+                    due_now += 1;
+                    if let Err(e) = session.rtc.handle_input(Input::Timeout(Instant::now())) {
+                        debug!(error = %e, "timeout rejected");
+                        break t.min(idle);
+                    }
+                }
                 Ok(Output::Timeout(t)) => break t.min(idle),
                 Ok(Output::Transmit(t)) => {
+                    self.shared
+                        .counters
+                        .bytes_out
+                        .fetch_add(t.contents.len() as u64, Ordering::Relaxed);
                     // Only once media flows, so ICE and DTLS are never part of the simulated outage.
                     if session.connected
                         && let Some(test) = self.config.simulate_loss

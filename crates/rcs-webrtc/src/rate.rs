@@ -4,17 +4,22 @@
 //! mode, leaves headroom for retransmissions and padding, drops at once and climbs slowly, so the picture does not
 //! pump with every new estimate.
 //!
-//! The estimate never strays far above what is actually sent: `str0m` keeps it 10-50% over the acknowledged rate.
-//! A desktop sends a few Mbit/s, LCVBR stays under its target, so the estimate sinks with what goes out, and following
-//! it down starves the encoder and sends even less (P8-1: a 40 Mbit/s link went down to 2 Mbit/s with no loss and an
-//! RTT of 1.4 ms). So:
+//! Without probes the estimate does not stray far above what is actually sent: `str0m` caps it at 1.5 times the
+//! acknowledged rate. A desktop sends a few Mbit/s, LCVBR stays under its target, so following the estimate down
+//! starves the encoder and sends even less. So (D-027, both addenda):
 //!
-//! - The target drops only on congestion: the estimate under what goes out (`str0m` sets it to 0.85 of the
-//!   acknowledged rate on overuse) or heavy loss. An estimate under the target alone is no sign: LCVBR sends about
-//!   70% of its target, so the estimate sits under it on a free link too (P8-1, second run).
-//! - The estimate cannot tell how much more the link would carry, so with no sign of congestion the target climbs on
-//!   its own; LCVBR only spends what the picture needs. For a while after a congestion drop it climbs only to a little
-//!   above the rate the link carried then.
+//! - The target drops on congestion only:
+//!   - `str0m` lowered its estimate (on overuse to 0.85 of the acknowledged rate) and it is now under what goes out;
+//!   - the RTT grew by `RTT_RISE` while more goes out than the estimate, before `str0m` lowered it;
+//!   - heavy loss: down to what still gets through.
+//!
+//!   An estimate under the target alone is no sign: LCVBR sends about 70% of its target. Nor is an estimate that
+//!   stays where it was while more goes out: after a decrease `str0m` climbs by a packet or so per step.
+//! - With no sign of congestion the target climbs on a clock, not only when a new estimate comes (`str0m` reports
+//!   one only when it changes), and goes straight to its share of a higher estimate, which probes measure. An encoder
+//!   that spends its whole target (`mf`, a busy picture) climbs only with the estimate; one that leaves part unused
+//!   climbs past it, LCVBR only spends what the picture needs. For a while after a congestion drop the target climbs
+//!   only to a little above the rate the link carried then.
 
 use std::time::{Duration, Instant};
 
@@ -33,6 +38,10 @@ const LOSS_CUT_FACTOR: f64 = 0.8;
 const RTT_RISE: Duration = Duration::from_millis(80);
 /// An estimate under this share of the rate sent means the link no longer carries what goes out.
 const UNDER_SENT: f64 = 0.9;
+/// An estimate under this share of the one before is a decrease by `str0m`, not rounding.
+const FELL: f64 = 0.99;
+/// Sending this share of the target or more: the encoder spends what it is given.
+const SPENDS: f64 = 0.9;
 /// After a congestion drop, an application-limited target climbs to this many times the rate carried then...
 const CEILING_ROOM: f64 = 1.5;
 /// ...for this long.
@@ -142,23 +151,55 @@ impl RateControl {
 
     /// The send-side estimate of `str0m`.
     pub fn on_estimate(&mut self, now: Instant, estimate_bps: u64) {
-        self.estimate = Some(estimate_bps.min(u64::from(u32::MAX)) as u32);
+        let before = self
+            .estimate
+            .replace(estimate_bps.min(u64::from(u32::MAX)) as u32);
         let first = *self.first_estimate.get_or_insert(now);
         let estimate = estimate_bps as f64;
-        let current = f64::from(self.target);
         let settled = now.duration_since(first) >= SETTLE;
-        if settled && estimate < self.sent_bps(now) * UNDER_SENT {
+        let fell = before.is_none_or(|b| estimate < f64::from(b) * FELL);
+        if settled && fell && estimate < self.sent_bps(now) * UNDER_SENT {
             self.lower(now, estimate * SHARE, estimate);
             return;
         }
+        self.rise(now);
+    }
+
+    /// Lets the target climb with no new estimate; call it often, it steps at most once per `UP_EVERY`.
+    pub fn on_tick(&mut self, now: Instant) {
+        if self
+            .first_estimate
+            .is_some_and(|first| now.duration_since(first) >= SETTLE)
+        {
+            self.rise(now);
+        }
+    }
+
+    fn rise(&mut self, now: Instant) {
         if !self.may_rise(now) {
             return;
         }
+        let current = f64::from(self.target);
         let room = self
             .ceiling
             .filter(|(_, at)| now.duration_since(*at) < CEILING_FOR)
             .map_or(f64::INFINITY, |(carried, _)| carried * CEILING_ROOM);
-        let next = self.limits.clamp((current * UP_STEP).min(room));
+        // An encoder that spends its whole target (`mf`, or a busy picture) would send everything above the
+        // estimate into the link; then the target climbs with the estimate, and `str0m` probes for more.
+        let spends = self.sent_bps(now) >= current * SPENDS;
+        let cap = match self.estimate {
+            Some(estimate) if spends => f64::from(estimate),
+            _ => f64::INFINITY,
+        };
+        let step = (current * UP_STEP).min(room).min(cap);
+        // A higher estimate is what `str0m` measured, for example with a probe after the link came back: the target
+        // may go straight to its share instead of climbing there.
+        // Not past the ceiling after congestion: during a loss storm the estimate may still be the one from before.
+        let follow = self
+            .estimate
+            .map_or(0.0, |e| f64::from(e) * SHARE)
+            .min(room);
+        let next = self.limits.clamp(step.max(follow));
         if next > self.target {
             self.target = next;
             self.last_up = Some(now);
@@ -174,10 +215,28 @@ impl RateControl {
         if loss.is_some() {
             self.loss = loss;
         }
-        if loss.is_some_and(|l| l > LOSS_CUT) {
-            let next = f64::from(self.target) * LOSS_CUT_FACTOR;
+        let sent = self.sent_bps(now);
+        if let Some(loss) = loss.filter(|l| *l > LOSS_CUT) {
+            // What reaches the browser is a better floor than a fixed share when most of it is lost.
+            let delivered = sent * f64::from(1.0 - loss.min(1.0));
+            let mut next = f64::from(self.target) * LOSS_CUT_FACTOR;
+            if delivered > 0.0 {
+                next = next.min(delivered);
+            }
             self.lower(now, next, next);
+            return;
         }
+        // A queue builds while more goes out than the estimate, and `str0m` has not lowered it (yet).
+        if self.queue_builds()
+            && let Some(estimate) = self.estimate.map(f64::from)
+            && estimate < sent * UNDER_SENT
+        {
+            self.lower(now, estimate * SHARE, estimate);
+        }
+    }
+
+    fn queue_builds(&self) -> bool {
+        matches!((self.rtt, self.min_rtt), (Some(r), Some(m)) if r > m + RTT_RISE)
     }
 
     /// Lowers the target after congestion; `carried` is what the link took then.
@@ -192,11 +251,10 @@ impl RateControl {
 
     fn may_rise(&self, now: Instant) -> bool {
         let since = |t: Option<Instant>, d: Duration| t.is_none_or(|t| now.duration_since(t) >= d);
-        let queue = matches!((self.rtt, self.min_rtt), (Some(r), Some(m)) if r > m + RTT_RISE);
         since(self.last_up, UP_EVERY)
             && since(self.last_drop, HOLD_AFTER_DROP)
             && !self.loss.is_some_and(|l| l > LOSS_HOLD)
-            && !queue
+            && !self.queue_builds()
     }
 }
 
@@ -323,17 +381,17 @@ mod tests {
         busy(&mut c, t, 30);
         c.on_estimate(t, mbps(12));
         let low = c.target();
-        c.on_estimate(t + Duration::from_millis(1500), mbps(100));
+        c.on_estimate(t + Duration::from_millis(1500), mbps(12));
         assert_eq!(c.target(), low, "held after the drop");
         let mut at = t + HOLD_AFTER_DROP;
-        c.on_estimate(at, mbps(100));
+        c.on_estimate(at, mbps(12));
         assert_eq!(c.target(), (f64::from(low) * UP_STEP) as u32);
         let once = c.target();
-        c.on_estimate(at + Duration::from_millis(500), mbps(100));
+        c.on_estimate(at + Duration::from_millis(500), mbps(12));
         assert_eq!(c.target(), once, "one step per second");
         for _ in 0..60 {
             at += UP_EVERY;
-            c.on_estimate(at, mbps(100));
+            c.on_estimate(at, mbps(12));
         }
         assert_eq!(c.target(), 50 * MBPS, "up to the mode maximum");
     }
@@ -357,11 +415,138 @@ mod tests {
         let (mut c, t) = control();
         c.on_report(t, Some(0.0), Some(Duration::from_millis(30)));
         c.on_report(t, None, Some(Duration::from_millis(150)));
-        c.on_estimate(t, mbps(100));
+        c.on_estimate(t, mbps(30));
         assert_eq!(c.target(), 30 * MBPS);
         c.on_report(t, None, Some(Duration::from_millis(40)));
-        c.on_estimate(t, mbps(100));
+        c.on_estimate(t, mbps(30));
         assert_eq!(c.target(), (30.0 * f64::from(MBPS) * UP_STEP) as u32);
+    }
+
+    #[test]
+    fn the_target_climbs_on_the_clock_without_new_estimates() {
+        let (mut c, t) = settled();
+        c.estimate = Some(11 * MBPS);
+        c.target = 11 * MBPS;
+        let mut at = t;
+        for _ in 0..5 {
+            at += UP_EVERY;
+            c.on_tick(at);
+        }
+        assert!(c.target() > 16 * MBPS, "{}", c.target());
+        // Ticks closer than a second apart step once.
+        let once = c.target();
+        c.on_tick(at + Duration::from_millis(300));
+        assert_eq!(c.target(), once);
+    }
+
+    #[test]
+    fn no_climb_on_the_clock_before_the_first_estimates_settle() {
+        let (mut c, t) = control();
+        c.on_tick(t + Duration::from_secs(5));
+        assert_eq!(c.target(), 30 * MBPS, "no estimate yet");
+        c.on_estimate(t + Duration::from_secs(5), mbps(30));
+        let first = c.target();
+        c.on_tick(t + Duration::from_secs(6));
+        assert_eq!(c.target(), first, "still settling");
+        c.on_tick(t + Duration::from_secs(8));
+        assert!(c.target() > first);
+    }
+
+    #[test]
+    fn an_estimate_that_stays_while_more_goes_out_is_no_congestion() {
+        // `mf` sends its whole target, which has climbed past an estimate that grows a packet at a time.
+        let (mut c, t) = settled();
+        busy(&mut c, t, 11);
+        c.on_estimate(t, mbps(11));
+        c.target = 14 * MBPS;
+        busy(&mut c, t + Duration::from_secs(1), 14);
+        c.on_estimate(t + Duration::from_secs(1), mbps(11));
+        assert!(c.target() >= 14 * MBPS, "{}", c.target());
+        // str0m lowers it: now it is congestion.
+        busy(&mut c, t + Duration::from_secs(2), 14);
+        c.on_estimate(t + Duration::from_secs(2), mbps(10));
+        assert_eq!(c.target(), (10.0 * f64::from(MBPS) * SHARE) as u32);
+    }
+
+    #[test]
+    fn a_lower_estimate_still_over_what_goes_out_is_no_congestion() {
+        let (mut c, t) = settled();
+        busy(&mut c, t, 6);
+        c.on_estimate(t, mbps(30));
+        c.on_estimate(t, mbps(20));
+        assert!(c.target() >= 30 * MBPS);
+    }
+
+    #[test]
+    fn a_growing_queue_drops_to_the_estimate_while_more_goes_out() {
+        let (mut c, t) = settled();
+        c.on_report(t, Some(0.0), Some(Duration::from_millis(2)));
+        c.on_estimate(t, mbps(36));
+        c.target = 50 * MBPS;
+        busy(&mut c, t + Duration::from_secs(1), 50);
+        c.on_report(
+            t + Duration::from_secs(1),
+            Some(0.0),
+            Some(Duration::from_millis(120)),
+        );
+        assert_eq!(c.target(), (36.0 * f64::from(MBPS) * SHARE) as u32);
+    }
+
+    #[test]
+    fn a_growing_queue_with_less_going_out_than_the_estimate_only_holds() {
+        let (mut c, t) = settled();
+        c.on_report(t, Some(0.0), Some(Duration::from_millis(2)));
+        c.on_estimate(t, mbps(36));
+        busy(&mut c, t + Duration::from_secs(1), 10);
+        c.on_report(
+            t + Duration::from_secs(1),
+            Some(0.0),
+            Some(Duration::from_millis(120)),
+        );
+        assert!(c.target() >= 30 * MBPS);
+    }
+
+    #[test]
+    fn heavy_loss_cuts_to_what_gets_through() {
+        let (mut c, t) = settled();
+        busy(&mut c, t, 20);
+        c.on_report(t, Some(0.5), None);
+        let target = f64::from(c.target());
+        assert!((9.5e6..10.5e6).contains(&target), "{target}");
+    }
+
+    #[test]
+    fn an_encoder_that_spends_its_target_climbs_only_with_the_estimate() {
+        let (mut c, t) = settled();
+        c.target = 20 * MBPS;
+        c.estimate = Some(21 * MBPS);
+        busy(&mut c, t, 20);
+        c.on_tick(t);
+        assert_eq!(c.target(), 21 * MBPS);
+        busy(&mut c, t + UP_EVERY, 21);
+        c.on_tick(t + UP_EVERY);
+        assert_eq!(c.target(), 21 * MBPS, "at the estimate");
+        // LCVBR leaves most of it unused: the clock lifts it past the estimate.
+        busy(&mut c, t + UP_EVERY * 2, 8);
+        c.on_tick(t + UP_EVERY * 2);
+        assert!(c.target() > 21 * MBPS);
+    }
+
+    #[test]
+    fn a_probed_estimate_lifts_the_target_at_once() {
+        let (mut c, t) = settled();
+        busy(&mut c, t, 10);
+        c.on_estimate(t, mbps(3));
+        assert_eq!(c.target(), 8 * MBPS);
+        // Right after the drop only up to the ceiling, 1.5 x 8 Mbit/s: the estimate may be a stale one.
+        let at = t + HOLD_AFTER_DROP;
+        busy(&mut c, at, 3);
+        c.on_estimate(at, mbps(30));
+        assert_eq!(c.target(), 12 * MBPS);
+        let at = t + CEILING_FOR;
+        busy(&mut c, at, 3);
+        c.on_estimate(at, mbps(31));
+        assert_eq!(c.target(), (31.0 * f64::from(MBPS) * SHARE) as u32);
     }
 
     #[test]
