@@ -171,8 +171,18 @@ button {
   pointer-events: none;
 }
 
-.stats .probe {
+.stats .probe,
+.stats .limit {
   pointer-events: auto;
+}
+
+.stats .limit select {
+  min-height: 28px;
+  font: inherit;
+  color: inherit;
+  background: #222;
+  border: 1px solid #555;
+  border-radius: 4px;
 }
 
 .stats .probe button {

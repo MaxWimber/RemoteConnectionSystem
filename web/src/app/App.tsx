@@ -8,10 +8,18 @@ import { GamepadPoller } from '../input/gamepads';
 import { ScreenPad } from '../gamepad-ui/screen-pad';
 import { probeInputLatency } from '../input/probe';
 import { TouchController } from '../input/touch';
-import { buildReport, download, installErrorCapture, logEvent, recordSample } from '../stream/diagnostics';
+import {
+  buildReport,
+  download,
+  installErrorCapture,
+  logEvent,
+  recordSample,
+  recordServerStats,
+} from '../stream/diagnostics';
 import { LatencyMeter, type LatencySummary } from '../stream/latency';
 import { StreamSession, type SessionState } from '../stream/session';
 import { summarize, toMap, type StatsMap, type StreamSummary } from '../stream/stats';
+import { BITRATE_LIMITS, loadBitrateLimit, mbps, type ServerStats } from '../stream/server-stats';
 import { appTitle } from './title';
 
 const STATS_INTERVAL_MS = 1000;
@@ -65,6 +73,9 @@ export function App({ onSignedOut }: Props) {
   const [showStats, setShowStats] = useState(false);
   const [summary, setSummary] = useState<StreamSummary | null>(null);
   const [latency, setLatency] = useState<LatencySummary | null>(null);
+  const [serverStats, setServerStats] = useState<ServerStats | null>(null);
+  const [limitKbps, setLimitKbps] = useState<number | null>(() => loadBitrateLimit());
+  const [fixedRate, setFixedRate] = useState(false);
   const meter = useRef<LatencyMeter | null>(null);
   const input = useRef<InputController | null>(null);
 
@@ -91,6 +102,14 @@ export function App({ onSignedOut }: Props) {
       },
       signedOut: () => onSignedOut('Сессия завершена: выход, истечение срока или вход с другого устройства.'),
       cursor: (m) => cursor.current?.handle(m),
+      serverStats: (st) => {
+        setServerStats(st);
+        recordServerStats(st);
+      },
+      settingsApplied: (maxKbps, adaptive) => {
+        setFixedRate(!adaptive);
+        logEvent(`предел битрейта на сервере: ${maxKbps} кбит/с${adaptive ? '' : ', битрейт фиксированный'}`);
+      },
     });
     session.current = s;
     s.start();
@@ -375,6 +394,39 @@ export function App({ onSignedOut }: Props) {
           <div>
             потеряно {summary?.packetsLost ?? 0} · NACK {summary?.nackCount ?? 0} · PLI {summary?.pliCount ?? 0} ·
             сброшено {summary?.framesDropped ?? 0} · фризы {summary?.freezeCount ?? 0}
+          </div>
+          <div>
+            сервер: цель {mbps(serverStats?.targetKbps ?? null)} · оценка {mbps(serverStats?.estimateKbps ?? null)}{' '}
+            · отправлено {mbps(serverStats?.sentKbps ?? null)} Мбит/с · потери{' '}
+            {serverStats?.loss == null ? '—' : `${(serverStats.loss * 100).toFixed(1)}%`} · RTT{' '}
+            {fmt(serverStats?.rttMs ?? null)} мс
+          </div>
+          <div class="limit">
+            <label>
+              предел битрейта{' '}
+              <select
+                value={limitKbps === null ? '' : String(limitKbps)}
+                onChange={(e) => {
+                  const v = (e.currentTarget as HTMLSelectElement).value;
+                  const kbps = v === '' ? null : Number(v);
+                  setLimitKbps(kbps);
+                  session.current?.setBitrateLimit(kbps);
+                }}
+              >
+                {BITRATE_LIMITS.map((k) => (
+                  <option key={String(k)} value={k === null ? '' : String(k)}>
+                    {k === null ? 'без предела' : `${k / 1000} Мбит/с`}
+                  </option>
+                ))}
+              </select>
+            </label>{' '}
+            {serverStats && (
+              <span class="detail">
+                {fixedRate || !serverStats.adaptive
+                  ? 'битрейт фиксированный'
+                  : `диапазон ${mbps(serverStats.minKbps)}–${mbps(serverStats.maxKbps)} Мбит/с`}
+              </span>
+            )}
           </div>
           <div class="detail">
             {summary?.decoder ?? '—'}

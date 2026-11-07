@@ -561,20 +561,45 @@ impl NetworkLoop {
         let (_, last_bytes, last_out, last_dropped) =
             std::mem::replace(&mut self.sampled, (now, bytes, out, dropped));
         let kbps = |b: u64| (b as f64 * 8.0 / elapsed.as_secs_f64() / 1000.0) as u64;
-        if !self.session.as_ref().is_some_and(|s| s.connected) {
+        let Some(session) = self.session.as_mut().filter(|s| s.connected) else {
             return;
-        }
+        };
         let r = self.shared.rate.snapshot();
+        let sent_kbps = kbps(bytes.saturating_sub(last_bytes));
+        let out_kbps = kbps(out.saturating_sub(last_out));
+        let rtt_ms = r.rtt.map(|d| (d.as_secs_f64() * 10_000.0).round() / 10.0);
         info!(
             target_kbps = r.target_bps / 1000,
             estimate_kbps = r.estimate_bps.map(|v| v / 1000),
-            sent_kbps = kbps(bytes.saturating_sub(last_bytes)),
-            out_kbps = kbps(out.saturating_sub(last_out)),
+            sent_kbps,
+            out_kbps,
             dropped_test = dropped.saturating_sub(last_dropped),
             loss = r.loss,
-            rtt_ms = r.rtt.map(|d| (d.as_secs_f64() * 10_000.0).round() / 10.0),
+            rtt_ms,
             "rate sample"
         );
+        // The same numbers for the statistics panel (D-029).
+        let adaptive = self.config.adaptive;
+        let limits = session.rate.limits();
+        let target = if adaptive {
+            r.target_bps
+        } else {
+            self.config.rate.start_bps
+        };
+        let stats = json!({
+            "t": "stats",
+            "adaptive": adaptive,
+            "target_kbps": target / 1000,
+            "estimate_kbps": r.estimate_bps.map(|v| v / 1000),
+            "sent_kbps": sent_kbps,
+            "out_kbps": out_kbps,
+            "loss": r.loss,
+            "rtt_ms": rtt_ms,
+            "min_kbps": limits.min_bps / 1000,
+            "max_kbps": limits.max_bps / 1000,
+            "rate_changes": c.rate_changes.load(Ordering::Relaxed),
+        });
+        send_control(session, &stats);
     }
 
     fn run(mut self) {
@@ -1011,6 +1036,23 @@ fn handle_event(
         Event::ChannelData(data) if Some(data.id) == session.control && !data.binary => {
             if let Some(reply) = control_reply(&data.data, unix_ms(SystemTime::now())) {
                 send_control(session, &reply);
+            } else if let Some(limits) = settings_limits(&data.data, config.rate) {
+                if config.adaptive {
+                    let before = session.rate.target();
+                    session.rate.set_limits(limits);
+                    rate_changed(session, shared, before, true);
+                }
+                info!(
+                    max_kbps = limits.max_bps / 1000,
+                    adaptive = config.adaptive,
+                    "client bitrate limit"
+                );
+                let reply = json!({
+                    "t": "settings",
+                    "max_bitrate_kbps": limits.max_bps / 1000,
+                    "adaptive": config.adaptive,
+                });
+                send_control(session, &reply);
             }
         }
         Event::ChannelData(data)
@@ -1122,6 +1164,23 @@ fn control_reply(text: &[u8], server_ms: f64) -> Option<Value> {
     }
 }
 
+/// The range for the rate control after a client `settings` (D-029): its `max_bitrate_kbps` inside the server's
+/// range, `null` or no value for the server's own limit. Anything else is not a settings message.
+fn settings_limits(text: &[u8], server: RateLimits) -> Option<RateLimits> {
+    let message: Value = serde_json::from_slice(text).ok()?;
+    if message["t"].as_str()? != "settings" {
+        return None;
+    }
+    let max_bps = match &message["max_bitrate_kbps"] {
+        Value::Null => server.max_bps,
+        v => {
+            let kbps = v.as_f64().filter(|k| k.is_finite())?;
+            (kbps * 1000.0).clamp(f64::from(server.min_bps), f64::from(server.max_bps)) as u32
+        }
+    };
+    Some(RateLimits { max_bps, ..server })
+}
+
 /// The H.264 payload type to send with: packetization-mode 1, High profile when offered, else any.
 /// Also returns its `profile-level-id`, for the log.
 fn choose_h264(
@@ -1167,6 +1226,38 @@ mod tests {
         assert_eq!(reply["server_ms"], 1000.25);
         assert!(control_reply(br#"{"t":"settings"}"#, 0.0).is_none());
         assert!(control_reply(b"not json", 0.0).is_none());
+    }
+
+    #[test]
+    fn settings_set_the_upper_limit_inside_the_server_range() {
+        let server = RateLimits {
+            start_bps: 30_000_000,
+            min_bps: 2_000_000,
+            max_bps: 50_000_000,
+        };
+        let max = |text: &str| settings_limits(text.as_bytes(), server).map(|l| l.max_bps);
+        assert_eq!(
+            max(r#"{"t":"settings","max_bitrate_kbps":20000}"#),
+            Some(20_000_000)
+        );
+        assert_eq!(
+            max(r#"{"t":"settings","max_bitrate_kbps":900000}"#),
+            Some(50_000_000)
+        );
+        assert_eq!(
+            max(r#"{"t":"settings","max_bitrate_kbps":10}"#),
+            Some(2_000_000)
+        );
+        assert_eq!(
+            max(r#"{"t":"settings","max_bitrate_kbps":null}"#),
+            Some(50_000_000)
+        );
+        assert_eq!(max(r#"{"t":"settings"}"#), Some(50_000_000));
+        assert_eq!(max(r#"{"t":"settings","max_bitrate_kbps":"lots"}"#), None);
+        assert_eq!(max(r#"{"t":"ping","id":1}"#), None);
+        assert_eq!(max("not json"), None);
+        let l = settings_limits(br#"{"t":"settings","max_bitrate_kbps":5000}"#, server).unwrap();
+        assert_eq!((l.start_bps, l.min_bps), (server.start_bps, server.min_bps));
     }
 
     #[test]

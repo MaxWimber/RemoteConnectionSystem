@@ -1,6 +1,7 @@
 // "Скачать диагностику": what the browser saw, as one JSON file (docs/ARCHITECTURE.md, Диагностика).
 
 import type { LatencySummary } from './latency';
+import type { ServerStats } from './server-stats';
 import type { StatsMap, StreamSummary } from './stats';
 
 const MAX_EVENTS = 500;
@@ -14,6 +15,7 @@ interface LogEvent {
 const events: LogEvent[] = [];
 const errors: LogEvent[] = [];
 const samples: Array<{ at: string; summary: StreamSummary; latency: LatencySummary | null }> = [];
+const serverSamples: Array<{ at: string; stats: ServerStats }> = [];
 
 function push<T>(list: T[], item: T, max: number): void {
   list.push(item);
@@ -26,6 +28,11 @@ export function logEvent(message: string): void {
 
 export function recordSample(summary: StreamSummary, latency: LatencySummary | null = null): void {
   push(samples, { at: new Date().toISOString(), summary, latency }, MAX_SAMPLES);
+}
+
+/** The agent's rate control as `stats` reported it (D-029). */
+export function recordServerStats(stats: ServerStats): void {
+  push(serverSamples, { at: new Date().toISOString(), stats }, MAX_SAMPLES);
 }
 
 let installed = false;
@@ -87,6 +94,7 @@ export function buildReport(stats: StatsMap | null, agentStatus: unknown): Recor
     events,
     errors,
     samples,
+    server: serverSamples,
     agent: agentStatus,
     getStats: stats ? Array.from(stats.values()) : null,
   };

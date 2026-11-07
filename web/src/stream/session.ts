@@ -5,6 +5,7 @@ import { me } from '../api/auth';
 import { InputChannels } from '../input/channels';
 import { decodeServer, type ServerMessage as CursorMessage } from '../input/protocol';
 import { watchNetwork } from './network';
+import { loadBitrateLimit, parseServerStats, saveBitrateLimit, settingsMessage, type ServerStats } from './server-stats';
 import { CLOSE_SESSION_ENDED, Signaling, signalUrl, type ServerMessage } from './signaling';
 
 export type SessionState = 'idle' | 'connecting' | 'playing' | 'reconnecting' | 'replaced' | 'stopped';
@@ -17,6 +18,10 @@ export interface SessionEvents {
   signedOut(): void;
   /** The server's pointer: shape on control, position on input-fast. */
   cursor?(message: CursorMessage): void;
+  /** The agent's rate control, once a second while video plays (D-029). */
+  serverStats?(stats: ServerStats): void;
+  /** The bitrate limit the server applied, kbit/s. */
+  settingsApplied?(maxKbps: number, adaptive: boolean): void;
 }
 
 /** Wait before the n-th reconnect attempt: 1 s, 2 s, 4 s, then 5 s. */
@@ -55,6 +60,8 @@ export class StreamSession {
   private clockSync: ClockSync | null = null;
   private inputChannels: InputChannels | null = null;
   private unwatch: (() => void) | undefined;
+  private control: RTCDataChannel | null = null;
+  private limitKbps: number | null = loadBitrateLimit();
 
   constructor(
     private readonly base: string,
@@ -68,6 +75,18 @@ export class StreamSession {
   /** The input channels of the current connection; they send nothing until open. */
   get input(): InputChannels | null {
     return this.inputChannels;
+  }
+
+  /** The bitrate limit chosen on this browser, kbit/s, or null for the server's. */
+  get bitrateLimit(): number | null {
+    return this.limitKbps;
+  }
+
+  /** Remembers the limit and sends it now if the control channel is open, else when it opens. */
+  setBitrateLimit(kbps: number | null): void {
+    this.limitKbps = kbps;
+    saveBitrateLimit(kbps);
+    if (this.control?.readyState === 'open') this.control.send(settingsMessage(kbps));
   }
 
   /** The server clock of the current session, once the control channel has answered. */
@@ -102,6 +121,7 @@ export class StreamSession {
     window.clearTimeout(this.pingTimer);
     this.clockSync = null;
     this.inputChannels = null;
+    this.control = null;
     this.signaling?.close();
     this.signaling = null;
     this.pc?.close();
@@ -229,7 +249,12 @@ export class StreamSession {
       this.pingTimer = window.setTimeout(ping, id < 10 ? 200 : 5000);
     };
     channel.binaryType = 'arraybuffer';
-    channel.onopen = ping;
+    this.control = channel;
+    channel.onopen = () => {
+      // The server keeps a limit only for the connection: send the chosen one every time (D-029).
+      if (this.limitKbps !== null) channel.send(settingsMessage(this.limitKbps));
+      ping();
+    };
     channel.onmessage = (e) => {
       if (e.data instanceof ArrayBuffer) {
         const m = decodeServer(new Uint8Array(e.data));
@@ -243,7 +268,12 @@ export class StreamSession {
       } catch {
         return;
       }
-      if (m['t'] === 'hello' && typeof m['rtp_epoch_ms'] === 'number') {
+      if (m['t'] === 'stats') {
+        const stats = parseServerStats(m);
+        if (stats) this.events.serverStats?.(stats);
+      } else if (m['t'] === 'settings' && typeof m['max_bitrate_kbps'] === 'number') {
+        this.events.settingsApplied?.(m['max_bitrate_kbps'], m['adaptive'] === true);
+      } else if (m['t'] === 'hello' && typeof m['rtp_epoch_ms'] === 'number') {
         clock.rtpEpochMs = m['rtp_epoch_ms'];
         if (typeof m['rtp_clock'] === 'number') clock.rtpClock = m['rtp_clock'];
       } else if (m['t'] === 'pong' && typeof m['id'] === 'number' && typeof m['server_ms'] === 'number') {
