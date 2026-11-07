@@ -5,6 +5,7 @@ export const PROTOCOL_VERSION = 1;
 export type ServerMessage =
   | { v: number; type: 'answer'; sdp: string }
   | { v: number; type: 'session-replaced' }
+  | { v: number; type: 'resumed' }
   | { v: number; type: 'error'; code: string }
   | { v: number; type: 'pong'; id: number };
 
@@ -33,6 +34,8 @@ export function parseServerMessage(text: string): ServerMessage {
         : { v: PROTOCOL_VERSION, type: 'error', code: 'bad_message' };
     case 'session-replaced':
       return { v: PROTOCOL_VERSION, type: 'session-replaced' };
+    case 'resumed':
+      return { v: PROTOCOL_VERSION, type: 'resumed' };
     case 'error':
       return { v: PROTOCOL_VERSION, type: 'error', code: String(m['code'] ?? 'unknown') };
     case 'pong':

@@ -31,6 +31,7 @@ test('server messages of another version or shape are errors', () => {
   expect(parseServerMessage('{"v":2,"type":"answer","sdp":"v=0"}')).toMatchObject({ code: 'protocol_mismatch' });
   expect(parseServerMessage('nonsense')).toMatchObject({ code: 'bad_message' });
   expect(parseServerMessage('{"v":1,"type":"session-replaced"}').type).toBe('session-replaced');
+  expect(parseServerMessage('{"v":1,"type":"resumed"}').type).toBe('resumed');
 });
 
 test('abs-capture-time is switched from stopped to recvonly, nothing else changes', () => {

@@ -40,6 +40,8 @@ pub struct Policy {
     pub socket_ping: Duration,
     /// A signaling socket that hears nothing, not even a pong, for this long is dead and ends like a closed one.
     pub socket_silence: Duration,
+    /// A media session whose socket was lost waits this long for the same sign-in to take it back (D-031).
+    pub resume_grace: Duration,
 }
 
 impl Default for Policy {
@@ -56,6 +58,7 @@ impl Default for Policy {
             global_block: Duration::from_secs(15 * 60),
             socket_ping: Duration::from_secs(15),
             socket_silence: Duration::from_secs(45),
+            resume_grace: Duration::from_secs(20),
         }
     }
 }
@@ -76,7 +79,7 @@ impl Stage {
     }
 }
 
-type Key = [u8; 32];
+pub type Key = [u8; 32];
 
 struct Entry {
     stage: Stage,

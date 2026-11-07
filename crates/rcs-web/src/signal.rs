@@ -1,7 +1,8 @@
 //! `GET /api/signal`: WebSocket signaling from docs/PROTOCOL.md. Only a full session gets here (`auth::guard`).
 //!
 //! The socket lives as long as its sign-in session: logout, a new sign-in and expiry close it at once and end the
-//! media session in the agent. An active stream counts as activity for the idle limit.
+//! media session in the agent. An active stream counts as activity for the idle limit. A socket that was lost, not
+//! closed, leaves its media session waiting for the same sign-in to take it back with `resume` (D-031).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -14,11 +15,11 @@ use axum::response::Response;
 use rcs_protocol::PROTOCOL_VERSION;
 use rcs_protocol::agent::{Request, Response as AgentResponse};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::app::{AppState, Owner};
-use crate::auth::{ClientIp, Liveness, SessionRef};
+use crate::auth::{ClientIp, Key, Liveness, SessionRef};
 
 const CHECK: Duration = Duration::from_secs(1);
 /// Close code for a session that ended, so the browser goes back to sign-in instead of reconnecting.
@@ -59,6 +60,8 @@ async fn serve_socket(
     let mut pinged = opened;
     // Why the socket ended, for the log: a lost connection and a closed tab look the same to the browser (1006).
     let mut why = String::from("session ended");
+    // The connection was lost rather than closed by the browser: the media session may be taken back (D-031).
+    let mut lost = false;
     info!(socket = id, "signaling connected");
     while signed_in {
         tokio::select! {
@@ -67,10 +70,12 @@ async fn serve_socket(
                     Some(Ok(frame)) => frame,
                     Some(Err(e)) => {
                         why = format!("connection lost: {e}");
+                        lost = true;
                         break;
                     }
                     None => {
                         why = "connection lost".into();
+                        lost = true;
                         break;
                     }
                 };
@@ -86,11 +91,12 @@ async fn serve_socket(
                     }
                     _ => continue,
                 };
-                let reply = handle(&state, id, &text, &notify, &mut session, ip).await;
+                let reply = handle(&state, id, &auth.key, &text, &notify, &mut session, ip).await;
                 if let Some(reply) = reply
                     && let Err(e) = socket.send(Message::Text(reply.to_string().into())).await
                 {
                     why = format!("send failed: {e}");
+                    lost = true;
                     break;
                 }
             }
@@ -99,6 +105,7 @@ async fn serve_socket(
                 session = None;
                 if let Err(e) = socket.send(Message::Text(notice.to_string().into())).await {
                     why = format!("send failed: {e}");
+                    lost = true;
                     break;
                 }
             }
@@ -119,6 +126,7 @@ async fn serve_socket(
                 }
                 if now.duration_since(heard) >= state.policy.socket_silence {
                     why = "no answer to ping".into();
+                    lost = true;
                     break;
                 }
                 let ping = state.policy.socket_ping;
@@ -126,6 +134,7 @@ async fn serve_socket(
                     pinged = now;
                     if let Err(e) = socket.send(Message::Ping(Vec::new().into())).await {
                         why = format!("send failed: {e}");
+                        lost = true;
                         break;
                     }
                 }
@@ -145,23 +154,74 @@ async fn serve_socket(
             })))
             .await;
     }
-    // A browser that leaves ends its media session, unless another browser already replaced it.
+    // A browser that leaves ends its media session, unless another socket already holds it. A lost socket leaves it
+    // waiting for `resume` (D-031).
     if let Some(session_id) = session {
         let mut owner = state.owner.lock().await;
-        if owner.as_ref().is_some_and(|o| o.session_id == session_id) {
-            *owner = None;
-            drop(owner);
-            let _ = state.agent.call(Request::CloseSession { session_id }).await;
-            state.audit.event("stream_stopped", Some(ip), json!({}));
+        if let Some(o) = owner
+            .as_mut()
+            .filter(|o| o.session_id == session_id && o.socket == id)
+        {
+            if lost && signed_in {
+                o.orphaned = true;
+                drop(owner);
+                info!(socket = id, "media session waits for resume");
+                tokio::spawn(close_unless_resumed(
+                    state.clone(),
+                    session_id,
+                    id,
+                    auth.ended.clone(),
+                    ip,
+                ));
+            } else {
+                *owner = None;
+                drop(owner);
+                close_media(&state, session_id, ip).await;
+            }
         }
     }
     let seconds = opened.elapsed().as_secs_f64();
     info!(socket = id, why, seconds, "signaling closed");
 }
 
+async fn close_media(state: &AppState, session_id: String, ip: std::net::IpAddr) {
+    let _ = state.agent.call(Request::CloseSession { session_id }).await;
+    state.audit.event("stream_stopped", Some(ip), json!({}));
+}
+
+/// Ends a media session that lost its socket, unless a socket of the same sign-in took it back in time. The end of
+/// the sign-in session ends it at once.
+async fn close_unless_resumed(
+    state: Arc<AppState>,
+    session_id: String,
+    socket: u64,
+    mut ended: watch::Receiver<bool>,
+    ip: std::net::IpAddr,
+) {
+    if !*ended.borrow() {
+        tokio::select! {
+            _ = tokio::time::sleep(state.policy.resume_grace) => {}
+            // Also when the sign-in session is gone and its sender with it.
+            _ = ended.changed() => {}
+        }
+    }
+    let mut owner = state.owner.lock().await;
+    if owner
+        .as_ref()
+        .is_some_and(|o| o.session_id == session_id && o.socket == socket)
+    {
+        *owner = None;
+        drop(owner);
+        info!(socket, "no resume, media session closed");
+        close_media(&state, session_id, ip).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     state: &AppState,
     socket_id: u64,
+    login: &Key,
     text: &str,
     notify: &mpsc::Sender<Value>,
     session: &mut Option<String>,
@@ -195,6 +255,9 @@ async fn handle(
                     let previous = state.owner.lock().await.replace(Owner {
                         session_id: session_id.clone(),
                         notify: notify.clone(),
+                        socket: socket_id,
+                        login: *login,
+                        orphaned: false,
                     });
                     if let Some(previous) = previous
                         && previous.session_id != session_id
@@ -224,6 +287,22 @@ async fn handle(
         }
         // The client sends a new offer right after; the old session ends when that one opens.
         Some("restart") => None,
+        // A new socket after a lost one: the media session goes on if this sign-in opened it (D-031).
+        Some("resume") => {
+            let mut owner = state.owner.lock().await;
+            match owner.as_mut() {
+                Some(o) if o.orphaned && o.login == *login => {
+                    o.orphaned = false;
+                    o.socket = socket_id;
+                    o.notify = notify.clone();
+                    *session = Some(o.session_id.clone());
+                    info!(socket = socket_id, "media session resumed");
+                    state.audit.event("stream_resumed", Some(ip), json!({}));
+                    Some(message("resumed"))
+                }
+                _ => Some(error_message("resume_failed")),
+            }
+        }
         _ => Some(error_message("bad_message")),
     }
 }

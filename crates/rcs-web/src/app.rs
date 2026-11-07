@@ -28,6 +28,12 @@ use crate::signal;
 pub struct Owner {
     pub session_id: String,
     pub notify: mpsc::Sender<Value>,
+    /// The signaling socket that holds the session; only it may end the session when it closes (D-031).
+    pub socket: u64,
+    /// The sign-in session that opened it: only the same one may take it over after a lost socket.
+    pub login: auth::Key,
+    /// The socket was lost and the session waits for `resume`.
+    pub orphaned: bool,
 }
 
 pub struct AppState {

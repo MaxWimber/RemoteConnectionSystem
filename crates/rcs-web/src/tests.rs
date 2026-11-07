@@ -35,6 +35,8 @@ struct Fixture {
     secret: Vec<u8>,
     codes: Vec<String>,
     dir: PathBuf,
+    /// The agent pipe this fixture's `rcs-web` calls; nothing listens unless a test starts `fake_agent`.
+    pipe: String,
 }
 
 impl Drop for Fixture {
@@ -61,11 +63,12 @@ fn fixture(policy: Policy) -> Fixture {
     let www = dir.join("www");
     std::fs::create_dir_all(&www).unwrap();
     std::fs::write(www.join("index.html"), "<!doctype html><title>t</title>").unwrap();
+    let pipe = format!(
+        r"\\.\pipe\rcs-web-test-{}",
+        crate::util::hex(&crate::util::random::<6>())
+    );
     let state = Arc::new(AppState::new(Settings {
-        pipe: format!(
-            r"\\.\pipe\rcs-web-test-{}",
-            crate::util::hex(&crate::util::random::<6>())
-        ),
+        pipe: pipe.clone(),
         base: BASE.into(),
         origin: ORIGIN.into(),
         policy,
@@ -83,6 +86,7 @@ fn fixture(policy: Policy) -> Fixture {
         secret,
         codes,
         dir,
+        pipe,
     }
 }
 
@@ -885,6 +889,186 @@ async fn websocket_closes_when_the_session_runs_out_or_is_replaced() {
     assert_eq!(r.status, StatusCode::OK);
     let (errors, _) = until_closed(&mut socket, Duration::from_secs(2)).await;
     assert_eq!(errors, ["session_ended"]);
+}
+
+/// An agent on the fixture's pipe that opens and closes sessions and writes down what it was asked.
+fn fake_agent(f: &Fixture) -> Arc<std::sync::Mutex<Vec<String>>> {
+    use rcs_protocol::agent::{
+        Request as AgentRequest, Response as AgentResponse, body_len, decode, encode,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = log.clone();
+    let name = f.pipe.clone();
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&name)
+        .unwrap();
+    tokio::spawn(async move {
+        loop {
+            if server.connect().await.is_err() {
+                return;
+            }
+            let mut pipe = server;
+            server = ServerOptions::new().create(&name).unwrap();
+            let mut prefix = [0u8; 4];
+            if pipe.read_exact(&mut prefix).await.is_err() {
+                continue;
+            }
+            let mut body = vec![0u8; body_len(prefix).unwrap()];
+            pipe.read_exact(&mut body).await.unwrap();
+            let reply = match decode::<AgentRequest>(&body).unwrap() {
+                AgentRequest::OpenSession { session_id, .. } => {
+                    seen.lock().unwrap().push(format!("open {session_id}"));
+                    AgentResponse::SessionOpened {
+                        session_id,
+                        sdp_answer: "v=0".into(),
+                    }
+                }
+                AgentRequest::CloseSession { session_id } => {
+                    seen.lock().unwrap().push(format!("close {session_id}"));
+                    AgentResponse::SessionClosed { session_id }
+                }
+                AgentRequest::Status => AgentResponse::Error {
+                    code: "test".into(),
+                    message: "no status".into(),
+                },
+            };
+            let _ = pipe.write_all(&encode(&reply).unwrap()).await;
+        }
+    });
+    log
+}
+
+async fn send_json(socket: &mut Socket, message: Value) {
+    socket
+        .send(Message::Text(message.to_string().into()))
+        .await
+        .unwrap();
+}
+
+/// The next JSON message, skipping pings.
+async fn next_json(socket: &mut Socket) -> Value {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("no message in 5 s")
+        {
+            Some(Ok(Message::Text(t))) => return serde_json::from_str(&t).unwrap(),
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// Drops a socket without a close frame, as a phone that lost its network does.
+fn lose(socket: Socket) {
+    drop(socket);
+}
+
+async fn wait_for(
+    log: &Arc<std::sync::Mutex<Vec<String>>>,
+    entries: usize,
+    within: Duration,
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let now = log.lock().unwrap().clone();
+        if now.len() >= entries || tokio::time::Instant::now() >= deadline {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_lost_socket_leaves_the_media_session_for_resume() {
+    let policy = Policy {
+        resume_grace: Duration::from_millis(1500),
+        ..Policy::default()
+    };
+    let f = fixture(policy);
+    let agent = fake_agent(&f);
+    let addr = serve(&f).await;
+    let session = sign_in(&f, "192.0.2.1", 0).await;
+
+    let mut socket = connect(addr, Some(&session), ORIGIN).await.unwrap();
+    send_json(
+        &mut socket,
+        json!({ "v": 1, "type": "offer", "sdp": "v=0" }),
+    )
+    .await;
+    assert_eq!(next_json(&mut socket).await["type"], "answer");
+    lose(socket);
+
+    // A new socket of the same sign-in takes the session back: the agent is never asked to close it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut again = connect(addr, Some(&session), ORIGIN).await.unwrap();
+    send_json(&mut again, json!({ "v": 1, "type": "resume" })).await;
+    assert_eq!(next_json(&mut again).await["type"], "resumed");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let log = agent.lock().unwrap().clone();
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert!(log[0].starts_with("open "), "{log:?}");
+
+    // Nobody to resume twice.
+    let mut third = connect(addr, Some(&session), ORIGIN).await.unwrap();
+    send_json(&mut third, json!({ "v": 1, "type": "resume" })).await;
+    let reply = next_json(&mut third).await;
+    assert_eq!(
+        (reply["type"].as_str(), reply["code"].as_str()),
+        (Some("error"), Some("resume_failed"))
+    );
+
+    // Lost again and not taken back: the session closes after the grace.
+    lose(again);
+    let log = wait_for(&agent, 2, Duration::from_secs(4)).await;
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(log[1], log[0].replace("open", "close"));
+}
+
+#[tokio::test]
+async fn a_closed_socket_ends_the_session_and_another_sign_in_cannot_resume() {
+    let f = fixture(Policy::default());
+    let agent = fake_agent(&f);
+    let addr = serve(&f).await;
+    let session = sign_in(&f, "192.0.2.1", 0).await;
+
+    // Closed by the browser, as a closed tab: the session ends at once.
+    let mut socket = connect(addr, Some(&session), ORIGIN).await.unwrap();
+    send_json(
+        &mut socket,
+        json!({ "v": 1, "type": "offer", "sdp": "v=0" }),
+    )
+    .await;
+    assert_eq!(next_json(&mut socket).await["type"], "answer");
+    socket.close(None).await.unwrap();
+    let log = wait_for(&agent, 2, Duration::from_secs(2)).await;
+    assert_eq!(log.len(), 2, "{log:?}");
+
+    // Lost, then another sign-in (which ends this one) tries to resume: refused, and the session closes at once.
+    let mut socket = connect(addr, Some(&session), ORIGIN).await.unwrap();
+    send_json(
+        &mut socket,
+        json!({ "v": 1, "type": "offer", "sdp": "v=0" }),
+    )
+    .await;
+    assert_eq!(next_json(&mut socket).await["type"], "answer");
+    lose(socket);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let other = sign_in(&f, "192.0.2.2", 1).await;
+    let mut stranger = connect(addr, Some(&other), ORIGIN).await.unwrap();
+    send_json(&mut stranger, json!({ "v": 1, "type": "resume" })).await;
+    let reply = next_json(&mut stranger).await;
+    assert_eq!(reply["code"], "resume_failed");
+    let log = wait_for(&agent, 4, Duration::from_secs(2)).await;
+    assert_eq!(
+        log.len(),
+        4,
+        "the default grace is 20 s, the sign-in ended: {log:?}"
+    );
 }
 
 mod files;

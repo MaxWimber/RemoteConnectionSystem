@@ -70,6 +70,8 @@ export class StreamSession {
   private inputChannels: InputChannels | null = null;
   private unwatch: (() => void) | undefined;
   private control: RTCDataChannel | null = null;
+  private resumeTimer: number | undefined;
+  private resumeAttempt = 0;
   private limitKbps: number | null = loadBitrateLimit();
   private modeChoice: StreamMode = loadMode();
 
@@ -140,6 +142,8 @@ export class StreamSession {
     window.clearTimeout(this.timer);
     window.clearTimeout(this.disconnectTimer);
     window.clearTimeout(this.pingTimer);
+    window.clearTimeout(this.resumeTimer);
+    this.resumeAttempt = 0;
     this.clockSync = null;
     this.inputChannels = null;
     this.control = null;
@@ -178,6 +182,51 @@ export class StreamSession {
     this.timer = window.setTimeout(() => void this.connect(), wait);
   }
 
+  /**
+   * The signaling socket closed. While the media is still connected only the socket comes back and asks the server
+   * to keep the media session (D-031); otherwise everything starts again.
+   */
+  private signalingLost(reason: string, code: number): void {
+    if (code === CLOSE_SESSION_ENDED) {
+      this.endSignedOut();
+      return;
+    }
+    if (this.stopped) return;
+    if (this.pc?.connectionState !== 'connected') {
+      this.scheduleReconnect(reason);
+      return;
+    }
+    this.signaling = null;
+    const wait = backoffMs(this.resumeAttempt++);
+    this.events.log(`сигналинг оборвался (${reason}), видео идёт; новый сокет через ${wait} мс`);
+    window.clearTimeout(this.resumeTimer);
+    this.resumeTimer = window.setTimeout(() => void this.resumeSignaling(), wait);
+  }
+
+  private async resumeSignaling(): Promise<void> {
+    if (this.stopped || !this.pc) return;
+    if (this.pc.connectionState !== 'connected') {
+      this.scheduleReconnect('медиасоединение тоже потеряно');
+      return;
+    }
+    const signaling = new Signaling(
+      signalUrl(window.location, this.base),
+      (m) => void this.onSignal(m),
+      (reason, code) => this.signalingLost(reason, code),
+    );
+    this.signaling = signaling;
+    try {
+      await signaling.open();
+    } catch (e) {
+      if (this.signaling !== signaling) return;
+      if (await this.sessionGone()) return;
+      this.signalingLost(String(e), 0);
+      return;
+    }
+    if (this.signaling !== signaling) return;
+    signaling.send({ type: 'resume' });
+  }
+
   private async connect(): Promise<void> {
     this.teardown();
     this.events.state(this.attempt === 0 ? 'connecting' : 'reconnecting');
@@ -185,7 +234,7 @@ export class StreamSession {
     const signaling = new Signaling(
       url,
       (m) => void this.onSignal(m),
-      (reason, code) => (code === CLOSE_SESSION_ENDED ? this.endSignedOut() : this.scheduleReconnect(reason)),
+      (reason, code) => this.signalingLost(reason, code),
     );
     this.signaling = signaling;
     try {
@@ -315,6 +364,10 @@ export class StreamSession {
         } catch (e) {
           this.scheduleReconnect(`answer не принят: ${String(e)}`);
         }
+        return;
+      case 'resumed':
+        this.resumeAttempt = 0;
+        this.events.log('сигналинг восстановлен, сеанс продолжен');
         return;
       case 'session-replaced':
         this.stopped = true;
