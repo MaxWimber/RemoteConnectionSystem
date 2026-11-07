@@ -69,7 +69,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         simulate_link_queue_ms: 200,
         rate: rcs_webrtc::RateLimits {
             start_bps: 30_000_000,
-            min_bps: 8_000_000,
+            // Under 8 Mbit/s 1080p looks poor, but a weak link must still carry a picture (D-027).
+            min_bps: 2_000_000,
             max_bps: 50_000_000,
         },
         adaptive: true,

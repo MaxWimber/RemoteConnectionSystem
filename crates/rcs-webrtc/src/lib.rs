@@ -497,7 +497,12 @@ struct NetworkLoop {
     buffer: Vec<u8>,
     local: SocketAddr,
     wake_source: SocketAddr,
+    /// The last once-a-second rate line: when, bytes sent and test drops by then.
+    sampled: (Instant, u64, u64),
 }
+
+/// How often a connected session logs its rate: estimate, target and what actually went out.
+const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 
 impl NetworkLoop {
     fn new(
@@ -519,7 +524,37 @@ impl NetworkLoop {
             buffer: vec![0; RECV_BUFFER],
             local,
             wake_source,
+            sampled: (Instant::now(), 0, 0),
         }
+    }
+
+    /// One line a second while media flows, so a run can be read back from the log (P8-1).
+    fn sample(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.sampled.0);
+        if elapsed < SAMPLE_EVERY {
+            return;
+        }
+        let c = &self.shared.counters;
+        let bytes = c.bytes_sent.load(Ordering::Relaxed);
+        let dropped = c.datagrams_dropped_test.load(Ordering::Relaxed);
+        let (_, last_bytes, last_dropped) =
+            std::mem::replace(&mut self.sampled, (now, bytes, dropped));
+        if !self.session.as_ref().is_some_and(|s| s.connected) {
+            return;
+        }
+        let r = self.shared.rate.snapshot();
+        info!(
+            target_kbps = r.target_bps / 1000,
+            estimate_kbps = r.estimate_bps.map(|v| v / 1000),
+            sent_kbps = (bytes.saturating_sub(last_bytes) as f64 * 8.0
+                / elapsed.as_secs_f64()
+                / 1000.0) as u64,
+            dropped_test = dropped.saturating_sub(last_dropped),
+            loss = r.loss,
+            rtt_ms = r.rtt.map(|d| (d.as_secs_f64() * 10_000.0).round() / 10.0),
+            "rate sample"
+        );
     }
 
     fn run(mut self) {
@@ -541,6 +576,7 @@ impl NetworkLoop {
             }
             self.send_frames();
             self.send_cursor();
+            self.sample();
             let deadline = self.drive();
             self.wait(deadline);
         }
@@ -664,6 +700,7 @@ impl NetworkLoop {
                     match written {
                         Some(Ok(())) => {
                             counters.frames_sent.fetch_add(1, Ordering::Relaxed);
+                            session.rate.on_sent(Instant::now(), size as usize);
                             counters.bytes_sent.fetch_add(size, Ordering::Relaxed);
                         }
                         Some(Err(e)) => {
