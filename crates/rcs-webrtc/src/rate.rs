@@ -10,7 +10,8 @@
 //!
 //! - The target drops on congestion only:
 //!   - `str0m` lowered its estimate (on overuse to 0.85 of the acknowledged rate) and it is now under what goes out;
-//!   - the RTT grew by `RTT_RISE` while more goes out than the estimate, before `str0m` lowered it;
+//!   - the RTT grew by `RTT_RISE` while more goes out than the estimate, before `str0m` lowered it, or while the
+//!     target is above the estimate: on a narrow link LCVBR peaks and IDR frames over it sit in its queue (P8-5);
 //!   - heavy loss: down to what still gets through.
 //!
 //!   An estimate under the target alone is no sign: LCVBR sends about 70% of its target. Nor is an estimate that
@@ -43,7 +44,7 @@ const FELL: f64 = 0.99;
 /// Sending this share of the target or more: the encoder spends what it is given.
 const SPENDS: f64 = 0.9;
 /// After a congestion drop, an application-limited target climbs to this many times the rate carried then...
-const CEILING_ROOM: f64 = 1.5;
+const CEILING_ROOM: f64 = 1.2;
 /// ...for this long.
 const CEILING_FOR: Duration = Duration::from_secs(15);
 /// The first estimates follow the start-up probes and the first IDR; only loss counts during this time.
@@ -226,10 +227,12 @@ impl RateControl {
             self.lower(now, next, next);
             return;
         }
-        // A queue builds while more goes out than the estimate, and `str0m` has not lowered it (yet).
+        // A queue builds while more goes out than the estimate, and `str0m` has not lowered it (yet). Or the target
+        // climbed past the estimate while the encoder left part of it unused, and its peaks now fill a narrow link
+        // (P8-5: 3 Mbit/s link, target 3.7-4.1, RTT up to 290 ms while on average less went out than the estimate).
         if self.queue_builds()
             && let Some(estimate) = self.estimate.map(f64::from)
-            && estimate < sent * UNDER_SENT
+            && (estimate < sent * UNDER_SENT || f64::from(self.target) > estimate)
         {
             self.lower(now, estimate * SHARE, estimate);
         }
@@ -332,14 +335,14 @@ mod tests {
         busy(&mut c, t, 10);
         c.on_estimate(t, mbps(6));
         assert_eq!(c.target(), 8 * MBPS);
-        // Quiet: 2 Mbit/s sent, no estimate above it. The ceiling is 1.5 x 8 Mbit/s.
+        // Quiet: 2 Mbit/s sent, no estimate above it. The ceiling is 1.2 x 8 Mbit/s.
         let mut at = t;
         for _ in 0..12 {
             at += UP_EVERY;
             busy(&mut c, at, 2);
             c.on_estimate(at, mbps(3));
         }
-        assert_eq!(c.target(), 12 * MBPS);
+        assert_eq!(c.target(), 9_600_000);
         for _ in 0..40 {
             at += UP_EVERY;
             busy(&mut c, at, 2);
@@ -507,6 +510,34 @@ mod tests {
     }
 
     #[test]
+    fn a_growing_queue_with_the_target_over_the_estimate_drops_to_it() {
+        // A narrow link: LCVBR sends 2.4 Mbit/s on average, but the target has climbed to 3.7 over the estimate of
+        // 3.2 and its peaks fill the link's queue.
+        let (mut c, t) = settled();
+        c.limits.min_bps = 2 * MBPS;
+        c.on_report(t, Some(0.0), Some(Duration::from_millis(2)));
+        c.on_estimate(t, mbps(3) + 200_000);
+        c.target = 3_700_000;
+        let at = t + Duration::from_secs(1);
+        c.on_sent(at - Duration::from_millis(900), 150_000);
+        c.on_sent(at - Duration::from_millis(400), 150_000);
+        c.on_report(at, Some(0.0), Some(Duration::from_millis(197)));
+        assert_eq!(c.target(), (3.2e6 * SHARE) as u32);
+        // The same RTT with the target under the estimate only holds.
+        let (mut c, t) = settled();
+        c.on_report(t, Some(0.0), Some(Duration::from_millis(2)));
+        c.on_estimate(t, mbps(40));
+        let held = c.target();
+        assert!(held < 40 * MBPS);
+        c.on_report(
+            t + Duration::from_secs(1),
+            Some(0.0),
+            Some(Duration::from_millis(197)),
+        );
+        assert_eq!(c.target(), held);
+    }
+
+    #[test]
     fn heavy_loss_cuts_to_what_gets_through() {
         let (mut c, t) = settled();
         busy(&mut c, t, 20);
@@ -538,11 +569,11 @@ mod tests {
         busy(&mut c, t, 10);
         c.on_estimate(t, mbps(3));
         assert_eq!(c.target(), 8 * MBPS);
-        // Right after the drop only up to the ceiling, 1.5 x 8 Mbit/s: the estimate may be a stale one.
+        // Right after the drop only up to the ceiling, 1.2 x 8 Mbit/s: the estimate may be a stale one.
         let at = t + HOLD_AFTER_DROP;
         busy(&mut c, at, 3);
         c.on_estimate(at, mbps(30));
-        assert_eq!(c.target(), 12 * MBPS);
+        assert_eq!(c.target(), 9_600_000);
         let at = t + CEILING_FOR;
         busy(&mut c, at, 3);
         c.on_estimate(at, mbps(31));

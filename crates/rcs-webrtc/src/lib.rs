@@ -33,12 +33,14 @@ use tracing::{debug, info, warn};
 mod link;
 mod mode;
 mod rate;
+mod timing;
 
 pub use link::LinkTest;
 use link::Shaper;
 use mode::ModeControl;
 pub use mode::StreamMode;
 pub use rate::{RateControl, RateLimits};
+use timing::FrameTimings;
 
 /// Frames waiting for the network thread. Two is enough to ride out one slow send without adding latency.
 const QUEUE_FRAMES: usize = 2;
@@ -71,6 +73,9 @@ pub struct Config {
     pub rate: RateLimits,
     /// Follow the send-side estimate (D-027).
     pub adaptive: bool,
+    /// Hold video to the pacer's rate, 1.1 x the estimate. Off: every frame goes out at once, the estimate still
+    /// comes from TWCC (P8-5).
+    pub paced_video: bool,
     /// Testing only (P8-1): a narrow link on the way out, see [`LinkTest`].
     pub simulate_link: Option<LinkTest>,
 }
@@ -496,6 +501,9 @@ struct Session {
     client_max: Option<u32>,
     /// `Config::simulate_link`, from the moment media flows.
     shaper: Option<Shaper>,
+    /// Capture to `str0m` and capture to the last packet out, summed up every `TIMING_EVERY` (P8-5).
+    timings: FrameTimings,
+    timings_since: Instant,
 }
 
 fn unix_ms(at: SystemTime) -> f64 {
@@ -523,6 +531,8 @@ struct NetworkLoop {
 
 /// How often a connected session logs its rate: estimate, target and what actually went out.
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
+/// How often a connected session logs where its frames' time went (P8-5).
+const TIMING_EVERY: Duration = Duration::from_secs(10);
 
 impl NetworkLoop {
     fn new(
@@ -593,6 +603,17 @@ impl NetworkLoop {
             rtt_ms,
             "rate sample"
         );
+        if now.duration_since(session.timings_since) >= TIMING_EVERY {
+            session.timings_since = now;
+            let (written, out) = session.timings.take();
+            let ms = |s: Option<timing::Spread>| s.map(|s| [s.p50, s.p95, s.p99, s.max]);
+            info!(
+                written_ms = ?ms(written),
+                out_ms = ?ms(out),
+                paced = self.config.paced_video,
+                "frame timing"
+            );
+        }
         // «Слабая сеть» by itself when the target stays low, back when the link has room (D-030).
         let adaptive = self.config.adaptive;
         if adaptive {
@@ -715,6 +736,8 @@ impl NetworkLoop {
             mode: ModeControl::new(now, last_mode),
             client_max: None,
             shaper: None,
+            timings: FrameTimings::default(),
+            timings_since: now,
         });
         self.shared.rate.publish(&RateControl::new(session_limits(
             self.config.rate,
@@ -779,6 +802,7 @@ impl NetworkLoop {
                     });
                     match written {
                         Some(Ok(())) => {
+                            session.timings.written(frame.captured.elapsed());
                             counters.frames_sent.fetch_add(1, Ordering::Relaxed);
                             session.rate.on_sent(Instant::now(), size as usize);
                             counters.bytes_sent.fetch_add(size, Ordering::Relaxed);
@@ -875,6 +899,13 @@ impl NetworkLoop {
                         .counters
                         .bytes_out
                         .fetch_add(t.contents.len() as u64, Ordering::Relaxed);
+                    if let Some((_, pt)) = session.video
+                        && let Some(ts) = timing::frame_end(&t.contents, *pt)
+                    {
+                        session
+                            .timings
+                            .out(timing::age(ts, session.epoch.elapsed()));
+                    }
                     // Only once media flows, so ICE and DTLS are never part of the simulated outage.
                     if session.connected
                         && let Some(test) = self.config.simulate_loss
@@ -991,7 +1022,12 @@ fn handle_event(
             match pt {
                 Some((pt, level_id)) => {
                     let profile_level_id = level_id.map(|v| format!("{v:06x}")).unwrap_or_default();
-                    info!(mid = %added.mid, ?pt, %profile_level_id, "video track ready");
+                    if !config.paced_video
+                        && let Some(tx) = session.rtc.direct_api().stream_tx_by_mid(added.mid, None)
+                    {
+                        tx.set_unpaced(true);
+                    }
+                    info!(mid = %added.mid, ?pt, %profile_level_id, paced = config.paced_video, "video track ready");
                     session.video = Some((added.mid, pt));
                 }
                 None => warn!("the browser offered no usable H.264"),
@@ -1487,6 +1523,7 @@ mod tests {
                 max_bps: 50_000_000,
             },
             adaptive: true,
+            paced_video: true,
             simulate_link: None,
         })
         .expect("bind on loopback");

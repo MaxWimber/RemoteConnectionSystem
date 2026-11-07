@@ -26,15 +26,15 @@ use tracing::{Level, error, info, info_span};
 const USAGE: &str = "\
 Usage: rcs-agent [--udp ADDR] [--advertise ADDR,ADDR] [--pipe NAME] [--log DIR]
                  [--encoder auto|amf|mf] [--width W] [--height H] [--fps F] [--bitrate-mbps B] [--display N]
-                 [--min-bitrate-mbps B] [--max-bitrate-mbps B] [--rate adaptive|fixed]
+                 [--min-bitrate-mbps B] [--max-bitrate-mbps B] [--rate adaptive|fixed] [--pacing paced|unpaced]
                  [--input record|sendinput] [--stop-event NAME]
                  [--simulate-loss EVERY_MS:BURST_MS]   testing only: stop sending for BURST_MS every EVERY_MS
                  [--simulate-link S:MBPS,S:MBPS] [--simulate-link-queue-ms MS]
-                 [--simulate-amf-failure FRAMES]       testing only: every AMF encoder fails after FRAMES frames
                                                        testing only: a narrow link on the way out, rates repeat
                  [--simulate-amf-failure FRAMES]       testing only: every AMF encoder fails after FRAMES frames
   --rate       adaptive (default) follows the network between the minimum and maximum bitrate (D-027); fixed
                keeps --bitrate-mbps
+  --pacing     paced (default) lets video out at 1.1 x the estimate; unpaced sends each frame at once (P8-5)
   --udp        UDP address for WebRTC, default 127.0.0.1:8443
   --input      record (default) checks and counts input without sending it to Windows; sendinput controls this
                computer (D-022)
@@ -53,6 +53,7 @@ struct Options {
     simulate_link_queue_ms: u64,
     rate: rcs_webrtc::RateLimits,
     adaptive: bool,
+    paced_video: bool,
     input: input::Mode,
     stop_event: Option<String>,
 }
@@ -80,6 +81,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             max_bps: 50_000_000,
         },
         adaptive: true,
+        paced_video: true,
         input: input::Mode::Record,
         stop_event: None,
         pipeline: pipeline::Config {
@@ -132,6 +134,13 @@ fn parse(args: &[String]) -> Result<Options, String> {
                     "adaptive" => true,
                     "fixed" => false,
                     _ => return Err(format!("{flag}: adaptive or fixed")),
+                }
+            }
+            "--pacing" => {
+                options.paced_video = match value.as_str() {
+                    "paced" => true,
+                    "unpaced" => false,
+                    _ => return Err(format!("{flag}: paced or unpaced")),
                 }
             }
             "--simulate-link" => options.simulate_link = Some(value.clone()),
@@ -258,11 +267,12 @@ fn run(options: Options) -> Result<(), String> {
         input: Some(link.clone()),
         rate: options.rate,
         adaptive: options.adaptive,
+        paced_video: options.paced_video,
         simulate_link,
     })
     .map_err(|e| format!("UDP {}: {e}", options.udp))?;
     info!(udp = %server.local_addr(), advertise = ?options.advertise, pipe = %options.pipe,
-        input = options.input.name(), adaptive = options.adaptive,
+        input = options.input.name(), adaptive = options.adaptive, paced_video = options.paced_video,
         min_kbps = options.rate.min_bps / 1000, max_kbps = options.rate.max_bps / 1000, "agent started");
     println!(
         "rcs-agent {BUILD_ID}: WebRTC {} ({:?}), канал {}, ввод {}",
