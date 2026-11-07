@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { logout } from '../api/auth';
 import { FileManager } from '../files/FileManager';
+import { browserQueue, useQueue } from '../files/queue';
 import { InputController } from '../input/controller';
 import { CursorView } from '../input/cursor';
 import { GamepadPoller } from '../input/gamepads';
@@ -53,6 +54,9 @@ export function App({ onSignedOut }: Props) {
   const screenPad = useRef<ScreenPad | null>(null);
   const [padShown, setPadShown] = useState(false);
   const [filesShown, setFilesShown] = useState(false);
+  const [uploads] = useState(() => browserQueue(import.meta.env.BASE_URL));
+  useQueue(uploads);
+  const sending = uploads.progress();
   const session = useRef<StreamSession | null>(null);
   const lastStats = useRef<StatsMap | null>(null);
   const agentStatus = useRef<unknown>(null);
@@ -63,6 +67,15 @@ export function App({ onSignedOut }: Props) {
   const [latency, setLatency] = useState<LatencySummary | null>(null);
   const meter = useRef<LatencyMeter | null>(null);
   const input = useRef<InputController | null>(null);
+
+  // A leaving page cancels nothing: the server keeps the uploads and the same file resumes after a reload.
+  useEffect(() => {
+    const warn = (e: BeforeUnloadEvent) => {
+      if (uploads.active) e.preventDefault();
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [uploads]);
 
   useEffect(() => {
     installErrorCapture();
@@ -330,14 +343,20 @@ export function App({ onSignedOut }: Props) {
             🖱
           </button>
         )}
-        <button onClick={() => setFilesShown(!filesShown)} title="Файлы">
+        <button
+          onClick={() => setFilesShown(!filesShown)}
+          title={sending.count > 0 ? `Файлы: загружается ${sending.count}` : 'Файлы'}
+        >
           📁
+          {sending.count > 0 && (
+            <span class="files-badge">{sending.size > 0 ? Math.floor((sending.sent / sending.size) * 100) : 0}%</span>
+          )}
         </button>
         <button onClick={() => setShowStats(!showStats)} title="Статистика">ℹ</button>
         <button onClick={() => void saveDiagnostics()} title="Скачать диагностику">⤓</button>
         <button onClick={() => void signOut()} title="Выйти">⏻</button>
       </div>
-      {filesShown && <FileManager base={import.meta.env.BASE_URL} onClose={() => setFilesShown(false)} />}
+      {filesShown && <FileManager base={import.meta.env.BASE_URL} uploads={uploads} onClose={() => setFilesShown(false)} />}
       {showStats && (
         <div class="stats">
           <div>

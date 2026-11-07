@@ -207,4 +207,29 @@ describe('upload', () => {
     expect(u.view.phase).toBe('error');
     expect(u.view.error).toBe('disk_full');
   });
+
+  it('a file that can no longer be read stops with an error and keeps the server copy', async () => {
+    const s = new FakeServer();
+    const store = new Map<string, string>();
+    const good = file('0123456789');
+    let reads = 0;
+    // The file changed on disk after the pick: the browser refuses to read it from the third chunk on.
+    const changed = {
+      name: good.name,
+      size: good.size,
+      lastModified: good.lastModified,
+      slice: (start: number, end: number) => {
+        if (++reads < 3) return good.slice(start, end);
+        return { arrayBuffer: () => Promise.reject(new DOMException('gone', 'NotReadableError')) } as Blob;
+      },
+    };
+    const views: UploadView[] = [];
+    const u = new Upload(changed, 'k.bin', deps(s, true, store), (v) => views.push(v));
+    await u.run();
+    expect(u.view.phase).toBe('error');
+    expect(u.view.error).toBe('file_unreadable');
+    expect(views.some((v) => v.phase === 'retrying')).toBe(false);
+    expect(s.uploads.size).toBe(1);
+    expect(store.size).toBe(1);
+  });
 });

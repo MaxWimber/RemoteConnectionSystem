@@ -13,19 +13,16 @@ import {
   codeText,
 } from './api';
 import { formatDate, formatEta, formatSize, formatSpeed } from './format';
-import { browserDeps, Upload, type UploadView } from './upload';
+import { useQueue, type UploadQueue } from './queue';
+import type { UploadView } from './upload';
 
 const TRASH = '.rcs-trash';
 
 interface Props {
   base: string;
+  /** Owned by the page: uploads go on while the panel is closed. */
+  uploads: UploadQueue;
   onClose(): void;
-}
-
-interface Row {
-  key: number;
-  upload: Upload;
-  view: UploadView;
 }
 
 const phaseText: Record<UploadView['phase'], string> = {
@@ -49,18 +46,17 @@ function icon(e: Entry): string {
 }
 
 /** Files under files.root (docs/PROTOCOL.md «Файлы»): browse, upload with resume, download, rename, move, trash. */
-export function FileManager({ base, onClose }: Props) {
+export function FileManager({ base, uploads, onClose }: Props) {
   const [dir, setDir] = useState('');
   const [entries, setEntries] = useState<Entry[]>([]);
   const [loading, setLoading] = useState(false);
+  // A listing that came late must not wipe what an action just said, so the two are kept apart.
   const [message, setMessage] = useState('');
+  const [listError, setListError] = useState('');
   const [hashes, setHashes] = useState<Record<string, string>>({});
-  const [rows, setRows] = useState<Row[]>([]);
+  const rows = useQueue(uploads);
   const [dragging, setDragging] = useState(false);
   const picker = useRef<HTMLInputElement>(null);
-  const nextKey = useRef(1);
-  const queue = useRef<Row[]>([]);
-  const running = useRef(false);
   const dirRef = useRef(dir);
   dirRef.current = dir;
   const inTrash = dir === TRASH || dir.startsWith(`${TRASH}/`);
@@ -69,9 +65,9 @@ export function FileManager({ base, onClose }: Props) {
     setLoading(true);
     try {
       setEntries(await list(base, path));
-      setMessage('');
+      setListError('');
     } catch (e) {
-      setMessage(errorText(e));
+      setListError(errorText(e));
     } finally {
       setLoading(false);
     }
@@ -79,6 +75,7 @@ export function FileManager({ base, onClose }: Props) {
 
   const open = (path: string) => {
     setDir(path);
+    setMessage('');
     setHashes({});
     void refresh(path);
   };
@@ -87,56 +84,21 @@ export function FileManager({ base, onClose }: Props) {
     void refresh('');
   }, []);
 
-  // A leaving page cancels nothing: the server keeps the uploads and the same file resumes after a reload.
-  useEffect(() => {
-    const warn = (e: BeforeUnloadEvent) => {
-      if (queue.current.some((r) => r.upload.active)) e.preventDefault();
-    };
-    window.addEventListener('beforeunload', warn);
-    return () => window.removeEventListener('beforeunload', warn);
-  }, []);
-
-  const update = (key: number, view: UploadView) =>
-    setRows((all) => all.map((r) => (r.key === key ? { ...r, view } : r)));
-
-  /** One upload at a time: they share the disk and the uplink. */
-  const pump = async () => {
-    if (running.current) return;
-    running.current = true;
-    try {
-      for (;;) {
-        const row = queue.current.find((r) => r.upload.view.phase === 'starting');
-        if (!row) break;
-        await row.upload.run();
-        if (row.upload.view.phase === 'done' && parentPath(row.view.path) === dirRef.current) void refresh();
-      }
-    } finally {
-      running.current = false;
-    }
-  };
+  useEffect(
+    () =>
+      uploads.onFinished((path) => {
+        if (parentPath(path) === dirRef.current) void refresh();
+      }),
+    [uploads],
+  );
 
   const enqueue = (files: FileList | File[]) => {
-    const deps = browserDeps(base, async (name) => confirm(`«${name}» уже есть в этой папке. Заменить?`));
-    const added: Row[] = [];
-    for (const f of Array.from(files)) {
-      const path = joinPath(dirRef.current, f.name);
-      const same = queue.current.find(
-        (r) => r.upload.active && r.view.path === path && r.view.size === f.size,
-      );
-      if (same) {
-        setMessage(`«${f.name}» уже загружается.`);
-        continue;
-      }
-      const key = nextKey.current++;
-      const upload = new Upload(f, path, deps, (v) => update(key, v));
-      added.push({ key, upload, view: { ...upload.view } });
-    }
-    queue.current = [...queue.current, ...added];
-    setRows((all) => [...all, ...added]);
-    void pump();
+    const refused = uploads.add(Array.from(files, (f) => ({ source: f, path: joinPath(dirRef.current, f.name) })));
+    if (refused.length > 0) setMessage(`Уже загружается: ${refused.map((n) => `«${n}»`).join(', ')}.`);
   };
 
   const act = async (what: () => Promise<unknown>) => {
+    setMessage('');
     try {
       await what();
       await refresh();
@@ -247,11 +209,15 @@ export function FileManager({ base, onClose }: Props) {
           }}
         />
       </div>
+      {listError && <div class="files-message">{listError}</div>}
       {message && <div class="files-message">{message}</div>}
       {inTrash && <div class="files-message">Корзина: удаление здесь только вручную на сервере, вернуть — «⇄».</div>}
       {rows.length > 0 && (
         <div class="uploads">
-          {rows.map(({ key, upload, view }) => {
+          {uploads.active && (
+            <div class="files-message">Загрузка продолжится и при закрытой панели. Не закрывайте вкладку.</div>
+          )}
+          {rows.map(({ key, job, view }) => {
             const pct = view.size > 0 ? (view.sent / view.size) * 100 : 100;
             const left = view.speed > 0 ? (view.size - view.sent) / view.speed : Infinity;
             return (
@@ -260,12 +226,12 @@ export function FileManager({ base, onClose }: Props) {
                   <span class="upload-name" title={view.path}>
                     {view.name}
                   </span>
-                  {upload.active ? (
-                    <button onClick={() => void upload.cancel()} title="Отменить">
+                  {job.active ? (
+                    <button onClick={() => void job.cancel()} title="Отменить">
                       ✕
                     </button>
                   ) : (
-                    <button onClick={() => setRows((all) => all.filter((r) => r.key !== key))} title="Убрать">
+                    <button onClick={() => uploads.dismiss(key)} title="Убрать">
                       ✓
                     </button>
                   )}

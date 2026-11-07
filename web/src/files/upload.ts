@@ -100,9 +100,15 @@ export const browserDeps = (base: string, confirmOverwrite: (name: string) => Pr
   },
 });
 
+/** The browser can no longer read the picked file: it was changed, moved or deleted after the pick. */
+function unreadable(e: unknown): boolean {
+  return e instanceof DOMException && (e.name === 'NotReadableError' || e.name === 'NotFoundError');
+}
+
 /** A break the client waits out: no network, a proxy error, a server restart. */
 function transient(e: unknown): boolean {
   if (e instanceof ApiError) return e.status >= 500 && e.status !== 507;
+  if (unreadable(e)) return false;
   return !(e instanceof DOMException && e.name === 'AbortError');
 }
 
@@ -211,6 +217,8 @@ export class Upload {
       const current: Prepared = await (next && (await next).offset === received ? next : this.prepare(received));
       const following = current.offset + current.data.byteLength;
       next = following < this.file.size ? this.prepare(following) : null;
+      // Read while the current chunk is on the wire; a failed read surfaces when the chunk is used, not before.
+      next?.catch(() => {});
       const r = await this.request(`uploads/${this.id}?offset=${current.offset}`, 'PUT', current.data, {
         'X-Chunk-SHA256': current.sha,
       });
@@ -282,7 +290,9 @@ export class Upload {
           return;
         }
         if (!transient(e)) {
-          this.set({ phase: 'error', error: e instanceof ApiError ? e.code : String(e), speed: 0 });
+          const error = e instanceof ApiError ? e.code : unreadable(e) ? 'file_unreadable' : String(e);
+          // The server keeps what it has: the same file picked again goes on from there.
+          this.set({ phase: 'error', error, speed: 0 });
           return;
         }
         this.set({ phase: 'retrying', retryInSec: Math.round(backoff / 1000), speed: 0 });

@@ -268,6 +268,14 @@ button {
   box-sizing: border-box;
 }
 
+/* Uploads go on with the panel closed: their share on the 📁 button. */
+.files-badge {
+  margin-left: 4px;
+  font-size: 12px;
+  color: #9cc0ff;
+  font-variant-numeric: tabular-nums;
+}
+
 .files.dragging {
   outline: 2px dashed #6aa0ff;
   outline-offset: -6px;
