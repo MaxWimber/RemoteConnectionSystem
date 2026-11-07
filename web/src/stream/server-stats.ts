@@ -12,6 +12,23 @@ export interface ServerStats {
   minKbps: number;
   maxKbps: number;
   rateChanges: number;
+  /** The mode the client chose, and the one streaming now: «Слабая сеть» may come on by itself (D-030). */
+  mode: StreamMode;
+  activeMode: StreamMode;
+}
+
+export type StreamMode = 'game' | 'desktop' | 'weak';
+
+export const MODES: readonly { mode: StreamMode; label: string }[] = [
+  { mode: 'game', label: 'Игра' },
+  { mode: 'desktop', label: 'Рабочий стол' },
+  { mode: 'weak', label: 'Слабая сеть' },
+];
+
+const isMode = (v: unknown): v is StreamMode => v === 'game' || v === 'desktop' || v === 'weak';
+
+export function modeLabel(mode: StreamMode): string {
+  return MODES.find((m) => m.mode === mode)?.label ?? mode;
 }
 
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
@@ -36,6 +53,8 @@ export function parseServerStats(m: Record<string, unknown>): ServerStats | null
     minKbps: min,
     maxKbps: max,
     rateChanges: num(m['rate_changes']) ?? 0,
+    mode: isMode(m['mode']) ? m['mode'] : 'game',
+    activeMode: isMode(m['active_mode']) ? m['active_mode'] : isMode(m['mode']) ? m['mode'] : 'game',
   };
 }
 
@@ -43,6 +62,25 @@ export function parseServerStats(m: Record<string, unknown>): ServerStats | null
 export const BITRATE_LIMITS: readonly (number | null)[] = [null, 30000, 20000, 10000, 5000, 3000];
 
 const KEY = 'rcs.maxBitrateKbps';
+const MODE_KEY = 'rcs.streamMode';
+
+/** The mode chosen on this browser, «Игра» when none or storage refuses. */
+export function loadMode(storage: Pick<Storage, 'getItem'> | null = safeStorage()): StreamMode {
+  try {
+    const v = storage?.getItem(MODE_KEY);
+    return isMode(v) ? v : 'game';
+  } catch {
+    return 'game';
+  }
+}
+
+export function saveMode(mode: StreamMode, storage: Pick<Storage, 'setItem'> | null = safeStorage()): void {
+  try {
+    storage?.setItem(MODE_KEY, mode);
+  } catch {
+    // Only this browser forgets the choice.
+  }
+}
 
 /** The limit chosen on this browser. Storage may be missing or refuse: then the server's limit. */
 export function loadBitrateLimit(storage: Pick<Storage, 'getItem'> | null = safeStorage()): number | null {
@@ -74,8 +112,10 @@ function safeStorage(): Storage | null {
   }
 }
 
-export function settingsMessage(kbps: number | null): string {
-  return JSON.stringify({ t: 'settings', max_bitrate_kbps: kbps });
+export function settingsMessage(kbps: number | null, mode?: StreamMode): string {
+  const message: Record<string, unknown> = { t: 'settings', max_bitrate_kbps: kbps };
+  if (mode) message['mode'] = mode;
+  return JSON.stringify(message);
 }
 
 /** «12,3 Мбит/с» from kbit/s. */

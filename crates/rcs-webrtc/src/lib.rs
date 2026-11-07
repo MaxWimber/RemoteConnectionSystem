@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -31,10 +31,13 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig}
 use tracing::{debug, info, warn};
 
 mod link;
+mod mode;
 mod rate;
 
 pub use link::LinkTest;
 use link::Shaper;
+use mode::ModeControl;
+pub use mode::StreamMode;
 pub use rate::{RateControl, RateLimits};
 
 /// Frames waiting for the network thread. Two is enough to ride out one slow send without adding latency.
@@ -181,6 +184,8 @@ struct Shared {
     pool: Mutex<Vec<Vec<u8>>>,
     keyframe_wanted: AtomicBool,
     connected: AtomicBool,
+    /// The active `StreamMode`, for the encoder thread (D-030).
+    mode: AtomicU8,
     counters: Counters,
     waker: UdpSocket,
     wake_target: SocketAddr,
@@ -284,6 +289,11 @@ impl FrameSink {
         self.shared.keyframe_wanted.swap(false, Ordering::Relaxed)
     }
 
+    /// The stream mode the encoder should use now (D-030). Cheap: one atomic load.
+    pub fn stream_mode(&self) -> StreamMode {
+        StreamMode::from_u8(self.shared.mode.load(Ordering::Relaxed))
+    }
+
     /// The bitrate the encoder should use now (D-027). Cheap: one atomic load.
     pub fn target_bitrate(&self) -> u32 {
         self.shared.rate.target_bps.load(Ordering::Relaxed)
@@ -374,6 +384,7 @@ impl Server {
             pool: Mutex::new(Vec::with_capacity(POOL_BUFFERS)),
             keyframe_wanted: AtomicBool::new(false),
             connected: AtomicBool::new(false),
+            mode: AtomicU8::new(StreamMode::Game.to_u8()),
             counters: Counters::default(),
             wake_target: SocketAddr::from((Ipv4Addr::LOCALHOST, local.port())),
             waker,
@@ -479,6 +490,10 @@ struct Session {
     position_sent: u64,
     cursor_seq: u16,
     rate: RateControl,
+    /// The client's mode and the one streaming now (D-030).
+    mode: ModeControl,
+    /// The client's bitrate limit, inside the server's range (D-029).
+    client_max: Option<u32>,
     /// `Config::simulate_link`, from the moment media flows.
     shaper: Option<Shaper>,
 }
@@ -578,8 +593,19 @@ impl NetworkLoop {
             rtt_ms,
             "rate sample"
         );
-        // The same numbers for the statistics panel (D-029).
+        // «Слабая сеть» by itself when the target stays low, back when the link has room (D-030).
         let adaptive = self.config.adaptive;
+        if adaptive {
+            let cap =
+                session_limits(self.config.rate, session.mode.chosen(), session.client_max).max_bps;
+            if session
+                .mode
+                .on_rate(now, r.target_bps, r.estimate_bps, r.loss, cap)
+            {
+                apply_mode(session, &self.shared, &self.config);
+            }
+        }
+        // The same numbers for the statistics panel (D-029).
         let limits = session.rate.limits();
         let target = if adaptive {
             r.target_bps
@@ -598,6 +624,8 @@ impl NetworkLoop {
             "min_kbps": limits.min_bps / 1000,
             "max_kbps": limits.max_bps / 1000,
             "rate_changes": c.rate_changes.load(Ordering::Relaxed),
+            "mode": session.mode.chosen().name(),
+            "active_mode": session.mode.active().name(),
         });
         send_control(session, &stats);
     }
@@ -668,6 +696,8 @@ impl NetworkLoop {
             .sessions
             .fetch_add(1, Ordering::Relaxed)
             + 1;
+        // The mode streaming before goes on until the client sends its own: no second new encoder on reconnect.
+        let last_mode = StreamMode::from_u8(self.shared.mode.load(Ordering::Relaxed));
         self.session = Some(Session {
             rtc,
             video: None,
@@ -681,12 +711,16 @@ impl NetworkLoop {
             shape_sent: false,
             position_sent: 0,
             cursor_seq: 0,
-            rate: RateControl::new(self.config.rate),
+            rate: RateControl::new(session_limits(self.config.rate, last_mode, None)),
+            mode: ModeControl::new(now, last_mode),
+            client_max: None,
             shaper: None,
         });
-        self.shared
-            .rate
-            .publish(&RateControl::new(self.config.rate));
+        self.shared.rate.publish(&RateControl::new(session_limits(
+            self.config.rate,
+            last_mode,
+            None,
+        )));
         if let Some(link) = &self.config.input {
             link.live.store(number, Ordering::Relaxed);
         }
@@ -1036,20 +1070,25 @@ fn handle_event(
         Event::ChannelData(data) if Some(data.id) == session.control && !data.binary => {
             if let Some(reply) = control_reply(&data.data, unix_ms(SystemTime::now())) {
                 send_control(session, &reply);
-            } else if let Some(limits) = settings_limits(&data.data, config.rate) {
-                if config.adaptive {
-                    let before = session.rate.target();
-                    session.rate.set_limits(limits);
-                    rate_changed(session, shared, before, true);
+            } else if let Some(settings) = parse_settings(&data.data, config.rate) {
+                if let Some(max) = settings.max_bps {
+                    session.client_max = max;
                 }
+                if let Some(mode) = settings.mode {
+                    session.mode.choose(Instant::now(), mode);
+                }
+                apply_mode(session, shared, config);
+                let max = session.client_max.unwrap_or(config.rate.max_bps);
                 info!(
-                    max_kbps = limits.max_bps / 1000,
+                    max_kbps = max / 1000,
+                    mode = session.mode.chosen().name(),
                     adaptive = config.adaptive,
-                    "client bitrate limit"
+                    "client settings"
                 );
                 let reply = json!({
                     "t": "settings",
-                    "max_bitrate_kbps": limits.max_bps / 1000,
+                    "max_bitrate_kbps": max / 1000,
+                    "mode": session.mode.chosen().name(),
                     "adaptive": config.adaptive,
                 });
                 send_control(session, &reply);
@@ -1164,21 +1203,64 @@ fn control_reply(text: &[u8], server_ms: f64) -> Option<Value> {
     }
 }
 
-/// The range for the rate control after a client `settings` (D-029): its `max_bitrate_kbps` inside the server's
-/// range, `null` or no value for the server's own limit. Anything else is not a settings message.
-fn settings_limits(text: &[u8], server: RateLimits) -> Option<RateLimits> {
+/// A client `settings` message (D-029, D-030). A field that is not there changes nothing.
+#[derive(Debug, Default, PartialEq)]
+struct ClientSettings {
+    /// `Some(None)`: back to the server's limit.
+    max_bps: Option<Option<u32>>,
+    mode: Option<StreamMode>,
+}
+
+/// Reads `settings`; the limit is kept inside the server's range. A field of the wrong kind spoils the message.
+fn parse_settings(text: &[u8], server: RateLimits) -> Option<ClientSettings> {
     let message: Value = serde_json::from_slice(text).ok()?;
     if message["t"].as_str()? != "settings" {
         return None;
     }
-    let max_bps = match &message["max_bitrate_kbps"] {
-        Value::Null => server.max_bps,
-        v => {
+    let max_bps = match message.get("max_bitrate_kbps") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(v) => {
             let kbps = v.as_f64().filter(|k| k.is_finite())?;
-            (kbps * 1000.0).clamp(f64::from(server.min_bps), f64::from(server.max_bps)) as u32
+            let bps = (kbps * 1000.0).clamp(f64::from(server.min_bps), f64::from(server.max_bps));
+            Some(Some(bps as u32))
         }
     };
-    Some(RateLimits { max_bps, ..server })
+    let mode = match message.get("mode") {
+        None => None,
+        Some(v) => Some(StreamMode::parse(v.as_str()?)?),
+    };
+    Some(ClientSettings { max_bps, mode })
+}
+
+/// The target range for a mode: its top, the server's and the client's limit, whichever is lowest (D-030).
+fn session_limits(server: RateLimits, mode: StreamMode, client_max: Option<u32>) -> RateLimits {
+    let max_bps = server
+        .max_bps
+        .min(mode.max_bps())
+        .min(client_max.unwrap_or(u32::MAX))
+        .max(server.min_bps);
+    RateLimits {
+        start_bps: server.start_bps.min(max_bps),
+        min_bps: server.min_bps,
+        max_bps,
+    }
+}
+
+/// Puts the session's active mode into effect: the target range now, the picture size on the encoder thread.
+fn apply_mode(session: &mut Session, shared: &Shared, config: &Config) {
+    let active = session.mode.active();
+    if config.adaptive {
+        let before = session.rate.target();
+        session
+            .rate
+            .set_limits(session_limits(config.rate, active, session.client_max));
+        rate_changed(session, shared, before, true);
+    }
+    let old = shared.mode.swap(active.to_u8(), Ordering::Relaxed);
+    if old != active.to_u8() {
+        info!(mode = active.name(), "stream mode");
+    }
 }
 
 /// The H.264 payload type to send with: packetization-mode 1, High profile when offered, else any.
@@ -1229,35 +1311,69 @@ mod tests {
     }
 
     #[test]
-    fn settings_set_the_upper_limit_inside_the_server_range() {
+    fn settings_fields_are_independent_and_kept_in_range() {
         let server = RateLimits {
             start_bps: 30_000_000,
             min_bps: 2_000_000,
             max_bps: 50_000_000,
         };
-        let max = |text: &str| settings_limits(text.as_bytes(), server).map(|l| l.max_bps);
+        let parse = |text: &str| parse_settings(text.as_bytes(), server);
+        let limit = |text: &str| parse(text).and_then(|s| s.max_bps);
         assert_eq!(
-            max(r#"{"t":"settings","max_bitrate_kbps":20000}"#),
-            Some(20_000_000)
+            limit(r#"{"t":"settings","max_bitrate_kbps":20000}"#),
+            Some(Some(20_000_000))
         );
         assert_eq!(
-            max(r#"{"t":"settings","max_bitrate_kbps":900000}"#),
-            Some(50_000_000)
+            limit(r#"{"t":"settings","max_bitrate_kbps":900000}"#),
+            Some(Some(50_000_000))
         );
         assert_eq!(
-            max(r#"{"t":"settings","max_bitrate_kbps":10}"#),
-            Some(2_000_000)
+            limit(r#"{"t":"settings","max_bitrate_kbps":10}"#),
+            Some(Some(2_000_000))
         );
         assert_eq!(
-            max(r#"{"t":"settings","max_bitrate_kbps":null}"#),
-            Some(50_000_000)
+            limit(r#"{"t":"settings","max_bitrate_kbps":null}"#),
+            Some(None)
         );
-        assert_eq!(max(r#"{"t":"settings"}"#), Some(50_000_000));
-        assert_eq!(max(r#"{"t":"settings","max_bitrate_kbps":"lots"}"#), None);
-        assert_eq!(max(r#"{"t":"ping","id":1}"#), None);
-        assert_eq!(max("not json"), None);
-        let l = settings_limits(br#"{"t":"settings","max_bitrate_kbps":5000}"#, server).unwrap();
-        assert_eq!((l.start_bps, l.min_bps), (server.start_bps, server.min_bps));
+        assert_eq!(
+            parse(r#"{"t":"settings","mode":"weak"}"#),
+            Some(ClientSettings {
+                max_bps: None,
+                mode: Some(StreamMode::Weak)
+            })
+        );
+        assert_eq!(
+            parse(r#"{"t":"settings"}"#),
+            Some(ClientSettings::default())
+        );
+        assert_eq!(parse(r#"{"t":"settings","max_bitrate_kbps":"lots"}"#), None);
+        assert_eq!(parse(r#"{"t":"settings","mode":"4k"}"#), None);
+        assert_eq!(parse(r#"{"t":"ping","id":1}"#), None);
+        assert_eq!(parse("not json"), None);
+    }
+
+    #[test]
+    fn the_mode_the_server_and_the_client_cap_the_range() {
+        let server = RateLimits {
+            start_bps: 30_000_000,
+            min_bps: 2_000_000,
+            max_bps: 50_000_000,
+        };
+        let top = |mode, client| session_limits(server, mode, client).max_bps;
+        assert_eq!(top(StreamMode::Game, None), 30_000_000);
+        assert_eq!(top(StreamMode::Desktop, None), 40_000_000);
+        assert_eq!(top(StreamMode::Weak, None), 12_000_000);
+        assert_eq!(top(StreamMode::Desktop, Some(20_000_000)), 20_000_000);
+        let low = RateLimits {
+            max_bps: 25_000_000,
+            ..server
+        };
+        assert_eq!(
+            session_limits(low, StreamMode::Desktop, None).max_bps,
+            25_000_000
+        );
+        let weak = session_limits(server, StreamMode::Weak, None);
+        assert_eq!((weak.start_bps, weak.min_bps), (12_000_000, 2_000_000));
     }
 
     #[test]
@@ -1277,6 +1393,7 @@ mod tests {
             pool: Mutex::new(Vec::new()),
             keyframe_wanted: AtomicBool::new(false),
             connected: AtomicBool::new(false),
+            mode: AtomicU8::new(0),
             counters: Counters::default(),
             waker: UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
             wake_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),

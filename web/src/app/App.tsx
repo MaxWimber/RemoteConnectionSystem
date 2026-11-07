@@ -19,7 +19,16 @@ import {
 import { LatencyMeter, type LatencySummary } from '../stream/latency';
 import { StreamSession, type SessionState } from '../stream/session';
 import { summarize, toMap, type StatsMap, type StreamSummary } from '../stream/stats';
-import { BITRATE_LIMITS, loadBitrateLimit, mbps, type ServerStats } from '../stream/server-stats';
+import {
+  BITRATE_LIMITS,
+  MODES,
+  loadBitrateLimit,
+  loadMode,
+  mbps,
+  modeLabel,
+  type ServerStats,
+  type StreamMode,
+} from '../stream/server-stats';
 import { appTitle } from './title';
 
 const STATS_INTERVAL_MS = 1000;
@@ -76,6 +85,7 @@ export function App({ onSignedOut }: Props) {
   const [serverStats, setServerStats] = useState<ServerStats | null>(null);
   const [limitKbps, setLimitKbps] = useState<number | null>(() => loadBitrateLimit());
   const [fixedRate, setFixedRate] = useState(false);
+  const [mode, setMode] = useState<StreamMode>(() => loadMode());
   const meter = useRef<LatencyMeter | null>(null);
   const input = useRef<InputController | null>(null);
 
@@ -106,9 +116,11 @@ export function App({ onSignedOut }: Props) {
         setServerStats(st);
         recordServerStats(st);
       },
-      settingsApplied: (maxKbps, adaptive) => {
+      settingsApplied: (maxKbps, adaptive, applied) => {
         setFixedRate(!adaptive);
-        logEvent(`предел битрейта на сервере: ${maxKbps} кбит/с${adaptive ? '' : ', битрейт фиксированный'}`);
+        logEvent(
+          `настройки на сервере: режим ${applied}, предел ${maxKbps} кбит/с${adaptive ? '' : ', битрейт фиксированный'}`,
+        );
       },
     });
     session.current = s;
@@ -400,6 +412,28 @@ export function App({ onSignedOut }: Props) {
             · отправлено {mbps(serverStats?.sentKbps ?? null)} Мбит/с · потери{' '}
             {serverStats?.loss == null ? '—' : `${(serverStats.loss * 100).toFixed(1)}%`} · RTT{' '}
             {fmt(serverStats?.rttMs ?? null)} мс
+          </div>
+          <div class="limit">
+            <label>
+              режим{' '}
+              <select
+                value={mode}
+                onChange={(e) => {
+                  const m = (e.currentTarget as HTMLSelectElement).value as StreamMode;
+                  setMode(m);
+                  session.current?.setMode(m);
+                }}
+              >
+                {MODES.map((m) => (
+                  <option key={m.mode} value={m.mode}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </label>{' '}
+            {serverStats && serverStats.activeMode !== serverStats.mode && (
+              <span class="detail">сейчас «{modeLabel(serverStats.activeMode)}»: сеть слабая</span>
+            )}
           </div>
           <div class="limit">
             <label>

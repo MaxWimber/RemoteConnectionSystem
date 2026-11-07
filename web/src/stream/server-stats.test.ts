@@ -1,5 +1,14 @@
 import { expect, test } from 'vitest';
-import { loadBitrateLimit, mbps, parseServerStats, saveBitrateLimit, settingsMessage } from './server-stats';
+import {
+  loadBitrateLimit,
+  loadMode,
+  mbps,
+  modeLabel,
+  parseServerStats,
+  saveBitrateLimit,
+  saveMode,
+  settingsMessage,
+} from './server-stats';
 
 test('a stats message is read, missing reports stay null', () => {
   const s = parseServerStats({
@@ -14,6 +23,8 @@ test('a stats message is read, missing reports stay null', () => {
     min_kbps: 2000,
     max_kbps: 50000,
     rate_changes: 3,
+    mode: 'game',
+    active_mode: 'weak',
   });
   expect(s).toEqual({
     adaptive: true,
@@ -26,7 +37,25 @@ test('a stats message is read, missing reports stay null', () => {
     minKbps: 2000,
     maxKbps: 50000,
     rateChanges: 3,
+    mode: 'game',
+    activeMode: 'weak',
   });
+});
+
+test('modes are read and kept, anything unknown is «Игра»', () => {
+  const store = new Map<string, string>();
+  const storage = {
+    getItem: (k: string) => store.get(k) ?? null,
+    setItem: (k: string, v: string) => void store.set(k, v),
+  };
+  expect(loadMode(storage)).toBe('game');
+  saveMode('weak', storage);
+  expect(loadMode(storage)).toBe('weak');
+  store.set('rcs.streamMode', '4k');
+  expect(loadMode(storage)).toBe('game');
+  expect(modeLabel('desktop')).toBe('Рабочий стол');
+  const old = parseServerStats({ t: 'stats', target_kbps: 1, sent_kbps: 1, out_kbps: 1, min_kbps: 1, max_kbps: 2 });
+  expect(old?.activeMode).toBe('game');
 });
 
 test('other or broken messages are not stats', () => {
@@ -66,6 +95,11 @@ test('the limit is kept only for known choices and survives a refusing storage',
 test('settings and numbers for the panel', () => {
   expect(JSON.parse(settingsMessage(20000))).toEqual({ t: 'settings', max_bitrate_kbps: 20000 });
   expect(JSON.parse(settingsMessage(null))).toEqual({ t: 'settings', max_bitrate_kbps: null });
+  expect(JSON.parse(settingsMessage(null, 'desktop'))).toEqual({
+    t: 'settings',
+    max_bitrate_kbps: null,
+    mode: 'desktop',
+  });
   expect(mbps(32400)).toBe('32,4');
   expect(mbps(null)).toBe('—');
 });

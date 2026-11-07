@@ -16,7 +16,7 @@ use rcs_capture::{
 };
 use rcs_encode::amf::EncoderConfig;
 use rcs_encode::{Backend, EncodeError, EncodedFrame, Encoder, SubmitStats};
-use rcs_webrtc::{FrameSink, VideoFrame};
+use rcs_webrtc::{FrameSink, StreamMode, VideoFrame};
 use tracing::{info, warn};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
@@ -194,7 +194,7 @@ fn run(
         open_now = false;
         let backend = if use_mf { Backend::Mf } else { config.backend };
         let opened = Instant::now();
-        let failure = match Pipeline::open(config, backend, stats) {
+        let failure = match Pipeline::open(config, backend, sink.stream_mode(), stats) {
             Ok(mut pipeline) => {
                 set_open(stats, true);
                 let result = pipeline.run(config, backend, sink, shapes, stats, stop);
@@ -221,8 +221,10 @@ fn run(
     info!("pipeline stopped");
 }
 
-fn encoder_config(config: &Config, input: (u32, u32)) -> EncoderConfig {
-    let mut c = EncoderConfig::low_latency(config.width, config.height, config.fps, config.bitrate);
+/// The encoder for `mode`: its picture size, scaled from the captured `input` by the encoder itself (D-030).
+fn encoder_config(config: &Config, mode: StreamMode, input: (u32, u32)) -> EncoderConfig {
+    let (width, height) = mode.size((config.width, config.height));
+    let mut c = EncoderConfig::low_latency(width, height, config.fps, config.bitrate);
     c.input_width = input.0 as i32;
     c.input_height = input.1 as i32;
     c
@@ -232,9 +234,10 @@ fn open_encoder(
     config: &Config,
     backend: Backend,
     device: &ID3D11Device,
+    mode: StreamMode,
     input: (u32, u32),
 ) -> Result<Box<dyn Encoder>, EncodeError> {
-    let encoder = rcs_encode::open(backend, device, &encoder_config(config, input))?;
+    let encoder = rcs_encode::open(backend, device, &encoder_config(config, mode, input))?;
     Ok(match config.simulate_amf_failure {
         Some(frames) if encoder.backend() == "amf" => Box::new(FailingEncoder {
             inner: encoder,
@@ -242,6 +245,32 @@ fn open_encoder(
         }),
         _ => encoder,
     })
+}
+
+/// Stands in while one encoder is closed and the next opens: the card may not take two at once.
+struct NoEncoder;
+
+impl Encoder for NoEncoder {
+    fn encode(
+        &mut self,
+        _frame: &rcs_capture::CapturedFrame<'_>,
+        _pts: i64,
+        _force_idr: bool,
+    ) -> Result<SubmitStats, EncodeError> {
+        Err(EncodeError("no encoder".into()))
+    }
+
+    fn poll(&mut self, _out: &mut EncodedFrame) -> Result<bool, EncodeError> {
+        Ok(false)
+    }
+
+    fn set_bitrate(&mut self, _bits_per_second: u32) -> Result<(), EncodeError> {
+        Ok(())
+    }
+
+    fn backend(&self) -> &'static str {
+        "none"
+    }
 }
 
 /// Testing only: an encoder that fails every frame after `frames_left` frames (D-028).
@@ -291,10 +320,16 @@ struct Pipeline {
     capture: DxgiCapture,
     encoder: Box<dyn Encoder>,
     input: (u32, u32),
+    mode: StreamMode,
 }
 
 impl Pipeline {
-    fn open(config: &Config, backend: Backend, stats: &Stats) -> Result<Self, String> {
+    fn open(
+        config: &Config,
+        backend: Backend,
+        mode: StreamMode,
+        stats: &Stats,
+    ) -> Result<Self, String> {
         let adapters = dxgi::enumerate_adapters().map_err(|e| dxgi::describe(&e))?;
         let adapter = adapters
             .iter()
@@ -305,13 +340,14 @@ impl Pipeline {
         let capture = DxgiCapture::new(adapter.adapter.clone(), device.clone(), config.display)
             .map_err(|e| e.to_string())?;
         let input = capture.size();
-        let encoder = open_encoder(config, backend, &device, input)
+        let encoder = open_encoder(config, backend, &device, mode, input)
             .map_err(|e| format!("encoder {}: {e}", backend.name()))?;
         info!(
             adapter = %adapter.info.name,
             encoder = encoder.backend(),
             width = input.0,
             height = input.1,
+            mode = mode.name(),
             "pipeline opened"
         );
         if let Ok(mut info) = stats.info.lock() {
@@ -326,7 +362,21 @@ impl Pipeline {
             capture,
             encoder,
             input,
+            mode,
         })
+    }
+
+    /// A new encoder for `mode` or the new input size; the old one is closed first.
+    fn reopen_encoder(
+        &mut self,
+        config: &Config,
+        backend: Backend,
+        mode: StreamMode,
+    ) -> Result<(), EncodeError> {
+        self.encoder = Box::new(NoEncoder);
+        self.encoder = open_encoder(config, backend, &self.device, mode, self.input)?;
+        self.mode = mode;
+        Ok(())
     }
 
     /// Runs until `stop` or until nobody was connected for `IDLE_RELEASE`, or returns why the pipeline must be
@@ -370,6 +420,25 @@ impl Pipeline {
             }
             if sink.take_keyframe_request() {
                 force_idr = true;
+            }
+            // Another stream mode: another picture size from the same capture, starting with an IDR (D-030).
+            let wanted = sink.stream_mode();
+            if wanted != self.mode {
+                let opened = Instant::now();
+                self.reopen_encoder(config, backend, wanted).map_err(|e| {
+                    Failure::Other(format!("encoder for mode {}: {e}", wanted.name()))
+                })?;
+                let (width, height) = wanted.size((config.width, config.height));
+                info!(
+                    mode = wanted.name(),
+                    width,
+                    height,
+                    ms = opened.elapsed().as_secs_f64() * 1000.0,
+                    "stream mode, new encoder"
+                );
+                force_idr = true;
+                // The new encoder starts at the configured bitrate; the target follows right below.
+                bitrate = config.bitrate.clamp(1, i64::from(u32::MAX)) as u32;
             }
             let target = sink.target_bitrate();
             if connected && target > 0 && target != bitrate {
@@ -435,13 +504,13 @@ impl Pipeline {
                     let size = self.capture.size();
                     if size != self.input && size.0 > 0 {
                         info!(?size, "display size changed, new encoder");
-                        self.encoder =
-                            open_encoder(config, backend, &self.device, size).map_err(|e| {
-                                Failure::Other(format!("encoder after a mode change: {e}"))
-                            })?;
+                        self.input = size;
+                        let mode = self.mode;
+                        self.reopen_encoder(config, backend, mode).map_err(|e| {
+                            Failure::Other(format!("encoder after a mode change: {e}"))
+                        })?;
                         // The new encoder starts at the configured bitrate; the next frame applies the target.
                         bitrate = config.bitrate.clamp(1, i64::from(u32::MAX)) as u32;
-                        self.input = size;
                         // A mode change moves the monitor's corners; reading them again is rare and cheap.
                         let monitor = dxgi::enumerate_adapters().ok().and_then(|list| {
                             list.iter()

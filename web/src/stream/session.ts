@@ -5,7 +5,16 @@ import { me } from '../api/auth';
 import { InputChannels } from '../input/channels';
 import { decodeServer, type ServerMessage as CursorMessage } from '../input/protocol';
 import { watchNetwork } from './network';
-import { loadBitrateLimit, parseServerStats, saveBitrateLimit, settingsMessage, type ServerStats } from './server-stats';
+import {
+  loadBitrateLimit,
+  loadMode,
+  parseServerStats,
+  saveBitrateLimit,
+  saveMode,
+  settingsMessage,
+  type ServerStats,
+  type StreamMode,
+} from './server-stats';
 import { CLOSE_SESSION_ENDED, Signaling, signalUrl, type ServerMessage } from './signaling';
 
 export type SessionState = 'idle' | 'connecting' | 'playing' | 'reconnecting' | 'replaced' | 'stopped';
@@ -21,7 +30,7 @@ export interface SessionEvents {
   /** The agent's rate control, once a second while video plays (D-029). */
   serverStats?(stats: ServerStats): void;
   /** The bitrate limit the server applied, kbit/s. */
-  settingsApplied?(maxKbps: number, adaptive: boolean): void;
+  settingsApplied?(maxKbps: number, adaptive: boolean, mode: string): void;
 }
 
 /** Wait before the n-th reconnect attempt: 1 s, 2 s, 4 s, then 5 s. */
@@ -62,6 +71,7 @@ export class StreamSession {
   private unwatch: (() => void) | undefined;
   private control: RTCDataChannel | null = null;
   private limitKbps: number | null = loadBitrateLimit();
+  private modeChoice: StreamMode = loadMode();
 
   constructor(
     private readonly base: string,
@@ -87,6 +97,17 @@ export class StreamSession {
     this.limitKbps = kbps;
     saveBitrateLimit(kbps);
     if (this.control?.readyState === 'open') this.control.send(settingsMessage(kbps));
+  }
+
+  /** The stream mode chosen on this browser (D-030). */
+  get mode(): StreamMode {
+    return this.modeChoice;
+  }
+
+  setMode(mode: StreamMode): void {
+    this.modeChoice = mode;
+    saveMode(mode);
+    if (this.control?.readyState === 'open') this.control.send(settingsMessage(this.limitKbps, mode));
   }
 
   /** The server clock of the current session, once the control channel has answered. */
@@ -251,8 +272,8 @@ export class StreamSession {
     channel.binaryType = 'arraybuffer';
     this.control = channel;
     channel.onopen = () => {
-      // The server keeps a limit only for the connection: send the chosen one every time (D-029).
-      if (this.limitKbps !== null) channel.send(settingsMessage(this.limitKbps));
+      // The server keeps the limit and the mode only for the connection: send them every time (D-029, D-030).
+      channel.send(settingsMessage(this.limitKbps, this.modeChoice));
       ping();
     };
     channel.onmessage = (e) => {
@@ -272,7 +293,7 @@ export class StreamSession {
         const stats = parseServerStats(m);
         if (stats) this.events.serverStats?.(stats);
       } else if (m['t'] === 'settings' && typeof m['max_bitrate_kbps'] === 'number') {
-        this.events.settingsApplied?.(m['max_bitrate_kbps'], m['adaptive'] === true);
+        this.events.settingsApplied?.(m['max_bitrate_kbps'], m['adaptive'] === true, String(m['mode'] ?? ''));
       } else if (m['t'] === 'hello' && typeof m['rtp_epoch_ms'] === 'number') {
         clock.rtpEpochMs = m['rtp_epoch_ms'];
         if (typeof m['rtp_clock'] === 'number') clock.rtpClock = m['rtp_clock'];
