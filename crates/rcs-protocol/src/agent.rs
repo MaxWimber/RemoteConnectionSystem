@@ -88,6 +88,19 @@ pub struct AgentStatus {
     pub gamepad: String,
     #[serde(default)]
     pub gamepad_events: u64,
+    /// The encoder's bitrate now, from the rate control (D-027); `bitrate` is the configured start.
+    #[serde(default)]
+    pub bitrate_target: u64,
+    /// The send-side estimate, before the first one `None`.
+    #[serde(default)]
+    pub bitrate_estimate: Option<u64>,
+    /// Loss from the receiver reports, 0..1.
+    #[serde(default)]
+    pub loss: Option<f32>,
+    #[serde(default)]
+    pub rtt_ms: Option<f64>,
+    #[serde(default)]
+    pub rate_changes: u64,
 }
 
 #[derive(Debug)]

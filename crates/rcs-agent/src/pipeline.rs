@@ -231,6 +231,8 @@ impl Pipeline {
         let mut credit_at = started;
         let mut was_connected = false;
         let mut force_idr = true;
+        // The bitrate the encoder was given; the rate control may want another (D-027).
+        let mut bitrate = config.bitrate.clamp(1, i64::from(u32::MAX)) as u32;
 
         while !stop.load(Ordering::Relaxed) {
             let connected = sink.connected();
@@ -240,6 +242,17 @@ impl Pipeline {
             was_connected = connected;
             if sink.take_keyframe_request() {
                 force_idr = true;
+            }
+            let target = sink.target_bitrate();
+            if connected && target > 0 && target != bitrate {
+                match self.encoder.set_bitrate(target) {
+                    Ok(()) => bitrate = target,
+                    Err(e) => {
+                        // Not tried again for this target; a broken encoder shows up in encode anyway.
+                        warn!(error = %e, target, "set_bitrate");
+                        bitrate = target;
+                    }
+                }
             }
 
             // Stream-rate credit (D-019).
@@ -300,6 +313,8 @@ impl Pipeline {
                             &encoder_config(config, size),
                         )
                         .map_err(|e| format!("encoder after a mode change: {e}"))?;
+                        // The new encoder starts at the configured bitrate; the next frame applies the target.
+                        bitrate = config.bitrate.clamp(1, i64::from(u32::MAX)) as u32;
                         self.input = size;
                         // A mode change moves the monitor's corners; reading them again is rare and cheap.
                         let monitor = dxgi::enumerate_adapters().ok().and_then(|list| {

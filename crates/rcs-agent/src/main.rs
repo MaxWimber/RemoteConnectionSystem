@@ -24,8 +24,13 @@ use tracing::{Level, error, info, info_span};
 const USAGE: &str = "\
 Usage: rcs-agent [--udp ADDR] [--advertise ADDR,ADDR] [--pipe NAME] [--log DIR]
                  [--encoder auto|amf|mf] [--width W] [--height H] [--fps F] [--bitrate-mbps B] [--display N]
+                 [--min-bitrate-mbps B] [--max-bitrate-mbps B] [--rate adaptive|fixed]
                  [--input record|sendinput] [--stop-event NAME]
                  [--simulate-loss EVERY_MS:BURST_MS]   testing only: stop sending for BURST_MS every EVERY_MS
+                 [--simulate-link S:MBPS,S:MBPS] [--simulate-link-queue-ms MS]
+                                                       testing only: a narrow link on the way out, rates repeat
+  --rate       adaptive (default) follows the network between the minimum and maximum bitrate (D-027); fixed
+               keeps --bitrate-mbps
   --udp        UDP address for WebRTC, default 127.0.0.1:8443
   --input      record (default) checks and counts input without sending it to Windows; sendinput controls this
                computer (D-022)
@@ -40,6 +45,10 @@ struct Options {
     log: PathBuf,
     pipeline: pipeline::Config,
     simulate_loss: Option<rcs_webrtc::LossTest>,
+    simulate_link: Option<String>,
+    simulate_link_queue_ms: u64,
+    rate: rcs_webrtc::RateLimits,
+    adaptive: bool,
     input: input::Mode,
     stop_event: Option<String>,
 }
@@ -56,6 +65,14 @@ fn parse(args: &[String]) -> Result<Options, String> {
         pipe: PIPE_NAME.into(),
         log: PathBuf::from("out").join("agent"),
         simulate_loss: None,
+        simulate_link: None,
+        simulate_link_queue_ms: 200,
+        rate: rcs_webrtc::RateLimits {
+            start_bps: 30_000_000,
+            min_bps: 8_000_000,
+            max_bps: 50_000_000,
+        },
+        adaptive: true,
         input: input::Mode::Record,
         stop_event: None,
         pipeline: pipeline::Config {
@@ -100,6 +117,17 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--height" => options.pipeline.height = number()? as i32,
             "--fps" => options.pipeline.fps = number()? as i32,
             "--bitrate-mbps" => options.pipeline.bitrate = number()? * 1_000_000,
+            "--min-bitrate-mbps" => options.rate.min_bps = (number()? * 1_000_000) as u32,
+            "--max-bitrate-mbps" => options.rate.max_bps = (number()? * 1_000_000) as u32,
+            "--rate" => {
+                options.adaptive = match value.as_str() {
+                    "adaptive" => true,
+                    "fixed" => false,
+                    _ => return Err(format!("{flag}: adaptive or fixed")),
+                }
+            }
+            "--simulate-link" => options.simulate_link = Some(value.clone()),
+            "--simulate-link-queue-ms" => options.simulate_link_queue_ms = number()? as u64,
             "--display" => options.pipeline.display = number().unwrap_or(0) as u32,
             "--simulate-loss" => {
                 let (every, burst) = value
@@ -119,6 +147,14 @@ fn parse(args: &[String]) -> Result<Options, String> {
     }
     if options.advertise.is_empty() {
         options.advertise = default_advertise(options.udp);
+    }
+    options.rate.start_bps = options.pipeline.bitrate.min(i64::from(u32::MAX)) as u32;
+    if options.rate.min_bps > options.rate.max_bps {
+        return Err("--min-bitrate-mbps is above --max-bitrate-mbps".into());
+    }
+    if !options.adaptive {
+        options.rate.min_bps = options.rate.start_bps;
+        options.rate.max_bps = options.rate.start_bps;
     }
     Ok(options)
 }
@@ -198,15 +234,25 @@ fn run(options: Options) -> Result<(), String> {
         release: Arc::new(AtomicBool::new(false)),
         live: Arc::new(AtomicU64::new(0)),
     };
+    let simulate_link = options
+        .simulate_link
+        .as_deref()
+        .map(|steps| rcs_webrtc::LinkTest::parse(steps, options.simulate_link_queue_ms))
+        .transpose()
+        .map_err(|e| format!("--simulate-link: {e}"))?;
     let server = rcs_webrtc::Server::start(rcs_webrtc::Config {
         bind: options.udp,
         advertise: options.advertise.clone(),
         simulate_loss: options.simulate_loss,
         input: Some(link.clone()),
+        rate: options.rate,
+        adaptive: options.adaptive,
+        simulate_link,
     })
     .map_err(|e| format!("UDP {}: {e}", options.udp))?;
     info!(udp = %server.local_addr(), advertise = ?options.advertise, pipe = %options.pipe,
-        input = options.input.name(), "agent started");
+        input = options.input.name(), adaptive = options.adaptive,
+        min_kbps = options.rate.min_bps / 1000, max_kbps = options.rate.max_bps / 1000, "agent started");
     println!(
         "rcs-agent {BUILD_ID}: WebRTC {} ({:?}), канал {}, ввод {}",
         server.local_addr(),
@@ -330,6 +376,7 @@ fn status(
     input: &input::Stats,
 ) -> AgentStatus {
     let c = server.counters();
+    let rate = server.rate();
     let info = stats.info.lock().map(|i| i.clone()).unwrap_or_default();
     let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
     let input_error = input.last_error.lock().ok().and_then(|e| e.clone());
@@ -360,5 +407,10 @@ fn status(
         input_releases: load(&input.releases),
         gamepad,
         gamepad_events: load(&input.gamepad_events),
+        bitrate_target: u64::from(rate.target_bps),
+        bitrate_estimate: rate.estimate_bps.map(u64::from),
+        loss: rate.loss,
+        rtt_ms: rate.rtt.map(|r| r.as_secs_f64() * 1000.0),
+        rate_changes: c.rate_changes,
     }
 }

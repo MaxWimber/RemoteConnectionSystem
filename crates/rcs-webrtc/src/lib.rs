@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rcs_protocol::input::{ClientMessage, ParseError, ServerMessage};
 use serde_json::{Value, json};
+use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::SdpOffer;
 use str0m::channel::ChannelId;
 use str0m::format::Codec;
@@ -28,6 +29,13 @@ use str0m::net::{Protocol, Receive};
 use str0m::rtp::{AbsCaptureTime, Extension};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tracing::{debug, info, warn};
+
+mod link;
+mod rate;
+
+pub use link::LinkTest;
+use link::Shaper;
+pub use rate::{RateControl, RateLimits};
 
 /// Frames waiting for the network thread. Two is enough to ride out one slow send without adding latency.
 const QUEUE_FRAMES: usize = 2;
@@ -41,6 +49,8 @@ const PLAYOUT_DELAY_ID: u8 = 6;
 const ABS_CAPTURE_TIME_ID: u8 = 7;
 /// Largest datagram we expect; ICE, DTLS and RTCP from browsers fit easily.
 const RECV_BUFFER: usize = 2048;
+/// How often `str0m` sums up the receiver reports: loss and RTT for the rate control.
+const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -52,6 +62,12 @@ pub struct Config {
     pub simulate_loss: Option<LossTest>,
     /// Where input messages go. Without it they are parsed, counted and dropped.
     pub input: Option<InputLink>,
+    /// The encoder's bitrate range; the start value is used as is when `adaptive` is off.
+    pub rate: RateLimits,
+    /// Follow the send-side estimate (D-027).
+    pub adaptive: bool,
+    /// Testing only (P8-1): a narrow link on the way out, see [`LinkTest`].
+    pub simulate_link: Option<LinkTest>,
 }
 
 /// One input message and the media session it came from: a new session number means new `seq` counters.
@@ -114,8 +130,10 @@ pub struct Counters {
     /// PLI and FIR from the browser.
     pub keyframe_requests: AtomicU64,
     pub write_errors: AtomicU64,
-    /// Datagrams held back by `Config::simulate_loss`.
+    /// Datagrams held back by `Config::simulate_loss`, or dropped by the full queue of `Config::simulate_link`.
     pub datagrams_dropped_test: AtomicU64,
+    /// Changes of the encoder's target bitrate.
+    pub rate_changes: AtomicU64,
     /// Input messages handed to the input thread.
     pub input_messages: AtomicU64,
     /// Input messages of an unknown type, or malformed: wrong length, a field out of range, text on a binary channel.
@@ -134,6 +152,7 @@ pub struct CountersSnapshot {
     pub keyframe_requests: u64,
     pub write_errors: u64,
     pub datagrams_dropped_test: u64,
+    pub rate_changes: u64,
     pub input_messages: u64,
     pub input_rejected: u64,
     pub input_dropped: u64,
@@ -160,6 +179,56 @@ struct Shared {
     counters: Counters,
     waker: UdpSocket,
     wake_target: SocketAddr,
+    rate: RateShared,
+}
+
+/// What the rate control decided, for the encoder thread and the statistics; 0 means not known yet.
+#[derive(Debug, Default)]
+pub struct RateShared {
+    target_bps: AtomicU32,
+    estimate_bps: AtomicU32,
+    loss_permille: AtomicU32,
+    rtt_us: AtomicU32,
+}
+
+/// A copy of [`RateShared`] for statistics.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RateSnapshot {
+    pub target_bps: u32,
+    pub estimate_bps: Option<u32>,
+    pub loss: Option<f32>,
+    pub rtt: Option<Duration>,
+}
+
+impl RateShared {
+    fn publish(&self, rate: &RateControl) {
+        // 0 stands for «not known yet»: loss and RTT are stored one higher, an estimate of 0 bit/s never comes.
+        self.target_bps.store(rate.target(), Ordering::Relaxed);
+        self.estimate_bps
+            .store(rate.estimate().unwrap_or(0), Ordering::Relaxed);
+        self.loss_permille.store(
+            rate.loss()
+                .map_or(0, |l| (l.clamp(0.0, 1.0) * 1000.0) as u32 + 1),
+            Ordering::Relaxed,
+        );
+        self.rtt_us.store(
+            rate.rtt().map_or(0, |r| {
+                r.as_micros().min(u128::from(u32::MAX - 1)) as u32 + 1
+            }),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn snapshot(&self) -> RateSnapshot {
+        let load = |v: &AtomicU32| v.load(Ordering::Relaxed);
+        let some = |v: u32| (v > 0).then_some(v);
+        RateSnapshot {
+            target_bps: load(&self.target_bps),
+            estimate_bps: some(load(&self.estimate_bps)),
+            loss: some(load(&self.loss_permille)).map(|v| (v - 1) as f32 / 1000.0),
+            rtt: some(load(&self.rtt_us)).map(|v| Duration::from_micros(u64::from(v - 1))),
+        }
+    }
 }
 
 impl Shared {
@@ -208,6 +277,11 @@ impl FrameSink {
     /// True once per request: the browser asked for a keyframe, a session started, or frames were dropped.
     pub fn take_keyframe_request(&self) -> bool {
         self.shared.keyframe_wanted.swap(false, Ordering::Relaxed)
+    }
+
+    /// The bitrate the encoder should use now (D-027). Cheap: one atomic load.
+    pub fn target_bitrate(&self) -> u32 {
+        self.shared.rate.target_bps.load(Ordering::Relaxed)
     }
 
     /// Whether a browser is connected and frames are worth encoding.
@@ -298,7 +372,9 @@ impl Server {
             counters: Counters::default(),
             wake_target: SocketAddr::from((Ipv4Addr::LOCALHOST, local.port())),
             waker,
+            rate: RateShared::default(),
         });
+        shared.rate.publish(&RateControl::new(config.rate));
         let (commands, receiver) = sync_channel(8);
         let thread_shared = shared.clone();
         let thread = std::thread::Builder::new()
@@ -344,6 +420,10 @@ impl Server {
         }
     }
 
+    pub fn rate(&self) -> RateSnapshot {
+        self.shared.rate.snapshot()
+    }
+
     pub fn counters(&self) -> CountersSnapshot {
         let c = &self.shared.counters;
         let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
@@ -356,6 +436,7 @@ impl Server {
             keyframe_requests: load(&c.keyframe_requests),
             write_errors: load(&c.write_errors),
             datagrams_dropped_test: load(&c.datagrams_dropped_test),
+            rate_changes: load(&c.rate_changes),
             input_messages: load(&c.input_messages),
             input_rejected: load(&c.input_rejected),
             input_dropped: load(&c.input_dropped),
@@ -392,6 +473,9 @@ struct Session {
     /// The last position sent on `input-fast`, `pack_cursor`.
     position_sent: u64,
     cursor_seq: u16,
+    rate: RateControl,
+    /// `Config::simulate_link`, from the moment media flows.
+    shaper: Option<Shaper>,
 }
 
 fn unix_ms(at: SystemTime) -> f64 {
@@ -474,6 +558,13 @@ impl NetworkLoop {
             .set_extension(PLAYOUT_DELAY_ID, Extension::PlayoutDelay)
             // The capture time lets the browser report capture -> display latency (requestVideoFrameCallback).
             .set_extension(ABS_CAPTURE_TIME_ID, Extension::AbsoluteCaptureTime)
+            // Loss and RTT from the receiver reports reach the rate control as `MediaEgressStats`.
+            .set_stats_interval(Some(STATS_INTERVAL))
+            .enable_bwe(
+                self.config
+                    .adaptive
+                    .then(|| Bitrate::bps(u64::from(self.config.rate.start_bps))),
+            )
             .build(now);
         for addr in &self.config.advertise {
             match Candidate::host(*addr, "udp") {
@@ -508,7 +599,12 @@ impl NetworkLoop {
             shape_sent: false,
             position_sent: 0,
             cursor_seq: 0,
+            rate: RateControl::new(self.config.rate),
+            shaper: None,
         });
+        self.shared
+            .rate
+            .publish(&RateControl::new(self.config.rate));
         if let Some(link) = &self.config.input {
             link.live.store(number, Ordering::Relaxed);
         }
@@ -656,14 +752,19 @@ impl NetworkLoop {
                             .counters
                             .datagrams_dropped_test
                             .fetch_add(1, Ordering::Relaxed);
+                    } else if let Some(shaper) = session.shaper.as_mut() {
+                        if !shaper.offer(Instant::now(), &t.contents, t.destination) {
+                            self.shared
+                                .counters
+                                .datagrams_dropped_test
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     } else if let Err(e) = self.socket.send_to(&t.contents, t.destination) {
                         debug!(error = %e, to = %t.destination, "send failed");
                     }
                 }
                 Ok(Output::Event(event)) => {
-                    if let Some(why) =
-                        handle_event(session, &self.shared, self.config.input.as_ref(), event)
-                    {
+                    if let Some(why) = handle_event(session, &self.shared, &self.config, event) {
                         ended = Some(why);
                     }
                 }
@@ -676,8 +777,20 @@ impl NetworkLoop {
         };
         if let Some(why) = ended {
             self.end_session(why);
+            return deadline;
         }
-        deadline
+        match self.session.as_mut().and_then(|s| s.shaper.as_mut()) {
+            Some(shaper) => {
+                let now = Instant::now();
+                while let Some((data, to)) = shaper.due(now) {
+                    if let Err(e) = self.socket.send_to(&data, to) {
+                        debug!(error = %e, %to, "send failed");
+                    }
+                }
+                shaper.next().map_or(deadline, |next| deadline.min(next))
+            }
+            None => deadline,
+        }
     }
 
     /// Waits for a datagram or the deadline and feeds the session.
@@ -733,9 +846,10 @@ impl NetworkLoop {
 fn handle_event(
     session: &mut Session,
     shared: &Shared,
-    input: Option<&InputLink>,
+    config: &Config,
     event: Event,
 ) -> Option<&'static str> {
+    let input = config.input.as_ref();
     match event {
         Event::MediaAdded(added) if added.kind == MediaKind::Video => {
             let pt = session
@@ -762,9 +876,35 @@ fn handle_event(
         Event::Connected => {
             info!("dtls connected");
             session.connected = true;
+            if config.adaptive {
+                let limits = session.rate.limits();
+                session.rtc.bwe().set_bitrate(
+                    Bitrate::bps(u64::from(limits.min_bps)),
+                    Bitrate::bps(u64::from(limits.max_bps)),
+                );
+            }
+            session.shaper = config
+                .simulate_link
+                .clone()
+                .map(|test| Shaper::new(test, Instant::now()));
             shared.connected.store(true, Ordering::Relaxed);
             // The first frame the browser sees must be an IDR.
             shared.keyframe_wanted.store(true, Ordering::Relaxed);
+        }
+        Event::EgressBitrateEstimate(BweKind::Twcc {
+            estimate,
+            can_probe,
+        }) if config.adaptive => {
+            let before = session.rate.target();
+            session.rate.on_estimate(Instant::now(), estimate.as_u64());
+            rate_changed(session, shared, before, can_probe);
+        }
+        Event::MediaEgressStats(stats) if config.adaptive => {
+            let before = session.rate.target();
+            session
+                .rate
+                .on_report(Instant::now(), stats.loss, stats.rtt);
+            rate_changed(session, shared, before, true);
         }
         Event::KeyframeRequest(request) => {
             debug!(kind = ?request.kind, "keyframe requested");
@@ -829,6 +969,24 @@ fn handle_event(
         _ => {}
     }
     None
+}
+
+/// Publishes the rate control's state and logs a new target.
+fn rate_changed(session: &Session, shared: &Shared, before: u32, can_probe: bool) {
+    shared.rate.publish(&session.rate);
+    let target = session.rate.target();
+    if target != before {
+        shared.counters.rate_changes.fetch_add(1, Ordering::Relaxed);
+        let snapshot = shared.rate.snapshot();
+        info!(
+            target_kbps = target / 1000,
+            estimate_kbps = snapshot.estimate_bps.map(|v| v / 1000),
+            loss = snapshot.loss,
+            rtt_ms = snapshot.rtt.map(|r| r.as_secs_f64() * 1000.0),
+            can_probe,
+            "rate"
+        );
+    }
 }
 
 /// Labels of the data channels, `docs/PROTOCOL.md`.
@@ -958,6 +1116,7 @@ mod tests {
             counters: Counters::default(),
             waker: UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
             wake_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            rate: RateShared::default(),
         }
     }
 
@@ -1041,6 +1200,13 @@ mod tests {
             advertise: Vec::new(),
             simulate_loss: None,
             input: None,
+            rate: RateLimits {
+                start_bps: 30_000_000,
+                min_bps: 8_000_000,
+                max_bps: 50_000_000,
+            },
+            adaptive: true,
+            simulate_link: None,
         })
         .expect("bind on loopback");
         assert!(server.open("not an sdp".into()).is_err());
