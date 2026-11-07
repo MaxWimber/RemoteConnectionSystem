@@ -50,6 +50,9 @@ pub struct AgentStatus {
     pub connected: bool,
     /// `amf` or `mf`, the backend actually in use, or empty before the first session.
     pub encoder: String,
+    /// Whether the pipeline and its encoder are open now; closed while nobody is connected (D-028).
+    #[serde(default)]
+    pub encoder_open: bool,
     pub adapter: String,
     pub width: u32,
     pub height: u32,

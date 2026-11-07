@@ -7,6 +7,7 @@ mod cursor;
 mod input;
 mod pipe;
 mod pipeline;
+mod recovery;
 
 use std::fs::{self, OpenOptions};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -28,7 +29,9 @@ Usage: rcs-agent [--udp ADDR] [--advertise ADDR,ADDR] [--pipe NAME] [--log DIR]
                  [--input record|sendinput] [--stop-event NAME]
                  [--simulate-loss EVERY_MS:BURST_MS]   testing only: stop sending for BURST_MS every EVERY_MS
                  [--simulate-link S:MBPS,S:MBPS] [--simulate-link-queue-ms MS]
+                 [--simulate-amf-failure FRAMES]       testing only: every AMF encoder fails after FRAMES frames
                                                        testing only: a narrow link on the way out, rates repeat
+                 [--simulate-amf-failure FRAMES]       testing only: every AMF encoder fails after FRAMES frames
   --rate       adaptive (default) follows the network between the minimum and maximum bitrate (D-027); fixed
                keeps --bitrate-mbps
   --udp        UDP address for WebRTC, default 127.0.0.1:8443
@@ -83,6 +86,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             height: 1080,
             fps: 60,
             bitrate: 30_000_000,
+            simulate_amf_failure: None,
         },
     };
     let mut rest = args.iter();
@@ -129,6 +133,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
             }
             "--simulate-link" => options.simulate_link = Some(value.clone()),
             "--simulate-link-queue-ms" => options.simulate_link_queue_ms = number()? as u64,
+            "--simulate-amf-failure" => {
+                options.pipeline.simulate_amf_failure = Some(number()? as u64)
+            }
             "--display" => options.pipeline.display = number().unwrap_or(0) as u32,
             "--simulate-loss" => {
                 let (every, burst) = value
@@ -386,6 +393,7 @@ fn status(
         build: BUILD_ID.into(),
         connected: server.sink().connected(),
         encoder: info.encoder,
+        encoder_open: info.open,
         adapter: info.adapter,
         width: config.width as u32,
         height: config.height as u32,

@@ -2,7 +2,8 @@
 //!
 //! It follows `rcs-bench capture`: the stream-rate credit (D-019), repeats of the last frame on a static screen,
 //! a new duplication after `ACCESS_LOST` and a new device, capture and encoder after the GPU was lost. Frames are
-//! encoded only while a browser is connected. No network or disk I/O happens here.
+//! encoded only while a browser is connected, and the whole pipeline is closed while nobody is, so the card's one
+//! encoder is free for other programs (D-028). No network or disk I/O happens here.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -14,10 +15,12 @@ use rcs_capture::{
     Capture, CaptureError, CaptureEvent, DxgiCapture, Pointer, PointerShape, TimerResolution, dxgi,
 };
 use rcs_encode::amf::EncoderConfig;
-use rcs_encode::{Backend, EncodedFrame, Encoder};
+use rcs_encode::{Backend, EncodeError, EncodedFrame, Encoder, SubmitStats};
 use rcs_webrtc::{FrameSink, VideoFrame};
 use tracing::{info, warn};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+
+use crate::recovery::{AmfFailures, Backoff};
 
 const AMD_VENDOR_ID: u32 = 0x1002;
 /// Credit a new frame needs, see D-019.
@@ -27,7 +30,10 @@ const REPEAT_FPS: f64 = 15.0;
 const OUTPUT_TIMEOUT: Duration = Duration::from_millis(200);
 /// How long the thread waits for frames while nobody is connected.
 const IDLE_WAIT: Duration = Duration::from_millis(100);
-const RETRY_AFTER: Duration = Duration::from_secs(1);
+/// Nobody connected for this long closes the pipeline (D-028).
+const IDLE_RELEASE: Duration = Duration::from_secs(10);
+/// How often a closed pipeline looks for a browser; opening it then takes about 0.1 s.
+const IDLE_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -37,6 +43,8 @@ pub struct Config {
     pub height: i32,
     pub fps: i32,
     pub bitrate: i64,
+    /// Testing only: every AMF encoder fails after this many frames (D-028).
+    pub simulate_amf_failure: Option<u64>,
 }
 
 /// What the pipeline tells the status request.
@@ -48,6 +56,8 @@ pub struct Info {
     /// The captured monitor in desktop pixels: left, top, right, bottom. The input thread maps positions onto it.
     pub monitor: Option<[i32; 4]>,
     pub last_error: Option<String>,
+    /// Whether the pipeline, and with it the encoder, is open now.
+    pub open: bool,
 }
 
 #[derive(Default)]
@@ -121,6 +131,41 @@ fn note_error(stats: &Stats, error: String) {
     }
 }
 
+/// Why a pipeline had to be built again.
+#[derive(Debug)]
+enum Failure {
+    /// Encoding failed on a working device; `amf` says whether the encoder was AMF.
+    Encoder { amf: bool, error: String },
+    /// Anything else: opening, capture, a lost device.
+    Other(String),
+}
+
+impl Failure {
+    fn text(&self) -> &str {
+        match self {
+            Self::Encoder { error, .. } | Self::Other(error) => error,
+        }
+    }
+}
+
+fn set_open(stats: &Stats, open: bool) {
+    if let Ok(mut info) = stats.info.lock() {
+        info.open = open;
+    }
+}
+
+/// Sleeps for `pause`, waking early when the agent stops.
+fn pause_unless_stopped(pause: Duration, stop: &AtomicBool) {
+    let until = Instant::now() + pause;
+    while !stop.load(Ordering::Relaxed) {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        std::thread::sleep(left.min(IDLE_POLL));
+    }
+}
+
 fn run(
     config: &Config,
     sink: &FrameSink,
@@ -129,24 +174,49 @@ fn run(
     stop: &AtomicBool,
 ) {
     let _timer = TimerResolution::new(1);
-    let mut first = true;
+    let mut backoff = Backoff::default();
+    let mut amf_failures = AmfFailures::default();
+    // `auto` after repeated AMF failures, until the browser disconnects (D-028).
+    let mut use_mf = false;
+    // Opened once at the start so the input thread learns the monitor, then closed when nobody connects.
+    let mut open_now = true;
     while !stop.load(Ordering::Relaxed) {
-        if !first {
-            stats.restarts.fetch_add(1, Ordering::Relaxed);
+        if !open_now && !sink.connected() {
+            if use_mf {
+                info!("browser gone, the next connection starts with AMF again");
+                use_mf = false;
+            }
+            amf_failures.clear();
+            backoff.reset();
+            std::thread::sleep(IDLE_POLL);
+            continue;
         }
-        first = false;
-        match Pipeline::open(config, stats) {
+        open_now = false;
+        let backend = if use_mf { Backend::Mf } else { config.backend };
+        let opened = Instant::now();
+        let failure = match Pipeline::open(config, backend, stats) {
             Ok(mut pipeline) => {
-                if let Err(e) = pipeline.run(config, sink, shapes, stats, stop) {
-                    note_error(stats, e);
-                    pipeline.capture.release();
+                set_open(stats, true);
+                let result = pipeline.run(config, backend, sink, shapes, stats, stop);
+                drop(pipeline);
+                set_open(stats, false);
+                match result {
+                    Ok(()) => continue,
+                    Err(failure) => failure,
                 }
             }
-            Err(e) => {
-                note_error(stats, e);
-                std::thread::sleep(RETRY_AFTER);
-            }
+            Err(error) => Failure::Other(error),
+        };
+        stats.restarts.fetch_add(1, Ordering::Relaxed);
+        note_error(stats, failure.text().to_owned());
+        if matches!(failure, Failure::Encoder { amf: true, .. })
+            && config.backend == Backend::Auto
+            && amf_failures.record(Instant::now())
+        {
+            warn!("AMF keeps failing, Media Foundation until the browser disconnects");
+            use_mf = true;
         }
+        pause_unless_stopped(backoff.after_failure(opened.elapsed()), stop);
     }
     info!("pipeline stopped");
 }
@@ -156,6 +226,55 @@ fn encoder_config(config: &Config, input: (u32, u32)) -> EncoderConfig {
     c.input_width = input.0 as i32;
     c.input_height = input.1 as i32;
     c
+}
+
+fn open_encoder(
+    config: &Config,
+    backend: Backend,
+    device: &ID3D11Device,
+    input: (u32, u32),
+) -> Result<Box<dyn Encoder>, EncodeError> {
+    let encoder = rcs_encode::open(backend, device, &encoder_config(config, input))?;
+    Ok(match config.simulate_amf_failure {
+        Some(frames) if encoder.backend() == "amf" => Box::new(FailingEncoder {
+            inner: encoder,
+            frames_left: frames,
+        }),
+        _ => encoder,
+    })
+}
+
+/// Testing only: an encoder that fails every frame after `frames_left` frames (D-028).
+struct FailingEncoder {
+    inner: Box<dyn Encoder>,
+    frames_left: u64,
+}
+
+impl Encoder for FailingEncoder {
+    fn encode(
+        &mut self,
+        frame: &rcs_capture::CapturedFrame<'_>,
+        pts: i64,
+        force_idr: bool,
+    ) -> Result<SubmitStats, EncodeError> {
+        if self.frames_left == 0 {
+            return Err(EncodeError("simulated AMF failure".into()));
+        }
+        self.frames_left -= 1;
+        self.inner.encode(frame, pts, force_idr)
+    }
+
+    fn poll(&mut self, out: &mut EncodedFrame) -> Result<bool, EncodeError> {
+        self.inner.poll(out)
+    }
+
+    fn set_bitrate(&mut self, bits_per_second: u32) -> Result<(), EncodeError> {
+        self.inner.set_bitrate(bits_per_second)
+    }
+
+    fn backend(&self) -> &'static str {
+        self.inner.backend()
+    }
 }
 
 fn monitor_of(adapter: &dxgi::AdapterInfo, display: u32) -> Option<[i32; 4]> {
@@ -175,7 +294,7 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn open(config: &Config, stats: &Stats) -> Result<Self, String> {
+    fn open(config: &Config, backend: Backend, stats: &Stats) -> Result<Self, String> {
         let adapters = dxgi::enumerate_adapters().map_err(|e| dxgi::describe(&e))?;
         let adapter = adapters
             .iter()
@@ -186,8 +305,8 @@ impl Pipeline {
         let capture = DxgiCapture::new(adapter.adapter.clone(), device.clone(), config.display)
             .map_err(|e| e.to_string())?;
         let input = capture.size();
-        let encoder = rcs_encode::open(config.backend, &device, &encoder_config(config, input))
-            .map_err(|e| format!("encoder {}: {e}", config.backend.name()))?;
+        let encoder = open_encoder(config, backend, &device, input)
+            .map_err(|e| format!("encoder {}: {e}", backend.name()))?;
         info!(
             adapter = %adapter.info.name,
             encoder = encoder.backend(),
@@ -210,15 +329,17 @@ impl Pipeline {
         })
     }
 
-    /// Runs until `stop`, or returns why the pipeline must be built again.
+    /// Runs until `stop` or until nobody was connected for `IDLE_RELEASE`, or returns why the pipeline must be
+    /// built again.
     fn run(
         &mut self,
         config: &Config,
+        backend: Backend,
         sink: &FrameSink,
         shapes: &SyncSender<PointerShape>,
         stats: &Stats,
         stop: &AtomicBool,
-    ) -> Result<(), String> {
+    ) -> Result<(), Failure> {
         let mut pointer = PointerSeen::default();
         let fps = f64::from(config.fps.max(1));
         let frame_interval = Duration::from_secs_f64(1.0 / fps);
@@ -233,6 +354,7 @@ impl Pipeline {
         let mut force_idr = true;
         // The bitrate the encoder was given; the rate control may want another (D-027).
         let mut bitrate = config.bitrate.clamp(1, i64::from(u32::MAX)) as u32;
+        let mut idle_since = None;
 
         while !stop.load(Ordering::Relaxed) {
             let connected = sink.connected();
@@ -240,6 +362,12 @@ impl Pipeline {
                 force_idr = true;
             }
             was_connected = connected;
+            if connected {
+                idle_since = None;
+            } else if idle_since.get_or_insert_with(Instant::now).elapsed() >= IDLE_RELEASE {
+                info!("nobody connected, pipeline and encoder closed");
+                return Ok(());
+            }
             if sink.take_keyframe_request() {
                 force_idr = true;
             }
@@ -307,12 +435,10 @@ impl Pipeline {
                     let size = self.capture.size();
                     if size != self.input && size.0 > 0 {
                         info!(?size, "display size changed, new encoder");
-                        self.encoder = rcs_encode::open(
-                            config.backend,
-                            &self.device,
-                            &encoder_config(config, size),
-                        )
-                        .map_err(|e| format!("encoder after a mode change: {e}"))?;
+                        self.encoder =
+                            open_encoder(config, backend, &self.device, size).map_err(|e| {
+                                Failure::Other(format!("encoder after a mode change: {e}"))
+                            })?;
                         // The new encoder starts at the configured bitrate; the next frame applies the target.
                         bitrate = config.bitrate.clamp(1, i64::from(u32::MAX)) as u32;
                         self.input = size;
@@ -331,9 +457,12 @@ impl Pipeline {
                     }
                 }
                 Err(CaptureError::DeviceRemoved(e)) => {
-                    return Err(format!("device lost: {}", dxgi::describe(&e)));
+                    return Err(Failure::Other(format!(
+                        "device lost: {}",
+                        dxgi::describe(&e)
+                    )));
                 }
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(Failure::Other(e.to_string())),
             }
             pointer.forward(&self.capture, sink, shapes);
             if repeat_due && let Some(frame) = self.capture.last_frame() {
@@ -355,12 +484,16 @@ impl Pipeline {
         Ok(())
     }
 
-    fn lost_or(&self, error: String) -> String {
+    /// An encoding error is the encoder's own only while the device still works.
+    fn lost_or(&self, error: String) -> Failure {
         // SAFETY: the device is valid; the call only reads its state.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            format!("device lost while encoding: {error}")
+            Failure::Other(format!("device lost while encoding: {error}"))
         } else {
-            error
+            Failure::Encoder {
+                amf: self.encoder.backend() == "amf",
+                error,
+            }
         }
     }
 }

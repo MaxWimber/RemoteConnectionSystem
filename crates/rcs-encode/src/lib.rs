@@ -18,6 +18,14 @@ impl std::fmt::Display for EncodeError {
 
 impl std::error::Error for EncodeError {}
 
+impl EncodeError {
+    /// AMF has no encoder for this process. On a card with one encoder (RX 560) that means another process holds
+    /// it (D-028).
+    pub fn amf_busy(&self) -> bool {
+        self.0.contains("AMF_ENCODER_NOT_PRESENT")
+    }
+}
+
 /// One access unit in Annex B. The buffer is reused between frames, so polling allocates only when a frame is
 /// larger than any before it.
 #[derive(Debug, Clone, Default)]
@@ -90,7 +98,8 @@ impl Backend {
 }
 
 /// Opens the encoder for `backend` on the capture device. An explicit backend that fails is an error, it never
-/// falls back silently; `Auto` tries AMF first and says in the error why both failed.
+/// falls back silently; `Auto` tries AMF first and says in the error why both failed. A busy AMF is not a reason
+/// for Media Foundation: its hardware MFT on an AMD card is the same encoder (D-028).
 pub fn open(
     backend: Backend,
     device: &ID3D11Device,
@@ -101,6 +110,9 @@ pub fn open(
         Backend::Mf => Ok(Box::new(mf::MfEncoder::new(device, config)?)),
         Backend::Auto => match amf::AmfEncoder::new(device, config) {
             Ok(encoder) => Ok(Box::new(encoder)),
+            Err(amf_error) if amf_error.amf_busy() => {
+                Err(EncodeError(format!("AMF busy: {amf_error}")))
+            }
             Err(amf_error) => match mf::MfEncoder::new(device, config) {
                 Ok(encoder) => Ok(Box::new(encoder)),
                 Err(mf_error) => Err(EncodeError(format!(
@@ -108,5 +120,19 @@ pub fn open(
                 ))),
             },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_busy_amf_is_told_by_its_result_name() {
+        assert!(EncodeError("encoder Init: 36 AMF_ENCODER_NOT_PRESENT".into()).amf_busy());
+        assert!(
+            EncodeError("AMF busy: encoder Init: 36 AMF_ENCODER_NOT_PRESENT".into()).amf_busy()
+        );
+        assert!(!EncodeError("encoder Init: 4 AMF_NOT_SUPPORTED".into()).amf_busy());
     }
 }
