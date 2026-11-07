@@ -153,6 +153,8 @@ try {
         $binDir = $previous
         $dist = Join-Path $previous 'web'
         $buildInfo = Get-Content -LiteralPath (Join-Path $previous 'build.json') -Raw -ErrorAction SilentlyContinue
+        # Installed before build.json existed: its commit is unknown.
+        if (-not $buildInfo) { $buildInfo = [ordered]@{ build = 'dev'; source = $previous } | ConvertTo-Json }
     } elseif (Test-Path (Join-Path $packageBin 'rcs-agent.exe')) {
         $binDir = $packageBin
         $dist = Join-Path $repo 'web'
