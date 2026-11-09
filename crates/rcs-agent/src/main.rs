@@ -29,7 +29,7 @@ Usage: rcs-agent [--udp ADDR] [--advertise ADDR,ADDR] [--pipe NAME] [--log DIR]
                  [--min-bitrate-mbps B] [--max-bitrate-mbps B] [--rate adaptive|fixed] [--pacing paced|unpaced]
                  [--input record|sendinput] [--stop-event NAME]
                  [--simulate-loss EVERY_MS:BURST_MS]   testing only: stop sending for BURST_MS every EVERY_MS
-                 [--simulate-link S:MBPS,S:MBPS] [--simulate-link-queue-ms MS]
+                 [--simulate-link S:MBPS,S:MBPS] [--simulate-link-queue-ms MS] [--simulate-link-loss PERCENT]
                                                        testing only: a narrow link on the way out, rates repeat
                  [--simulate-amf-failure FRAMES]       testing only: every AMF encoder fails after FRAMES frames
   --rate       adaptive (default) follows the network between the minimum and maximum bitrate (D-027); fixed
@@ -51,6 +51,7 @@ struct Options {
     simulate_loss: Option<rcs_webrtc::LossTest>,
     simulate_link: Option<String>,
     simulate_link_queue_ms: u64,
+    simulate_link_loss: f64,
     rate: rcs_webrtc::RateLimits,
     adaptive: bool,
     paced_video: bool,
@@ -74,6 +75,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         simulate_loss: None,
         simulate_link: None,
         simulate_link_queue_ms: 200,
+        simulate_link_loss: 0.0,
         rate: rcs_webrtc::RateLimits {
             start_bps: 30_000_000,
             // Under 8 Mbit/s 1080p looks poor, but a weak link must still carry a picture (D-027).
@@ -145,6 +147,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
             }
             "--simulate-link" => options.simulate_link = Some(value.clone()),
             "--simulate-link-queue-ms" => options.simulate_link_queue_ms = number()? as u64,
+            "--simulate-link-loss" => {
+                options.simulate_link_loss =
+                    value.parse().map_err(|_| format!("{flag}: percent"))?
+            }
             "--simulate-amf-failure" => {
                 options.pipeline.simulate_amf_failure = Some(number()? as u64)
             }
@@ -257,7 +263,10 @@ fn run(options: Options) -> Result<(), String> {
     let simulate_link = options
         .simulate_link
         .as_deref()
-        .map(|steps| rcs_webrtc::LinkTest::parse(steps, options.simulate_link_queue_ms))
+        .map(|steps| {
+            rcs_webrtc::LinkTest::parse(steps, options.simulate_link_queue_ms)
+                .and_then(|t| t.with_loss(options.simulate_link_loss))
+        })
         .transpose()
         .map_err(|e| format!("--simulate-link: {e}"))?;
     let server = rcs_webrtc::Server::start(rcs_webrtc::Config {

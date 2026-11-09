@@ -1,5 +1,6 @@
 //! Testing only (P8-1, D-027): a narrow link on the way out. Datagrams of a connected session leave at the rate of
 //! the current step, wait in a queue of limited delay and are dropped when it is full, like a bottleneck router.
+//! A share of datagrams can also be lost at random, at any rate, as on a mobile network (D-036).
 //! Off unless `--simulate-link` is given. It copies each datagram; that is fine for a test and never runs otherwise.
 
 use std::collections::VecDeque;
@@ -12,6 +13,8 @@ pub struct LinkTest {
     pub steps: Vec<(Duration, f64)>,
     /// The longest a datagram may wait; beyond it the queue drops.
     pub queue: Duration,
+    /// Share of datagrams lost at random before the queue, 0..1.
+    pub loss: f64,
 }
 
 impl LinkTest {
@@ -42,7 +45,17 @@ impl LinkTest {
         Ok(Self {
             steps,
             queue: Duration::from_millis(queue_ms.max(1)),
+            loss: 0.0,
         })
+    }
+
+    /// Loses `percent` of the datagrams at random.
+    pub fn with_loss(mut self, percent: f64) -> Result<Self, String> {
+        if !(0.0..100.0).contains(&percent) {
+            return Err(format!("{percent}: loss in percent, 0 to under 100"));
+        }
+        self.loss = percent / 100.0;
+        Ok(self)
     }
 
     /// Bits per second `since` the session connected.
@@ -64,6 +77,8 @@ pub(crate) struct Shaper {
     started: Instant,
     queue: VecDeque<(Instant, Vec<u8>, SocketAddr)>,
     free_at: Instant,
+    /// xorshift64 state for the random loss; a fixed seed keeps runs alike.
+    random: u64,
 }
 
 impl Shaper {
@@ -73,11 +88,25 @@ impl Shaper {
             started: now,
             queue: VecDeque::new(),
             free_at: now,
+            random: 0x9E37_79B9_7F4A_7C15,
         }
+    }
+
+    /// The next number in 0..1.
+    fn uniform(&mut self) -> f64 {
+        let mut x = self.random;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.random = x;
+        (x >> 11) as f64 / (1u64 << 53) as f64
     }
 
     /// Takes a datagram into the queue, or returns false when the queue is full and it is dropped.
     pub(crate) fn offer(&mut self, now: Instant, data: &[u8], to: SocketAddr) -> bool {
+        if self.test.loss > 0.0 && self.uniform() < self.test.loss {
+            return false;
+        }
         let rate = self.test.rate_at(now.duration_since(self.started));
         let wire = Duration::from_secs_f64(data.len() as f64 * 8.0 / rate);
         let done = self.free_at.max(now) + wire;
@@ -120,6 +149,21 @@ mod tests {
         for bad in ["", "30", "x:5", "0:5", "5:0", "5:-1"] {
             assert!(LinkTest::parse(bad, 200).is_err(), "{bad}");
         }
+        assert!(t.clone().with_loss(100.0).is_err());
+        assert!(t.with_loss(-1.0).is_err());
+    }
+
+    #[test]
+    fn random_loss_drops_about_its_share() {
+        let now = Instant::now();
+        let test = LinkTest::parse("60:1000", 1000)
+            .unwrap()
+            .with_loss(5.0)
+            .unwrap();
+        let mut s = Shaper::new(test, now);
+        let to: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let lost = (0..10_000).filter(|_| !s.offer(now, &[0; 10], to)).count();
+        assert!((400..600).contains(&lost), "{lost}");
     }
 
     #[test]

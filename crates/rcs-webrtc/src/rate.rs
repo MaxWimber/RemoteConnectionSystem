@@ -12,7 +12,10 @@
 //!   - `str0m` lowered its estimate (on overuse to 0.85 of the acknowledged rate) and it is now under what goes out;
 //!   - the RTT grew by `RTT_RISE` while more goes out than the estimate, before `str0m` lowered it, or while the
 //!     target is above the estimate: on a narrow link LCVBR peaks and IDR frames over it sit in its queue (P8-5);
-//!   - heavy loss: down to what still gets through.
+//!   - heavy loss while the encoder sends at least half its target: down to what still gets through. Loss on a quiet
+//!     picture only holds the target: a mobile network loses a few percent at any rate, one report of 0.4 Mbit/s
+//!     with 22% lost cut 30 Mbit/s to the minimum and the picture to 720p (D-036). A link that really narrows under
+//!     a quiet picture shows in the estimate and the RTT.
 //!
 //!   An estimate under the target alone is no sign: LCVBR sends about 70% of its target. Nor is an estimate that
 //!   stays where it was while more goes out: after a decrease `str0m` climbs by a packet or so per step.
@@ -35,6 +38,8 @@ const HOLD_AFTER_DROP: Duration = Duration::from_secs(2);
 const LOSS_CUT: f32 = 0.10;
 const LOSS_HOLD: f32 = 0.02;
 const LOSS_CUT_FACTOR: f64 = 0.8;
+/// Loss cuts only while at least this share of the target goes out: then the link may not carry what is sent.
+const LOSS_BUSY: f64 = 0.5;
 /// RTT this much above the lowest seen holds the target: a queue is building somewhere.
 const RTT_RISE: Duration = Duration::from_millis(80);
 /// An estimate under this share of the rate sent means the link no longer carries what goes out.
@@ -217,7 +222,9 @@ impl RateControl {
             self.loss = loss;
         }
         let sent = self.sent_bps(now);
-        if let Some(loss) = loss.filter(|l| *l > LOSS_CUT) {
+        if let Some(loss) = loss.filter(|l| *l > LOSS_CUT)
+            && sent >= f64::from(self.target) * LOSS_BUSY
+        {
             // What reaches the browser is a better floor than a fixed share when most of it is lost.
             let delivered = sent * f64::from(1.0 - loss.min(1.0));
             let mut next = f64::from(self.target) * LOSS_CUT_FACTOR;
@@ -402,6 +409,7 @@ mod tests {
     #[test]
     fn heavy_loss_cuts_and_some_loss_holds() {
         let (mut c, t) = control();
+        busy(&mut c, t, 30);
         c.on_report(t, Some(0.2), Some(Duration::from_millis(20)));
         assert_eq!(c.target(), 24 * MBPS);
         let at = t + Duration::from_secs(10);
@@ -544,6 +552,28 @@ mod tests {
         c.on_report(t, Some(0.5), None);
         let target = f64::from(c.target());
         assert!((9.5e6..10.5e6).contains(&target), "{target}");
+    }
+
+    #[test]
+    fn loss_on_a_quiet_picture_holds_but_does_not_cut() {
+        // From the phone on mobile internet (D-036): a still desktop sends 0.4 Mbit/s, one report says 22% lost,
+        // the estimate stays at 31 Mbit/s.
+        let (mut c, t) = settled();
+        c.limits.min_bps = 2 * MBPS;
+        c.on_estimate(t, mbps(31));
+        let held = c.target();
+        let at = t + Duration::from_secs(1);
+        c.on_sent(at - Duration::from_millis(900), 25_000);
+        c.on_sent(at - Duration::from_millis(400), 25_000);
+        c.on_report(at, Some(0.225), Some(Duration::from_millis(27)));
+        assert_eq!(c.target(), held, "no cut");
+        c.on_tick(at + UP_EVERY);
+        assert_eq!(c.target(), held, "but no climb either");
+        // The same loss while the encoder spends most of its target is congestion.
+        let at = at + Duration::from_secs(2);
+        busy(&mut c, at, 20);
+        c.on_report(at, Some(0.225), Some(Duration::from_millis(27)));
+        assert!(c.target() < held, "{}", c.target());
     }
 
     #[test]
