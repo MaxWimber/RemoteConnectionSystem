@@ -1,0 +1,14 @@
+[package]
+name = "rcs-audio"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# libopus built from source by opusic-sys; CMake comes from Visual Studio Build Tools (D-038).
+opus = "0.4"
+tracing.workspace = true
+windows.workspace = true
+
+[lints]
+workspace = true

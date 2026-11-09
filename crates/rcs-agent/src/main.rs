@@ -3,6 +3,7 @@
 //! Phase 2: the agent runs as the current user, sends the desktop to one browser over WebRTC and answers `rcs-web`
 //! on `\\.\pipe\rcs-agent`. UDP listens on loopback unless `--udp` names another address.
 
+mod audio;
 mod cursor;
 mod input;
 mod pipe;
@@ -27,7 +28,7 @@ const USAGE: &str = "\
 Usage: rcs-agent [--udp ADDR] [--advertise ADDR,ADDR] [--pipe NAME] [--log DIR]
                  [--encoder auto|amf|mf] [--width W] [--height H] [--fps F] [--bitrate-mbps B] [--display N]
                  [--min-bitrate-mbps B] [--max-bitrate-mbps B] [--rate adaptive|fixed] [--pacing paced|unpaced]
-                 [--input record|sendinput] [--stop-event NAME]
+                 [--input record|sendinput] [--audio on|off] [--stop-event NAME]
                  [--simulate-loss EVERY_MS:BURST_MS]   testing only: stop sending for BURST_MS every EVERY_MS
                  [--simulate-link S:MBPS,S:MBPS] [--simulate-link-queue-ms MS] [--simulate-link-loss PERCENT]
                                                        testing only: a narrow link on the way out, rates repeat
@@ -38,6 +39,7 @@ Usage: rcs-agent [--udp ADDR] [--advertise ADDR,ADDR] [--pipe NAME] [--log DIR]
   --udp        UDP address for WebRTC, default 127.0.0.1:8443
   --input      record (default) checks and counts input without sending it to Windows; sendinput controls this
                computer (D-022)
+  --audio      on (default) sends the sound of the default output device (D-038)
   --stop-event the supervisor's event: when it is set the agent lets go of all input and exits (D-025)
   --advertise  addresses written into the answer, default the --udp address, or the LAN address and loopback
                when --udp is 0.0.0.0";
@@ -56,6 +58,7 @@ struct Options {
     adaptive: bool,
     paced_video: bool,
     input: input::Mode,
+    audio: bool,
     stop_event: Option<String>,
 }
 
@@ -85,6 +88,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         adaptive: true,
         paced_video: true,
         input: input::Mode::Record,
+        audio: true,
         stop_event: None,
         pipeline: pipeline::Config {
             display: 0,
@@ -119,6 +123,13 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--input" => {
                 options.input = input::Mode::parse(value)
                     .ok_or_else(|| format!("{flag}: record or sendinput"))?
+            }
+            "--audio" => {
+                options.audio = match value.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(format!("{flag}: on or off")),
+                }
             }
             "--log" => options.log = PathBuf::from(value),
             "--encoder" => {
@@ -281,7 +292,7 @@ fn run(options: Options) -> Result<(), String> {
     })
     .map_err(|e| format!("UDP {}: {e}", options.udp))?;
     info!(udp = %server.local_addr(), advertise = ?options.advertise, pipe = %options.pipe,
-        input = options.input.name(), adaptive = options.adaptive, paced_video = options.paced_video,
+        input = options.input.name(), audio = options.audio, adaptive = options.adaptive, paced_video = options.paced_video,
         min_kbps = options.rate.min_bps / 1000, max_kbps = options.rate.max_bps / 1000, "agent started");
     println!(
         "rcs-agent {BUILD_ID}: WebRTC {} ({:?}), канал {}, ввод {}",
@@ -320,6 +331,11 @@ fn run(options: Options) -> Result<(), String> {
         stop.clone(),
     )
     .map_err(|e| format!("pipeline thread: {e}"))?;
+    let audio_thread = options
+        .audio
+        .then(|| audio::spawn(server.sink(), stop.clone()))
+        .transpose()
+        .map_err(|e| format!("audio thread: {e}"))?;
     // Memory, handles and video memory every 10 s, for long runs (P8-7).
     let held = Arc::new(Mutex::new(resources::Sample::default()));
     let resources_thread = resources::spawn(RESOURCES_EVERY, held.clone(), stop.clone())
@@ -358,6 +374,9 @@ fn run(options: Options) -> Result<(), String> {
     });
     stop.store(true, Ordering::Relaxed);
     let _ = worker.join();
+    if let Some(t) = audio_thread {
+        let _ = t.join();
+    }
     let _ = resources_thread.join();
     if let Some(t) = input_thread.lock().ok().and_then(|mut t| t.take()) {
         let _ = t.join();

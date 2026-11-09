@@ -1,7 +1,8 @@
-// The media session: a receive-only RTCPeerConnection with H.264, reconnecting when it breaks.
+// The media session: a receive-only RTCPeerConnection with H.264 and Opus, reconnecting when it breaks.
 
 import { ClockSync, sampleFromPong } from './clock';
 import { me } from '../api/auth';
+import { withStereoOpus } from './audio';
 import { InputChannels } from '../input/channels';
 import { decodeServer, type ServerMessage as CursorMessage } from '../input/protocol';
 import { watchNetwork } from './network';
@@ -23,6 +24,8 @@ export interface SessionEvents {
   state(state: SessionState, detail?: string): void;
   log(message: string): void;
   stream(stream: MediaStream): void;
+  /** The sound of the server (D-038), a track of its own. */
+  audio?(track: MediaStreamTrack, receiver: RTCRtpReceiver): void;
   /** The sign-in session ended (logout, expiry, a sign-in elsewhere): show the sign-in page. */
   signedOut(): void;
   /** The server's pointer: shape on control, position on input-fast. */
@@ -74,6 +77,7 @@ export class StreamSession {
   private resumeAttempt = 0;
   private limitKbps: number | null = loadBitrateLimit();
   private modeChoice: StreamMode = loadMode();
+  private audioRx: RTCRtpReceiver | null = null;
 
   constructor(
     private readonly base: string,
@@ -82,6 +86,11 @@ export class StreamSession {
 
   get peer(): RTCPeerConnection | null {
     return this.pc;
+  }
+
+  /** The receiver of the sound, for its delay. */
+  get audioReceiver(): RTCRtpReceiver | null {
+    return this.audioRx;
   }
 
   /** The input channels of the current connection; they send nothing until open. */
@@ -147,6 +156,7 @@ export class StreamSession {
     this.clockSync = null;
     this.inputChannels = null;
     this.control = null;
+    this.audioRx = null;
     this.signaling?.close();
     this.signaling = null;
     this.pc?.close();
@@ -248,16 +258,20 @@ export class StreamSession {
     const pc = new RTCPeerConnection({ bundlePolicy: 'max-bundle' });
     this.pc = pc;
     const transceiver = pc.addTransceiver('video', { direction: 'recvonly' });
+    // The sound comes on a track of its own, in a stream of its own: no lip sync that would delay the video.
+    const sound = pc.addTransceiver('audio', { direction: 'recvonly' });
     // The capture time of each frame gives the browser capture -> display latency (requestVideoFrameCallback).
-    const negotiable = transceiver as RTCRtpTransceiver & {
-      getHeaderExtensionsToNegotiate?: () => HeaderExtension[];
-      setHeaderExtensionsToNegotiate?: (list: HeaderExtension[]) => void;
-    };
-    if (negotiable.getHeaderExtensionsToNegotiate && negotiable.setHeaderExtensionsToNegotiate) {
-      try {
-        negotiable.setHeaderExtensionsToNegotiate(withAbsCaptureTime(negotiable.getHeaderExtensionsToNegotiate()));
-      } catch (e) {
-        this.events.log(`abs-capture-time: ${String(e)}`);
+    for (const t of [transceiver, sound]) {
+      const negotiable = t as RTCRtpTransceiver & {
+        getHeaderExtensionsToNegotiate?: () => HeaderExtension[];
+        setHeaderExtensionsToNegotiate?: (list: HeaderExtension[]) => void;
+      };
+      if (negotiable.getHeaderExtensionsToNegotiate && negotiable.setHeaderExtensionsToNegotiate) {
+        try {
+          negotiable.setHeaderExtensionsToNegotiate(withAbsCaptureTime(negotiable.getHeaderExtensionsToNegotiate()));
+        } catch (e) {
+          this.events.log(`abs-capture-time: ${String(e)}`);
+        }
       }
     }
     const caps = RTCRtpReceiver.getCapabilities('video');
@@ -269,6 +283,11 @@ export class StreamSession {
     this.openControl(pc.createDataChannel('control', { ordered: true }));
     this.inputChannels = new InputChannels(pc, (m) => this.events.cursor?.(m));
     pc.ontrack = (e) => {
+      if (e.track.kind === 'audio') {
+        this.audioRx = e.receiver;
+        this.events.audio?.(e.track, e.receiver);
+        return;
+      }
       const receiver = e.receiver as RTCRtpReceiver & {
         jitterBufferTarget?: number | null;
         playoutDelayHint?: number;
@@ -297,7 +316,8 @@ export class StreamSession {
         }, 3000);
       }
     };
-    const offer = await pc.createOffer();
+    const created = await pc.createOffer();
+    const offer = { type: created.type, sdp: withStereoOpus(created.sdp ?? '') };
     await pc.setLocalDescription(offer);
     // The server is ICE-lite and learns our address from the checks, so the offer goes without candidates.
     signaling.send({ type: 'offer', sdp: pc.localDescription?.sdp ?? offer.sdp });

@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+rcs-audio.workspace = true
 rcs-capture.workspace = true
 rcs-encode.workspace = true
 rcs-protocol.workspace = true

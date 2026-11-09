@@ -8,6 +8,9 @@
 //! Messages on `input-fast` and `input-reliable` are parsed here and handed to the agent's input thread through
 //! [`InputLink`] without waiting (D-022). When that queue is full, or a session or an input channel ends, the link's
 //! `release` flag asks the input thread to let go of everything.
+//!
+//! Sound goes the same way as video (D-038): the audio thread hands Opus packets through [`FrameSink::push_audio`],
+//! a queue of eight packets that drops the oldest when full.
 
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -23,8 +26,8 @@ use serde_json::{Value, json};
 use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::SdpOffer;
 use str0m::channel::ChannelId;
-use str0m::format::Codec;
-use str0m::media::{MediaKind, MediaTime, Mid, Pt};
+use str0m::format::{Codec, FormatParams};
+use str0m::media::{Frequency, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::{AbsCaptureTime, Extension};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
@@ -46,6 +49,10 @@ use timing::FrameTimings;
 const QUEUE_FRAMES: usize = 2;
 /// Spare frame buffers kept for the encoder.
 const POOL_BUFFERS: usize = 4;
+/// Opus packets waiting for the network thread: 80 ms (D-038).
+const AUDIO_QUEUE: usize = 8;
+/// The payload type offered for Opus by Chrome and Edge; the answer follows the offer anyway.
+const OPUS_PT: u8 = 111;
 /// Longest wait of the network thread when nothing is scheduled.
 const IDLE_WAIT: Duration = Duration::from_millis(50);
 /// Timeouts handled at once in one pass of the loop, so frames and commands still get their turn.
@@ -127,6 +134,14 @@ pub struct VideoFrame {
     pub keyframe: bool,
 }
 
+/// One Opus packet of 10 ms.
+#[derive(Debug)]
+pub struct AudioPacket {
+    pub data: Vec<u8>,
+    /// When its first sample went through the Windows mixer; the RTP timestamp is derived from it.
+    pub captured: Instant,
+}
+
 /// Counters for logs and the statistics panel.
 #[derive(Debug, Default)]
 pub struct Counters {
@@ -153,6 +168,10 @@ pub struct Counters {
     pub input_rejected: AtomicU64,
     /// Input messages dropped because the input queue was full.
     pub input_dropped: AtomicU64,
+    pub audio_packets_sent: AtomicU64,
+    pub audio_bytes_sent: AtomicU64,
+    /// Opus packets dropped because the audio queue was full, or nobody was connected.
+    pub audio_dropped: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -169,6 +188,9 @@ pub struct CountersSnapshot {
     pub input_messages: u64,
     pub input_rejected: u64,
     pub input_dropped: u64,
+    pub audio_packets_sent: u64,
+    pub audio_bytes_sent: u64,
+    pub audio_dropped: u64,
 }
 
 /// A cursor position packed in a u64: x in bits 0-15, y in 16-31, visible in bit 32, bit 40 once set at all.
@@ -187,6 +209,8 @@ struct Shared {
     cursor_shape: Mutex<Option<Vec<u8>>>,
     queue: Mutex<VecDeque<VideoFrame>>,
     pool: Mutex<Vec<Vec<u8>>>,
+    audio_queue: Mutex<VecDeque<AudioPacket>>,
+    audio_pool: Mutex<Vec<Vec<u8>>>,
     keyframe_wanted: AtomicBool,
     connected: AtomicBool,
     /// The active `StreamMode`, for the encoder thread (D-030).
@@ -289,6 +313,34 @@ impl FrameSink {
         dropped
     }
 
+    /// An empty buffer for the next Opus packet, reused from packets already sent.
+    pub fn audio_buffer(&self) -> Vec<u8> {
+        self.shared
+            .audio_pool
+            .lock()
+            .ok()
+            .and_then(|mut p| p.pop())
+            .unwrap_or_default()
+    }
+
+    /// Queues an Opus packet; when the queue is full the oldest packet is dropped.
+    pub fn push_audio(&self, packet: AudioPacket) {
+        let old = self.shared.audio_queue.lock().ok().and_then(|mut queue| {
+            queue.push_back(packet);
+            (queue.len() > AUDIO_QUEUE)
+                .then(|| queue.pop_front())
+                .flatten()
+        });
+        if let Some(old) = old {
+            self.shared
+                .counters
+                .audio_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            recycle_audio(&self.shared, old.data);
+        }
+        self.shared.wake();
+    }
+
     /// True once per request: the browser asked for a keyframe, a session started, or frames were dropped.
     pub fn take_keyframe_request(&self) -> bool {
         self.shared.keyframe_wanted.swap(false, Ordering::Relaxed)
@@ -349,6 +401,15 @@ fn push_bounded(queue: &mut VecDeque<VideoFrame>, frame: VideoFrame) -> Option<V
         .flatten()
 }
 
+fn recycle_audio(shared: &Shared, mut data: Vec<u8>) {
+    data.clear();
+    if let Ok(mut pool) = shared.audio_pool.lock()
+        && pool.len() < AUDIO_QUEUE * 2
+    {
+        pool.push(data);
+    }
+}
+
 fn recycle(shared: &Shared, mut data: Vec<u8>) {
     data.clear();
     if let Ok(mut pool) = shared.pool.lock()
@@ -387,6 +448,8 @@ impl Server {
             cursor_shape: Mutex::new(None),
             queue: Mutex::new(VecDeque::with_capacity(QUEUE_FRAMES + 1)),
             pool: Mutex::new(Vec::with_capacity(POOL_BUFFERS)),
+            audio_queue: Mutex::new(VecDeque::with_capacity(AUDIO_QUEUE + 1)),
+            audio_pool: Mutex::new(Vec::with_capacity(AUDIO_QUEUE * 2)),
             keyframe_wanted: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             mode: AtomicU8::new(StreamMode::Game.to_u8()),
@@ -461,6 +524,9 @@ impl Server {
             input_messages: load(&c.input_messages),
             input_rejected: load(&c.input_rejected),
             input_dropped: load(&c.input_dropped),
+            audio_packets_sent: load(&c.audio_packets_sent),
+            audio_bytes_sent: load(&c.audio_bytes_sent),
+            audio_dropped: load(&c.audio_dropped),
         }
     }
 }
@@ -479,6 +545,8 @@ impl Drop for Server {
 struct Session {
     rtc: Rtc,
     video: Option<(Mid, Pt)>,
+    /// The Opus track, when the browser offered one (D-038).
+    audio: Option<(Mid, Pt)>,
     connected: bool,
     /// RTP time 0 of the video stream, see `send_frames`.
     epoch: Instant,
@@ -525,8 +593,8 @@ struct NetworkLoop {
     buffer: Vec<u8>,
     local: SocketAddr,
     wake_source: SocketAddr,
-    /// The last once-a-second rate line: when, bytes sent, datagram bytes out and test drops by then.
-    sampled: (Instant, u64, u64, u64),
+    /// The last once-a-second rate line: when, bytes sent, datagram bytes out, test drops and sound bytes by then.
+    sampled: (Instant, u64, u64, u64, u64),
 }
 
 /// How often a connected session logs its rate: estimate, target and what actually went out.
@@ -554,7 +622,7 @@ impl NetworkLoop {
             buffer: vec![0; RECV_BUFFER],
             local,
             wake_source,
-            sampled: (Instant::now(), 0, 0, 0),
+            sampled: (Instant::now(), 0, 0, 0, 0),
         }
     }
 
@@ -583,8 +651,9 @@ impl NetworkLoop {
         let bytes = c.bytes_sent.load(Ordering::Relaxed);
         let out = c.bytes_out.load(Ordering::Relaxed);
         let dropped = c.datagrams_dropped_test.load(Ordering::Relaxed);
-        let (_, last_bytes, last_out, last_dropped) =
-            std::mem::replace(&mut self.sampled, (now, bytes, out, dropped));
+        let audio = c.audio_bytes_sent.load(Ordering::Relaxed);
+        let (_, last_bytes, last_out, last_dropped, last_audio) =
+            std::mem::replace(&mut self.sampled, (now, bytes, out, dropped, audio));
         let kbps = |b: u64| (b as f64 * 8.0 / elapsed.as_secs_f64() / 1000.0) as u64;
         let Some(session) = self.session.as_mut().filter(|s| s.connected) else {
             return;
@@ -592,12 +661,14 @@ impl NetworkLoop {
         let r = self.shared.rate.snapshot();
         let sent_kbps = kbps(bytes.saturating_sub(last_bytes));
         let out_kbps = kbps(out.saturating_sub(last_out));
+        let audio_kbps = kbps(audio.saturating_sub(last_audio));
         let rtt_ms = r.rtt.map(|d| (d.as_secs_f64() * 10_000.0).round() / 10.0);
         info!(
             target_kbps = r.target_bps / 1000,
             estimate_kbps = r.estimate_bps.map(|v| v / 1000),
             sent_kbps,
             out_kbps,
+            audio_kbps,
             dropped_test = dropped.saturating_sub(last_dropped),
             loss = r.loss,
             rtt_ms,
@@ -640,6 +711,7 @@ impl NetworkLoop {
             "estimate_kbps": r.estimate_bps.map(|v| v / 1000),
             "sent_kbps": sent_kbps,
             "out_kbps": out_kbps,
+            "audio_kbps": audio_kbps,
             "loss": r.loss,
             "rtt_ms": rtt_ms,
             "min_kbps": limits.min_bps / 1000,
@@ -669,6 +741,7 @@ impl NetworkLoop {
                 Err(TryRecvError::Empty) => {}
             }
             self.send_frames();
+            self.send_audio();
             self.send_cursor();
             self.tick_rate();
             self.sample();
@@ -682,10 +755,26 @@ impl NetworkLoop {
         let offer = SdpOffer::from_sdp_string(offer).map_err(|e| format!("bad offer: {e}"))?;
         let now = Instant::now();
         // playout-delay is not in the standard extension map; without it the zero delay never reaches the browser.
-        let mut rtc = RtcConfig::new()
+        let mut config = RtcConfig::new()
             .set_ice_lite(true)
             .clear_codecs()
-            .enable_h264(true)
+            .enable_h264(true);
+        // Stereo in both directions of the fmtp: Chrome decodes mono otherwise (D-038).
+        config.codec_config().add_config(
+            OPUS_PT.into(),
+            None,
+            Codec::Opus,
+            Frequency::FORTY_EIGHT_KHZ,
+            Some(2),
+            FormatParams {
+                min_p_time: Some(10),
+                use_inband_fec: Some(true),
+                stereo: Some(true),
+                sprop_stereo: Some(true),
+                ..Default::default()
+            },
+        );
+        let mut rtc = config
             .set_extension(PLAYOUT_DELAY_ID, Extension::PlayoutDelay)
             // The capture time lets the browser report capture -> display latency (requestVideoFrameCallback).
             .set_extension(ABS_CAPTURE_TIME_ID, Extension::AbsoluteCaptureTime)
@@ -722,6 +811,7 @@ impl NetworkLoop {
         self.session = Some(Session {
             rtc,
             video: None,
+            audio: None,
             connected: false,
             epoch: now,
             epoch_unix_ms: unix_ms(SystemTime::now()) - now.elapsed().as_secs_f64() * 1000.0,
@@ -821,6 +911,67 @@ impl NetworkLoop {
                 }
             }
             recycle(&self.shared, frame.data);
+        }
+    }
+
+    /// Writes queued Opus packets into the session, or drops them while nobody listens.
+    fn send_audio(&mut self) {
+        loop {
+            let packet = match self.shared.audio_queue.lock() {
+                Ok(mut q) => q.pop_front(),
+                Err(_) => None,
+            };
+            let Some(packet) = packet else { return };
+            let counters = &self.shared.counters;
+            let track = self
+                .session
+                .as_mut()
+                .filter(|s| s.connected)
+                .and_then(|s| s.audio.map(|a| (s, a)));
+            match track {
+                Some((session, (mid, pt))) => {
+                    let ticks = packet
+                        .captured
+                        .saturating_duration_since(session.epoch)
+                        .as_micros()
+                        * 48
+                        / 1000;
+                    let rtp_time = MediaTime::new(ticks as u64, Frequency::FORTY_EIGHT_KHZ);
+                    let capture_time = SystemTime::now()
+                        .checked_sub(packet.captured.elapsed())
+                        .unwrap_or(SystemTime::now());
+                    let size = packet.data.len() as u64;
+                    let written = session.rtc.writer(mid).map(|w| {
+                        w.abs_capture_time(AbsCaptureTime {
+                            capture_time,
+                            clock_offset: Some(0),
+                        })
+                        .write(
+                            pt,
+                            packet.captured,
+                            rtp_time,
+                            packet.data.as_slice(),
+                        )
+                    });
+                    match written {
+                        Some(Ok(())) => {
+                            counters.audio_packets_sent.fetch_add(1, Ordering::Relaxed);
+                            counters.audio_bytes_sent.fetch_add(size, Ordering::Relaxed);
+                        }
+                        Some(Err(e)) => {
+                            counters.write_errors.fetch_add(1, Ordering::Relaxed);
+                            debug!(error = %e, "audio not written");
+                        }
+                        None => {
+                            counters.write_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                None => {
+                    counters.audio_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            recycle_audio(&self.shared, packet.data);
         }
     }
 
@@ -1033,6 +1184,20 @@ fn handle_event(
                 None => warn!("the browser offered no usable H.264"),
             }
         }
+        Event::MediaAdded(added) if added.kind == MediaKind::Audio => {
+            let pt = session.rtc.writer(added.mid).and_then(|w| {
+                w.payload_params()
+                    .find(|p| p.spec().codec == Codec::Opus)
+                    .map(|p| p.pt())
+            });
+            match pt {
+                Some(pt) => {
+                    info!(mid = %added.mid, ?pt, "audio track ready");
+                    session.audio = Some((added.mid, pt));
+                }
+                None => warn!("the browser offered no Opus"),
+            }
+        }
         Event::IceConnectionStateChange(state) => {
             info!(?state, "ice state");
             match state {
@@ -1097,6 +1262,7 @@ fn handle_event(
                     "t": "hello",
                     "protocol": 1,
                     "codec": "h264",
+                    "audio": session.audio.is_some(),
                     "rtp_epoch_ms": session.epoch_unix_ms,
                     "rtp_clock": 90_000,
                 });
@@ -1427,6 +1593,8 @@ mod tests {
             cursor_shape: Mutex::new(None),
             queue: Mutex::new(VecDeque::new()),
             pool: Mutex::new(Vec::new()),
+            audio_queue: Mutex::new(VecDeque::new()),
+            audio_pool: Mutex::new(Vec::new()),
             keyframe_wanted: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             mode: AtomicU8::new(0),
@@ -1435,6 +1603,28 @@ mod tests {
             wake_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
             rate: RateShared::default(),
         }
+    }
+
+    #[test]
+    fn a_full_audio_queue_drops_the_oldest_packets_and_reuses_their_buffers() {
+        let sink = FrameSink {
+            shared: Arc::new(shared()),
+        };
+        let at = Instant::now();
+        for i in 0..AUDIO_QUEUE as u8 + 2 {
+            let mut data = sink.audio_buffer();
+            data.push(i);
+            sink.push_audio(AudioPacket { data, captured: at });
+        }
+        let queue = sink.shared.audio_queue.lock().unwrap();
+        assert_eq!(queue.len(), AUDIO_QUEUE);
+        assert_eq!(queue.front().map(|p| p.data[0]), Some(2));
+        assert_eq!(
+            sink.shared.counters.audio_dropped.load(Ordering::Relaxed),
+            2
+        );
+        drop(queue);
+        assert!(sink.audio_buffer().capacity() > 0);
     }
 
     #[test]

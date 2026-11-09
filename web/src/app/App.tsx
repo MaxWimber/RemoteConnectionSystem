@@ -16,6 +16,8 @@ import {
   recordSample,
   recordServerStats,
 } from '../stream/diagnostics';
+import { audioDelayMs, SoundPlayer, type SoundState } from '../stream/audio';
+import { probeAvSync } from '../stream/avsync';
 import { LatencyMeter, type LatencySummary } from '../stream/latency';
 import { StreamSession, type SessionState } from '../stream/session';
 import { summarize, toMap, type StatsMap, type StreamSummary } from '../stream/stats';
@@ -39,6 +41,21 @@ interface WakeLockLike {
   release(): Promise<void>;
 }
 const AGENT_INTERVAL_MS = 2000;
+/** Seconds of sound delay samples behind the p50 in the panel. */
+const AUDIO_DELAY_SAMPLES = 30;
+
+const soundTitle: Record<SoundState, string> = {
+  off: 'Звук выключен',
+  waiting: 'Звук включится после касания или щелчка',
+  playing: 'Выключить звук',
+};
+const soundIcon: Record<SoundState, string> = { off: '🔇', waiting: '🔈', playing: '🔊' };
+
+function median(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)]!;
+}
 
 const stateText: Record<SessionState, string> = {
   idle: 'Не подключено',
@@ -65,6 +82,10 @@ export function App({ onSignedOut }: Props) {
   const keyboardField = useRef<HTMLTextAreaElement>(null);
   const touch = useRef<TouchController | null>(null);
   const [probe, setProbe] = useState('');
+  const [avProbe, setAvProbe] = useState('');
+  const sound = useRef<SoundPlayer | null>(null);
+  const [soundState, setSoundState] = useState<SoundState>('waiting');
+  const audioDelays = useRef<number[]>([]);
   const gamepads = useRef<GamepadPoller | null>(null);
   const [notice, setNotice] = useState('');
   const screenEl = useRef<HTMLDivElement>(null);
@@ -100,6 +121,12 @@ export function App({ onSignedOut }: Props) {
 
   useEffect(() => {
     installErrorCapture();
+    const player = new SoundPlayer((st) => {
+      setSoundState(st);
+      logEvent(`звук: ${st}`);
+    });
+    sound.current = player;
+    setSoundState(player.state);
     const s = new StreamSession(import.meta.env.BASE_URL, {
       state: (next, why) => {
         setState(next);
@@ -109,6 +136,10 @@ export function App({ onSignedOut }: Props) {
       log: logEvent,
       stream: (stream) => {
         if (video.current) video.current.srcObject = stream;
+      },
+      audio: (track) => {
+        audioDelays.current = [];
+        player.attach(track);
       },
       signedOut: () => onSignedOut('Сессия завершена: выход, истечение срока или вход с другого устройства.'),
       cursor: (m) => cursor.current?.handle(m),
@@ -187,6 +218,13 @@ export function App({ onSignedOut }: Props) {
         const s = summarize(now, lastStats.current ?? undefined);
         lastStats.current = now;
         const l = meter.current?.summary() ?? null;
+        const rx = session.current?.audioReceiver;
+        const delay = rx ? audioDelayMs(rx, session.current?.clock ?? null) : null;
+        if (delay !== null) {
+          audioDelays.current.push(delay);
+          if (audioDelays.current.length > AUDIO_DELAY_SAMPLES) audioDelays.current.shift();
+        }
+        if (l) l.audioDelayP50 = median(audioDelays.current);
         if (s) {
           recordSample(s, l);
           setSummary(s);
@@ -297,6 +335,33 @@ export function App({ onSignedOut }: Props) {
     }
   };
 
+  const runAvProbe = async () => {
+    const v = video.current;
+    const stream = sound.current?.stream;
+    if (!v || avProbe.startsWith('замер…')) return;
+    if (!stream) {
+      setAvProbe('нет звуковой дорожки');
+      return;
+    }
+    setAvProbe('замер… 20 с');
+    // On the server itself the sound would come back through the loopback: listen without playing.
+    sound.current?.silence(true);
+    try {
+      const r = await probeAvSync(v, stream, import.meta.env.BASE_URL, 20, (f, c) =>
+        setAvProbe(`замер… вспышек ${f}, щелчков ${c}`),
+      );
+      logEvent(`замер звука и видео: ${JSON.stringify(r)}`);
+      setAvProbe(
+        `звук позже видео: p50 ${fmt(r.p50)} / p95 ${fmt(r.p95)} мс · мин ${fmt(r.min)} · макс ${fmt(r.max)} · ` +
+          `пар ${r.samples.length} из ${r.flashes} вспышек, щелчков ${r.clicks} · вывод WebAudio ${fmt(r.outputLatencyMs)} мс`,
+      );
+    } catch (e) {
+      setAvProbe(`замер не удался: ${String(e)}`);
+    } finally {
+      sound.current?.silence(false);
+    }
+  };
+
   /** The on-screen pad needs ViGEmBus too: say so when it is shown. */
   const checkPadServer = async () => {
     try {
@@ -383,6 +448,13 @@ export function App({ onSignedOut }: Props) {
             <span class="files-badge">{sending.size > 0 ? Math.floor((sending.sent / sending.size) * 100) : 0}%</span>
           )}
         </button>
+        <button
+          onClick={() => sound.current?.setEnabled(soundState === 'off')}
+          title={soundTitle[soundState]}
+          aria-pressed={soundState !== 'off'}
+        >
+          {soundIcon[soundState]}
+        </button>
         <button onClick={() => setShowStats(!showStats)} title="Статистика">ℹ</button>
         <button onClick={() => void saveDiagnostics()} title="Скачать диагностику">⤓</button>
         <button onClick={() => void signOut()} title="Выйти">⏻</button>
@@ -402,6 +474,16 @@ export function App({ onSignedOut }: Props) {
             захват→показ p50 {fmt(latency?.captureToDisplayP50 ?? null)} / p95 {fmt(latency?.captureToDisplayP95 ?? null)}{' '}
             мс · захват→приём {fmt(latency?.captureToReceiveP50 ?? null)} мс · приём→показ{' '}
             {fmt(latency?.receiveToDisplayP50 ?? null)} мс · часы ±{fmt(latency?.clockErrorMs ?? null)} мс
+          </div>
+          <div>
+            звук: {soundState === 'playing' ? 'играет' : soundState === 'off' ? 'выключен' : 'ждёт касания'} · захват→выдача p50{' '}
+            {fmt(latency?.audioDelayP50 ?? null)} мс · позже видео на{' '}
+            {fmt(
+              latency?.audioDelayP50 != null && latency.captureToDisplayP50 != null
+                ? latency.audioDelayP50 - latency.captureToDisplayP50
+                : null,
+            )}{' '}
+            мс · {serverStats?.audioKbps ?? '—'} кбит/с
           </div>
           <div>
             потеряно {summary?.packetsLost ?? 0} · NACK {summary?.nackCount ?? 0} · PLI {summary?.pliCount ?? 0} ·
@@ -484,6 +566,12 @@ export function App({ onSignedOut }: Props) {
               Замер ввода
             </button>{' '}
             {probe}
+          </div>
+          <div class="probe">
+            <button onClick={() => void runAvProbe()} title="Нужно окно rcs-bench avsync на сервере">
+              Замер звука
+            </button>{' '}
+            {avProbe}
           </div>
           {agent && (
             <div class="detail">

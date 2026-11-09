@@ -6,6 +6,8 @@ export interface ServerStats {
   estimateKbps: number | null;
   sentKbps: number;
   outKbps: number;
+  /** Opus sent, kbit/s; null from an agent without sound. */
+  audioKbps: number | null;
   /** 0..1 from the browser's reports, null until the first report. */
   loss: number | null;
   rttMs: number | null;
@@ -48,6 +50,7 @@ export function parseServerStats(m: Record<string, unknown>): ServerStats | null
     estimateKbps: num(m['estimate_kbps']),
     sentKbps: sent,
     outKbps: out,
+    audioKbps: num(m['audio_kbps']),
     loss: num(m['loss']),
     rttMs: num(m['rtt_ms']),
     minKbps: min,

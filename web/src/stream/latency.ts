@@ -21,6 +21,8 @@ export interface LatencySummary {
   captureToDisplayP95: number | null;
   captureToReceiveP50: number | null;
   receiveToDisplayP50: number | null;
+  /** Capture -> playout of the sound, from the newest played packet (D-038), added by the page. */
+  audioDelayP50?: number | null;
 }
 
 type Metadata = VideoFrameCallbackMetadata & { captureTime?: number; receiveTime?: number; rtpTimestamp?: number };
