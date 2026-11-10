@@ -11,6 +11,9 @@
 //!
 //! Sound goes the same way as video (D-038): the audio thread hands Opus packets through [`FrameSink::push_audio`],
 //! a queue of eight packets that drops the oldest when full.
+//!
+//! The `clipboard` channel (D-040) carries text both ways in parts: texts from the browser go to the agent's
+//! clipboard thread through [`ClipboardLink`], texts from the clipboard thread wait in a short queue here.
 
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -21,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rcs_protocol::clipboard::{self, Assembler};
 use rcs_protocol::input::{ClientMessage, ParseError, ServerMessage};
 use serde_json::{Value, json};
 use str0m::bwe::{Bitrate, BweKind};
@@ -85,6 +89,25 @@ pub struct Config {
     pub paced_video: bool,
     /// Testing only (P8-1): a narrow link on the way out, see [`LinkTest`].
     pub simulate_link: Option<LinkTest>,
+    /// Where texts from the browser's clipboard go (D-040). Without it the `clipboard` channel is ignored.
+    pub clipboard: Option<ClipboardLink>,
+}
+
+/// The network thread's end of the clipboard (D-040).
+#[derive(Debug, Clone)]
+pub struct ClipboardLink {
+    /// Whole texts from the browser, for the clipboard thread.
+    pub incoming: SyncSender<String>,
+    /// Set while a browser has its `clipboard` channel open: only then is the Windows clipboard read.
+    pub enabled: Arc<AtomicBool>,
+}
+
+/// What the clipboard thread has for the browser.
+#[derive(Debug)]
+enum ClipboardOut {
+    Text(Vec<u8>),
+    Applied(u32),
+    TooLarge(u32),
 }
 
 /// One input message and the media session it came from: a new session number means new `seq` counters.
@@ -172,6 +195,11 @@ pub struct Counters {
     pub audio_bytes_sent: AtomicU64,
     /// Opus packets dropped because the audio queue was full, or nobody was connected.
     pub audio_dropped: AtomicU64,
+    /// Whole texts received from the browser and sent to it; their content is never logged.
+    pub clipboard_in: AtomicU64,
+    pub clipboard_out: AtomicU64,
+    /// Clipboard messages refused: malformed, out of order, not UTF-8, or a full queue.
+    pub clipboard_rejected: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -211,6 +239,7 @@ struct Shared {
     pool: Mutex<Vec<Vec<u8>>>,
     audio_queue: Mutex<VecDeque<AudioPacket>>,
     audio_pool: Mutex<Vec<Vec<u8>>>,
+    clipboard_out: Mutex<VecDeque<ClipboardOut>>,
     keyframe_wanted: AtomicBool,
     connected: AtomicBool,
     /// The active `StreamMode`, for the encoder thread (D-030).
@@ -341,6 +370,34 @@ impl FrameSink {
         self.shared.wake();
     }
 
+    /// A new text from the Windows clipboard for the browser; an older one not yet sent is replaced.
+    pub fn send_clipboard(&self, text: Vec<u8>) {
+        self.queue_clipboard(ClipboardOut::Text(text));
+    }
+
+    /// The browser's text of `total` bytes is now in the Windows clipboard.
+    pub fn clipboard_applied(&self, total: u32) {
+        self.queue_clipboard(ClipboardOut::Applied(total));
+    }
+
+    /// The Windows clipboard holds a text over the limit; the browser is told its size instead.
+    pub fn clipboard_too_large(&self, size: u32) {
+        self.queue_clipboard(ClipboardOut::TooLarge(size));
+    }
+
+    fn queue_clipboard(&self, item: ClipboardOut) {
+        if let Ok(mut queue) = self.shared.clipboard_out.lock() {
+            if matches!(item, ClipboardOut::Text(_) | ClipboardOut::TooLarge(_)) {
+                queue.retain(|q| matches!(q, ClipboardOut::Applied(_)));
+            }
+            queue.push_back(item);
+            while queue.len() > 4 {
+                queue.pop_front();
+            }
+        }
+        self.shared.wake();
+    }
+
     /// True once per request: the browser asked for a keyframe, a session started, or frames were dropped.
     pub fn take_keyframe_request(&self) -> bool {
         self.shared.keyframe_wanted.swap(false, Ordering::Relaxed)
@@ -450,6 +507,7 @@ impl Server {
             pool: Mutex::new(Vec::with_capacity(POOL_BUFFERS)),
             audio_queue: Mutex::new(VecDeque::with_capacity(AUDIO_QUEUE + 1)),
             audio_pool: Mutex::new(Vec::with_capacity(AUDIO_QUEUE * 2)),
+            clipboard_out: Mutex::new(VecDeque::new()),
             keyframe_wanted: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             mode: AtomicU8::new(StreamMode::Game.to_u8()),
@@ -547,6 +605,9 @@ struct Session {
     video: Option<(Mid, Pt)>,
     /// The Opus track, when the browser offered one (D-038).
     audio: Option<(Mid, Pt)>,
+    /// The `clipboard` channel and the text it is receiving (D-040).
+    clipboard: Option<ChannelId>,
+    clipboard_in: Assembler,
     connected: bool,
     /// RTP time 0 of the video stream, see `send_frames`.
     epoch: Instant,
@@ -742,6 +803,7 @@ impl NetworkLoop {
             }
             self.send_frames();
             self.send_audio();
+            self.send_clipboard();
             self.send_cursor();
             self.tick_rate();
             self.sample();
@@ -812,6 +874,8 @@ impl NetworkLoop {
             rtc,
             video: None,
             audio: None,
+            clipboard: None,
+            clipboard_in: Assembler::default(),
             connected: false,
             epoch: now,
             epoch_unix_ms: unix_ms(SystemTime::now()) - now.elapsed().as_secs_f64() * 1000.0,
@@ -842,6 +906,9 @@ impl NetworkLoop {
     }
 
     fn end_session(&mut self, why: &str) {
+        if let Some(link) = &self.config.clipboard {
+            link.enabled.store(false, Ordering::Relaxed);
+        }
         if let Some(mut s) = self.session.take() {
             s.rtc.disconnect();
             info!(why, "session ended");
@@ -972,6 +1039,54 @@ impl NetworkLoop {
                 }
             }
             recycle_audio(&self.shared, packet.data);
+        }
+    }
+
+    /// Sends what the clipboard thread queued, once the browser's `clipboard` channel is open.
+    fn send_clipboard(&mut self) {
+        let Some((session, id)) = self
+            .session
+            .as_mut()
+            .and_then(|s| s.clipboard.map(|id| (s, id)))
+        else {
+            return;
+        };
+        loop {
+            let item = self
+                .shared
+                .clipboard_out
+                .lock()
+                .ok()
+                .and_then(|mut q| q.pop_front());
+            let Some(item) = item else { return };
+            let messages = match item {
+                ClipboardOut::Text(text) => match clipboard::encode_text(&text) {
+                    Ok(m) => {
+                        info!(
+                            bytes = text.len(),
+                            parts = m.len(),
+                            "clipboard to the browser"
+                        );
+                        self.shared
+                            .counters
+                            .clipboard_out
+                            .fetch_add(1, Ordering::Relaxed);
+                        m
+                    }
+                    Err(_) => vec![clipboard::encode_too_large(text.len() as u32)],
+                },
+                ClipboardOut::Applied(total) => vec![clipboard::encode_applied(total)],
+                ClipboardOut::TooLarge(size) => vec![clipboard::encode_too_large(size)],
+            };
+            let Some(mut channel) = session.rtc.channel(id) else {
+                return;
+            };
+            for m in messages {
+                if let Err(e) = channel.write(true, &m) {
+                    debug!(error = %e, "clipboard message not sent");
+                    break;
+                }
+            }
         }
     }
 
@@ -1255,6 +1370,12 @@ fn handle_event(
                 session.position_sent = 0;
             } else if label == INPUT_RELIABLE_CHANNEL {
                 session.input_reliable = Some(id);
+            } else if label == CLIPBOARD_CHANNEL
+                && let Some(link) = &config.clipboard
+            {
+                session.clipboard = Some(id);
+                session.clipboard_in = Assembler::default();
+                link.enabled.store(true, Ordering::Relaxed);
             } else if label == CONTROL_CHANNEL {
                 session.control = Some(id);
                 session.shape_sent = false;
@@ -1306,9 +1427,24 @@ fn handle_event(
             };
             pass_input(shared, input, session.number, parsed);
         }
+        Event::ChannelData(data) if Some(data.id) == session.clipboard => {
+            receive_clipboard(
+                session,
+                shared,
+                config.clipboard.as_ref(),
+                &data.data,
+                data.binary,
+            );
+        }
         Event::ChannelClose(id) => {
             if Some(id) == session.control {
                 session.control = None;
+            }
+            if Some(id) == session.clipboard {
+                session.clipboard = None;
+                if let Some(link) = &config.clipboard {
+                    link.enabled.store(false, Ordering::Relaxed);
+                }
             }
             if Some(id) == session.input_fast || Some(id) == session.input_reliable {
                 if Some(id) == session.input_fast {
@@ -1349,6 +1485,53 @@ fn rate_changed(session: &Session, shared: &Shared, before: u32, can_probe: bool
 const CONTROL_CHANNEL: &str = "control";
 const INPUT_FAST_CHANNEL: &str = "input-fast";
 const INPUT_RELIABLE_CHANNEL: &str = "input-reliable";
+const CLIPBOARD_CHANNEL: &str = "clipboard";
+
+/// One message of the `clipboard` channel: a whole text goes to the clipboard thread. Only sizes are logged.
+fn receive_clipboard(
+    session: &mut Session,
+    shared: &Shared,
+    link: Option<&ClipboardLink>,
+    data: &[u8],
+    binary: bool,
+) {
+    let counters = &shared.counters;
+    let parsed = if binary {
+        clipboard::Message::parse(data)
+    } else {
+        Err(clipboard::ClipboardError::Malformed)
+    };
+    let text = match parsed {
+        Ok(clipboard::Message::Text {
+            total,
+            offset,
+            part,
+        }) => session.clipboard_in.add(total, offset, part),
+        Ok(_) => Err(clipboard::ClipboardError::Malformed),
+        Err(e) => Err(e),
+    };
+    match (text, link) {
+        (Ok(None), _) => {}
+        (Ok(Some(text)), Some(link)) => {
+            let bytes = text.len();
+            match link.incoming.try_send(text) {
+                Ok(()) => {
+                    counters.clipboard_in.fetch_add(1, Ordering::Relaxed);
+                    info!(bytes, "clipboard from the browser");
+                }
+                Err(_) => {
+                    counters.clipboard_rejected.fetch_add(1, Ordering::Relaxed);
+                    warn!(bytes, "clipboard queue full, text dropped");
+                }
+            }
+        }
+        (Ok(Some(_)), None) => {}
+        (Err(e), _) => {
+            counters.clipboard_rejected.fetch_add(1, Ordering::Relaxed);
+            warn!(error = %e, "clipboard message refused");
+        }
+    }
+}
 
 /// Hands a parsed input message to the input thread without waiting, or counts why it could not.
 fn pass_input(
@@ -1595,6 +1778,7 @@ mod tests {
             pool: Mutex::new(Vec::new()),
             audio_queue: Mutex::new(VecDeque::new()),
             audio_pool: Mutex::new(Vec::new()),
+            clipboard_out: Mutex::new(VecDeque::new()),
             keyframe_wanted: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             mode: AtomicU8::new(0),
@@ -1603,6 +1787,25 @@ mod tests {
             wake_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
             rate: RateShared::default(),
         }
+    }
+
+    #[test]
+    fn a_newer_clipboard_text_replaces_one_not_sent_yet() {
+        let sink = FrameSink {
+            shared: Arc::new(shared()),
+        };
+        sink.send_clipboard(b"old".to_vec());
+        sink.clipboard_applied(3);
+        sink.send_clipboard(b"new".to_vec());
+        let queue = sink.shared.clipboard_out.lock().unwrap();
+        let kinds: Vec<String> = queue.iter().map(|q| format!("{q:?}")).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "Applied(3)".to_string(),
+                format!("{:?}", ClipboardOut::Text(b"new".to_vec()))
+            ]
+        );
     }
 
     #[test]
@@ -1715,6 +1918,7 @@ mod tests {
             adaptive: true,
             paced_video: true,
             simulate_link: None,
+            clipboard: None,
         })
         .expect("bind on loopback");
         assert!(server.open("not an sdp".into()).is_err());

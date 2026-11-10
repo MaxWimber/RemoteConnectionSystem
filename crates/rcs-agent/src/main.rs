@@ -4,6 +4,7 @@
 //! on `\\.\pipe\rcs-agent`. UDP listens on loopback unless `--udp` names another address.
 
 mod audio;
+mod clipboard;
 mod cursor;
 mod input;
 mod pipe;
@@ -64,6 +65,8 @@ struct Options {
 
 /// Input messages waiting for the input thread (D-022).
 const INPUT_QUEUE: usize = 1024;
+/// Whole clipboard texts from the browser waiting for the clipboard thread (D-040).
+const CLIPBOARD_QUEUE: usize = 2;
 /// How often the agent logs what it holds (P8-7).
 const RESOURCES_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 /// New pointer shapes waiting for the input thread; a shape changes a few times a second at most.
@@ -280,6 +283,9 @@ fn run(options: Options) -> Result<(), String> {
         })
         .transpose()
         .map_err(|e| format!("--simulate-link: {e}"))?;
+    // Texts from the browser for the clipboard thread (D-040); a second one waits, more are refused.
+    let (clipboard_sender, clipboard_receiver) = sync_channel(CLIPBOARD_QUEUE);
+    let clipboard_enabled = Arc::new(AtomicBool::new(false));
     let server = rcs_webrtc::Server::start(rcs_webrtc::Config {
         bind: options.udp,
         advertise: options.advertise.clone(),
@@ -289,6 +295,10 @@ fn run(options: Options) -> Result<(), String> {
         adaptive: options.adaptive,
         paced_video: options.paced_video,
         simulate_link,
+        clipboard: Some(rcs_webrtc::ClipboardLink {
+            incoming: clipboard_sender,
+            enabled: clipboard_enabled.clone(),
+        }),
     })
     .map_err(|e| format!("UDP {}: {e}", options.udp))?;
     info!(udp = %server.local_addr(), advertise = ?options.advertise, pipe = %options.pipe,
@@ -336,6 +346,13 @@ fn run(options: Options) -> Result<(), String> {
         .then(|| audio::spawn(server.sink(), stop.clone()))
         .transpose()
         .map_err(|e| format!("audio thread: {e}"))?;
+    let clipboard_thread = clipboard::spawn(
+        server.sink(),
+        clipboard_receiver,
+        clipboard_enabled,
+        stop.clone(),
+    )
+    .map_err(|e| format!("clipboard thread: {e}"))?;
     // Memory, handles and video memory every 10 s, for long runs (P8-7).
     let held = Arc::new(Mutex::new(resources::Sample::default()));
     let resources_thread = resources::spawn(RESOURCES_EVERY, held.clone(), stop.clone())
@@ -377,6 +394,7 @@ fn run(options: Options) -> Result<(), String> {
     if let Some(t) = audio_thread {
         let _ = t.join();
     }
+    let _ = clipboard_thread.join();
     let _ = resources_thread.join();
     if let Some(t) = input_thread.lock().ok().and_then(|mut t| t.take()) {
         let _ = t.join();

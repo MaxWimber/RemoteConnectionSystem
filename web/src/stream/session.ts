@@ -3,6 +3,7 @@
 import { ClockSync, sampleFromPong } from './clock';
 import { me } from '../api/auth';
 import { withStereoOpus } from './audio';
+import { ClipboardSync, loadClipboardSharing, saveClipboardSharing } from '../clipboard/sync';
 import { InputChannels } from '../input/channels';
 import { decodeServer, type ServerMessage as CursorMessage } from '../input/protocol';
 import { watchNetwork } from './network';
@@ -32,6 +33,8 @@ export interface SessionEvents {
   cursor?(message: CursorMessage): void;
   /** The agent's rate control, once a second while video plays (D-029). */
   serverStats?(stats: ServerStats): void;
+  /** Something to show the user for a while; empty clears it (D-040). */
+  notice?(text: string): void;
   /** The bitrate limit the server applied, kbit/s. */
   settingsApplied?(maxKbps: number, adaptive: boolean, mode: string): void;
 }
@@ -78,6 +81,8 @@ export class StreamSession {
   private limitKbps: number | null = loadBitrateLimit();
   private modeChoice: StreamMode = loadMode();
   private audioRx: RTCRtpReceiver | null = null;
+  private clipboardOn = loadClipboardSharing();
+  private clipboardSync: ClipboardSync | null = null;
 
   constructor(
     private readonly base: string,
@@ -86,6 +91,36 @@ export class StreamSession {
 
   get peer(): RTCPeerConnection | null {
     return this.pc;
+  }
+
+  /** The shared clipboard of the current connection, while sharing is on and the channel is open (D-040). */
+  get clipboard(): ClipboardSync | null {
+    return this.clipboardSync?.open ? this.clipboardSync : null;
+  }
+
+  get clipboardSharing(): boolean {
+    return this.clipboardOn;
+  }
+
+  /** Turns the shared clipboard on or off for this browser; the channel opens or closes at once. */
+  setClipboardSharing(on: boolean): void {
+    this.clipboardOn = on;
+    saveClipboardSharing(on);
+    if (!on) {
+      this.clipboardSync?.close();
+      this.clipboardSync = null;
+    } else if (this.pc && !this.clipboardSync) {
+      this.openClipboard(this.pc);
+    }
+    this.events.log(`общий буфер обмена ${on ? 'включён' : 'выключен'}`);
+  }
+
+  private openClipboard(pc: RTCPeerConnection): void {
+    const channel = pc.createDataChannel('clipboard', { ordered: true });
+    this.clipboardSync = new ClipboardSync(channel, {
+      notice: (text) => this.events.notice?.(text),
+      log: (m) => this.events.log(m),
+    });
   }
 
   /** The receiver of the sound, for its delay. */
@@ -157,6 +192,7 @@ export class StreamSession {
     this.inputChannels = null;
     this.control = null;
     this.audioRx = null;
+    this.clipboardSync = null;
     this.signaling?.close();
     this.signaling = null;
     this.pc?.close();
@@ -282,6 +318,7 @@ export class StreamSession {
     // The control channel carries the server clock now (PROTOCOL.md) and settings and input from phase 4.
     this.openControl(pc.createDataChannel('control', { ordered: true }));
     this.inputChannels = new InputChannels(pc, (m) => this.events.cursor?.(m));
+    if (this.clipboardOn) this.openClipboard(pc);
     pc.ontrack = (e) => {
       const receiver = e.receiver as RTCRtpReceiver & {
         jitterBufferTarget?: number | null;

@@ -4,9 +4,16 @@
 // Pointer Lock the mouse is relative; otherwise it is absolute over the picture. Keyboard Lock in full screen lets
 // Esc, Alt+Tab and Win reach the server. Leaving the page or losing focus sends ReleaseAll.
 
+import type { ClipboardSync } from '../clipboard/sync';
 import type { InputChannels } from './channels';
 import { buttonOf, contentBox, normalized, takeWhole, wheelUnits } from './pointer';
 import { scancodeFor } from './scancodes';
+
+/** Ctrl+V or Shift+Insert, without Alt: the keys that paste in Windows. */
+export function isPaste(e: Pick<KeyboardEvent, 'code' | 'ctrlKey' | 'shiftKey' | 'altKey' | 'metaKey'>): boolean {
+  if (e.altKey || e.metaKey) return false;
+  return (e.code === 'KeyV' && e.ctrlKey) || (e.code === 'Insert' && e.shiftKey && !e.ctrlKey);
+}
 
 interface KeyboardLock {
   lock(keys?: string[]): Promise<void>;
@@ -22,11 +29,14 @@ export class InputController {
   private keysDown = new Set<number>();
   private buttonsDown = new Set<number>();
   private detachAll: (() => void) | null = null;
+  /** The V or Insert of a paste, held back until the text is on the server; `up` once its release came. */
+  private pasteKey: { scancode: number; up: boolean } | null = null;
 
   constructor(
     private readonly video: HTMLVideoElement,
     private readonly channels: () => InputChannels | null,
     private readonly log: (message: string) => void,
+    private readonly clipboard: () => ClipboardSync | null = () => null,
   ) {}
 
   get pointerLocked(): boolean {
@@ -189,11 +199,57 @@ export class InputController {
     if (target?.closest?.('[data-local-keys]')) return;
     const scancode = scancodeFor(e.code);
     if (scancode === undefined) return;
+    if (this.pasteKey?.scancode === scancode) {
+      // Repeats and the release of a held-back paste key wait for it.
+      e.preventDefault();
+      if (!down) this.pasteKey.up = true;
+      return;
+    }
+    if (down && isPaste(e) && this.clipboard()) {
+      // No preventDefault: the browser fires `paste` with the text, no permission needed (D-040).
+      this.holdPaste(scancode);
+      return;
+    }
     e.preventDefault();
     if (down) this.keysDown.add(scancode);
     else if (!this.keysDown.delete(scancode)) return;
     // Held keys repeat in the browser; Windows does not repeat injected keys, so the repeats are sent too.
     c.send({ type: 'key', down, scancode });
+  }
+
+  /** Sends the browser's clipboard to the server, then the held paste key, so the server pastes the new text. */
+  private holdPaste(scancode: number): void {
+    this.pasteKey = { scancode, up: false };
+    const done = () => {
+      const held = this.pasteKey;
+      this.pasteKey = null;
+      const c = this.channels();
+      if (!held || !c?.open) return;
+      c.send({ type: 'key', down: true, scancode: held.scancode });
+      if (held.up) c.send({ type: 'key', down: false, scancode: held.scancode });
+      else this.keysDown.add(held.scancode);
+    };
+    let settled = false;
+    const onPaste = (e: ClipboardEvent) => {
+      if (settled) return;
+      settled = true;
+      e.preventDefault();
+      const text = e.clipboardData?.getData('text/plain') ?? '';
+      const sync = this.clipboard();
+      if (!text || !sync) {
+        done();
+        return;
+      }
+      void sync.send(text).then(done, done);
+    };
+    window.addEventListener('paste', onPaste, { once: true });
+    // No text in the clipboard, or no paste event at all: the key goes on its own.
+    window.setTimeout(() => {
+      window.removeEventListener('paste', onPaste);
+      if (settled) return;
+      settled = true;
+      done();
+    }, 300);
   }
 
   /** Keyboard Lock only works in full screen: take it there, give it back when leaving. */

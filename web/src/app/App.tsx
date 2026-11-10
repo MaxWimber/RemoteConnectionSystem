@@ -3,6 +3,8 @@ import { logout } from '../api/auth';
 import { FileManager } from '../files/FileManager';
 import { browserQueue, useQueue } from '../files/queue';
 import { InputController } from '../input/controller';
+import { scancodeFor } from '../input/scancodes';
+import { loadClipboardSharing } from '../clipboard/sync';
 import { CursorView } from '../input/cursor';
 import { GamepadPoller } from '../input/gamepads';
 import { ScreenPad } from '../gamepad-ui/screen-pad';
@@ -86,6 +88,7 @@ export function App({ onSignedOut }: Props) {
   const sound = useRef<SoundPlayer | null>(null);
   const [soundState, setSoundState] = useState<SoundState>('waiting');
   const audioDelays = useRef<number[]>([]);
+  const [clipboardOn, setClipboardOn] = useState(() => loadClipboardSharing());
   const gamepads = useRef<GamepadPoller | null>(null);
   const [notice, setNotice] = useState('');
   const screenEl = useRef<HTMLDivElement>(null);
@@ -141,6 +144,10 @@ export function App({ onSignedOut }: Props) {
         audioDelays.current = [];
         player.attach(track);
       },
+      notice: (text) => {
+        setNotice(text);
+        if (text) window.setTimeout(() => setNotice((n) => (n === text ? '' : n)), 8000);
+      },
       signedOut: () => onSignedOut('Сессия завершена: выход, истечение срока или вход с другого устройства.'),
       cursor: (m) => cursor.current?.handle(m),
       serverStats: (st) => {
@@ -159,7 +166,7 @@ export function App({ onSignedOut }: Props) {
     if (video.current) {
       meter.current = new LatencyMeter(video.current, () => s.clock);
       meter.current.start();
-      const controller = new InputController(video.current, () => s.input, logEvent);
+      const controller = new InputController(video.current, () => s.input, logEvent, () => s.clipboard);
       input.current = controller;
       controller.attach();
       // P5-2: a gamepad that the server cannot take is said so, the picture goes on.
@@ -376,6 +383,33 @@ export function App({ onSignedOut }: Props) {
     }
   };
 
+  /** 📋: the phone's clipboard to the server, then Ctrl+V there (D-040). */
+  const pasteToServer = async () => {
+    const sync = session.current?.clipboard;
+    const c = session.current?.input;
+    if (!sync || !c?.open) {
+      setNotice('Буфер обмена недоступен: нет соединения или обмен выключен');
+      return;
+    }
+    let text: string;
+    try {
+      text = await navigator.clipboard.readText();
+    } catch (e) {
+      logEvent(`буфер обмена: чтение: ${String(e)}`);
+      setNotice('Браузер не дал прочитать буфер обмена');
+      return;
+    }
+    if (!text) return;
+    await sync.send(text);
+    const ctrl = scancodeFor('ControlLeft');
+    const v = scancodeFor('KeyV');
+    if (ctrl === undefined || v === undefined) return;
+    c.send({ type: 'key', down: true, scancode: ctrl });
+    c.send({ type: 'key', down: true, scancode: v });
+    c.send({ type: 'key', down: false, scancode: v });
+    c.send({ type: 'key', down: false, scancode: ctrl });
+  };
+
   const reconnect = () => session.current?.start();
   const signOut = async () => {
     input.current?.detach();
@@ -455,6 +489,11 @@ export function App({ onSignedOut }: Props) {
         >
           {soundIcon[soundState]}
         </button>
+        {clipboardOn && (
+          <button onClick={() => void pasteToServer()} title="Вставить текст из буфера обмена на сервер">
+            📋
+          </button>
+        )}
         <button onClick={() => setShowStats(!showStats)} title="Статистика">ℹ</button>
         <button onClick={() => void saveDiagnostics()} title="Скачать диагностику">⤓</button>
         <button onClick={() => void signOut()} title="Выйти">⏻</button>
@@ -566,6 +605,20 @@ export function App({ onSignedOut }: Props) {
               Замер ввода
             </button>{' '}
             {probe}
+          </div>
+          <div class="limit">
+            <label>
+              <input
+                type="checkbox"
+                checked={clipboardOn}
+                onChange={(e) => {
+                  const on = (e.currentTarget as HTMLInputElement).checked;
+                  setClipboardOn(on);
+                  session.current?.setClipboardSharing(on);
+                }}
+              />{' '}
+              общий буфер обмена с сервером (текст до 1 МБ)
+            </label>
           </div>
           <div class="probe">
             <button onClick={() => void runAvProbe()} title="Нужно окно rcs-bench avsync на сервере">
