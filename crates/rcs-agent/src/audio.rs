@@ -90,6 +90,15 @@ fn run(sink: &FrameSink, stop: &AtomicBool) {
                     encode_error = Some(e);
                 }
             });
+            if encode_error.is_none()
+                && let Err(e) = packetizer.fill_silence(Instant::now(), |bytes, captured| {
+                    let mut data = sink.audio_buffer();
+                    data.extend_from_slice(bytes);
+                    sink.push_audio(AudioPacket { data, captured });
+                })
+            {
+                encode_error = Some(e);
+            }
             if let Some(e) = encode_error {
                 warn!(error = %e, "opus encode failed");
             }

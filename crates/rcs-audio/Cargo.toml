@@ -12,3 +12,7 @@ windows.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The `interface` macro of the switch_default example needs the core crate by name.
+windows-core = "0.62"

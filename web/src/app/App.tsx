@@ -449,7 +449,7 @@ export function App({ onSignedOut }: Props) {
           )}
         </button>
         <button
-          onClick={() => sound.current?.setEnabled(soundState === 'off')}
+          onClick={() => sound.current?.setEnabled(soundState !== 'playing')}
           title={soundTitle[soundState]}
           aria-pressed={soundState !== 'off'}
         >

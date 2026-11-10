@@ -283,18 +283,18 @@ export class StreamSession {
     this.openControl(pc.createDataChannel('control', { ordered: true }));
     this.inputChannels = new InputChannels(pc, (m) => this.events.cursor?.(m));
     pc.ontrack = (e) => {
+      const receiver = e.receiver as RTCRtpReceiver & {
+        jitterBufferTarget?: number | null;
+        playoutDelayHint?: number;
+      };
+      // Show frames and play sound as soon as they are decoded (P2-7, D-038).
+      if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = 0;
+      if ('playoutDelayHint' in receiver) receiver.playoutDelayHint = 0;
       if (e.track.kind === 'audio') {
         this.audioRx = e.receiver;
         this.events.audio?.(e.track, e.receiver);
         return;
       }
-      const receiver = e.receiver as RTCRtpReceiver & {
-        jitterBufferTarget?: number | null;
-        playoutDelayHint?: number;
-      };
-      // Show frames as soon as they are decoded (P2-7).
-      if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = 0;
-      if ('playoutDelayHint' in receiver) receiver.playoutDelayHint = 0;
       this.events.stream(e.streams[0] ?? new MediaStream([e.track]));
     };
     pc.onconnectionstatechange = () => {
