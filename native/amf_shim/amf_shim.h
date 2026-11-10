@@ -25,7 +25,8 @@ char* rcs_amf_ull_probe(void* d3d11_device, const RcsAmfProbeOptions* options);
 
 void rcs_amf_free(char* text);
 
-// ---- Encoder: BGRA D3D11 texture -> AMFVideoConverter (NV12, BT.709, limited range) -> AVC encoder -> Annex B.
+// ---- Encoder: BGRA D3D11 texture -> AMFVideoConverter (NV12, BT.709, limited range) -> AVC or HEVC encoder ->
+// Annex B.
 // Every frame stays in video memory: the texture is wrapped with CreateSurfaceFromDX11Native, never mapped.
 
 typedef struct RcsAmfEncoderConfig {
@@ -48,7 +49,10 @@ typedef struct RcsAmfEncoderConfig {
     int32_t vbaq;               // -1 keeps the default, otherwise bool
     int64_t max_au_bits;        // 0 keeps the default, otherwise the largest access unit in bits
     int32_t intra_refresh_mode; // -1 keeps the default; 0 disabled, 1 GOP aligned, 2 continuous
+    int32_t codec;              // RCS_AMF_CODEC_*; the other fields use the AVC values, the shim maps them for HEVC
 } RcsAmfEncoderConfig;
+
+enum { RCS_AMF_CODEC_AVC = 0, RCS_AMF_CODEC_HEVC = 1 };
 
 typedef struct RcsAmfSubmitInfo {
     double convert_ms;      // CPU time from converter submit to its NV12 output

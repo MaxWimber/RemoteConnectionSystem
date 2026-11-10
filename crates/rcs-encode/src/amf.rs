@@ -76,7 +76,12 @@ pub struct EncoderConfig {
     pub max_au_bits: i64,
     /// -1 keeps the default (disabled on the server); 0 disabled, 1 GOP aligned, 2 continuous.
     pub intra_refresh_mode: i32,
+    /// `CODEC_AVC` or `CODEC_HEVC` (P9-3). The other fields take the AVC values; the shim maps them for HEVC.
+    pub codec: i32,
 }
+
+pub const CODEC_AVC: i32 = 0;
+pub const CODEC_HEVC: i32 = 1;
 
 pub const USAGE_TRANSCODING: i32 = 0;
 pub const USAGE_LOW_LATENCY: i32 = 2;
@@ -117,6 +122,7 @@ impl EncoderConfig {
             vbaq: -1,
             max_au_bits: 0,
             intra_refresh_mode: -1,
+            codec: CODEC_AVC,
         }
     }
 }

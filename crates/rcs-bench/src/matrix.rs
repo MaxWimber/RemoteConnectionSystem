@@ -168,6 +168,47 @@ fn variants(fps: i32) -> Vec<Variant> {
             "Режим «Рабочий стол»: 40 Мбит/с",
             &|c| c.bitrate = mbps(40),
         ),
+        // P9-3: the same settings in H.264 and HEVC at the bitrates of a narrow link, for SSIM at equal bitrate.
+        with("avc_2", "H.264, 2 Мбит/с", &|c| c.bitrate = mbps(2)),
+        with("hevc_2", "HEVC, 2 Мбит/с", &|c| {
+            c.codec = amf::CODEC_HEVC;
+            c.bitrate = mbps(2);
+        }),
+        with("avc_5", "H.264, 5 Мбит/с", &|c| c.bitrate = mbps(5)),
+        with("hevc_5", "HEVC, 5 Мбит/с", &|c| {
+            c.codec = amf::CODEC_HEVC;
+            c.bitrate = mbps(5);
+        }),
+        with("avc_10", "H.264, 10 Мбит/с", &|c| c.bitrate = mbps(10)),
+        with("hevc_10", "HEVC, 10 Мбит/с", &|c| {
+            c.codec = amf::CODEC_HEVC;
+            c.bitrate = mbps(10);
+        }),
+        with("avc_720p_2", "H.264, 1280×720, 2 Мбит/с", &|c| {
+            c.width = 1280;
+            c.height = 720;
+            c.bitrate = mbps(2);
+        }),
+        with("avc_720p_3", "H.264, 1280×720, 3 Мбит/с", &|c| {
+            c.width = 1280;
+            c.height = 720;
+            c.bitrate = mbps(3);
+        }),
+        with("hevc_720p_2", "HEVC, 1280×720, 2 Мбит/с", &|c| {
+            c.codec = amf::CODEC_HEVC;
+            c.width = 1280;
+            c.height = 720;
+            c.bitrate = mbps(2);
+        }),
+        with("hevc_720p_3", "HEVC, 1280×720, 3 Мбит/с", &|c| {
+            c.codec = amf::CODEC_HEVC;
+            c.width = 1280;
+            c.height = 720;
+            c.bitrate = mbps(3);
+        }),
+        with("hevc_30", "HEVC, 30 Мбит/с, как baseline", &|c| {
+            c.codec = amf::CODEC_HEVC
+        }),
         with(
             "mode_weak_720p_10",
             "Режим «Слабая сеть»: 1280×720, 10 Мбит/с",
@@ -497,9 +538,15 @@ fn measure_quality(
     } else {
         String::new()
     };
+    // AMF writes no colour description into HEVC (P9-3): without one ffmpeg would convert with BT.601.
+    let tag = if config.codec == amf::CODEC_HEVC {
+        "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,"
+    } else {
+        ""
+    };
     // Both sides get frame numbers as timestamps, so frame i of the stream meets frame i of the clip.
     let graph = format!(
-        "[0:v]settb=1/60,setpts=N,format=bgra,format=gbrp,split[a1][a2];\
+        "[0:v]{tag}settb=1/60,setpts=N,format=bgra,format=gbrp,split[a1][a2];\
          [1:v]trim=end_frame={frames},settb=1/60,setpts=N,{scale}format=bgra,format=gbrp,split[b1][b2];\
          [a1][b1]ssim=stats_file=ssim.log;[a2][b2]psnr=stats_file=psnr.log"
     );
@@ -593,7 +640,12 @@ pub fn run(options: &Options) -> Result<(), String> {
                     continue;
                 }
             };
-            let stream_path = dir.join("stream.h264");
+            let extension = if variant.config.codec == amf::CODEC_HEVC {
+                "hevc"
+            } else {
+                "h264"
+            };
+            let stream_path = dir.join(format!("stream.{extension}"));
             fs::write(&stream_path, &stream)
                 .map_err(|e| format!("cannot write {}: {e}", stream_path.display()))?;
             let quality =
@@ -611,7 +663,7 @@ pub fn run(options: &Options) -> Result<(), String> {
                     "profile": c.profile, "rate_control": c.rate_control, "quality_preset": c.quality_preset,
                     "vbv_bits": c.vbv_bits, "enforce_hrd": c.enforce_hrd, "filler_data": c.filler_data,
                     "intra_refresh_mbs": c.intra_refresh_mbs, "intra_refresh_mode": c.intra_refresh_mode, "vbaq": c.vbaq, "max_au_bits": c.max_au_bits,
-                    "query_timeout_ms": c.query_timeout_ms,
+                    "query_timeout_ms": c.query_timeout_ms, "codec": c.codec,
                 },
                 "encoder_settings": settings,
                 "frames": {

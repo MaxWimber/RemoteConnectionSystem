@@ -1,4 +1,5 @@
-// Encoder for the pipeline: BGRA D3D11 texture -> AMFVideoConverter -> AVC encoder -> Annex B packets.
+// Encoder for the pipeline: BGRA D3D11 texture -> AMFVideoConverter -> AVC or HEVC encoder -> Annex B packets.
+// HEVC (P9-3) takes the same configuration: its own property names, and the AVC enum values mapped to its own.
 // The frame never leaves video memory: textures are wrapped with CreateSurfaceFromDX11Native and never mapped.
 
 #include "amf_shim.h"
@@ -16,6 +17,7 @@
 
 #include "components/ColorSpace.h"
 #include "components/VideoConverter.h"
+#include "components/VideoEncoderHEVC.h"
 #include "components/VideoEncoderVCE.h"
 #include "core/Factory.h"
 #include "core/Trace.h"
@@ -70,6 +72,55 @@ const Readback kEncoderReadback[] = {
     {"full_range", AMF_VIDEO_ENCODER_FULL_RANGE_COLOR},
 };
 
+const Readback kHevcReadback[] = {
+    {"usage", AMF_VIDEO_ENCODER_HEVC_USAGE},
+    {"profile", AMF_VIDEO_ENCODER_HEVC_PROFILE},
+    {"tier", AMF_VIDEO_ENCODER_HEVC_TIER},
+    {"profile_level", AMF_VIDEO_ENCODER_HEVC_PROFILE_LEVEL},
+    {"quality_preset", AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET},
+    {"rate_control_method", AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD},
+    {"target_bitrate", AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE},
+    {"peak_bitrate", AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE},
+    {"vbv_buffer_size", AMF_VIDEO_ENCODER_HEVC_VBV_BUFFER_SIZE},
+    {"frame_rate", AMF_VIDEO_ENCODER_HEVC_FRAMERATE},
+    {"gop_size", AMF_VIDEO_ENCODER_HEVC_GOP_SIZE},
+    {"gops_per_idr", AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR},
+    {"header_insertion_mode", AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE},
+    {"low_latency_mode", AMF_VIDEO_ENCODER_HEVC_LOWLATENCY_MODE},
+    {"max_num_ref_frames", AMF_VIDEO_ENCODER_HEVC_MAX_NUM_REFRAMES},
+    {"enforce_hrd", AMF_VIDEO_ENCODER_HEVC_ENFORCE_HRD},
+    {"filler_data", AMF_VIDEO_ENCODER_HEVC_FILLER_DATA_ENABLE},
+    {"vbaq", AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ},
+    {"max_au_size", AMF_VIDEO_ENCODER_HEVC_MAX_AU_SIZE},
+    {"query_timeout", AMF_VIDEO_ENCODER_HEVC_QUERY_TIMEOUT},
+    {"output_color_profile", AMF_VIDEO_ENCODER_HEVC_OUTPUT_COLOR_PROFILE},
+    {"output_transfer", AMF_VIDEO_ENCODER_HEVC_OUTPUT_TRANSFER_CHARACTERISTIC},
+    {"output_primaries", AMF_VIDEO_ENCODER_HEVC_OUTPUT_COLOR_PRIMARIES},
+    {"full_range", AMF_VIDEO_ENCODER_HEVC_NOMINAL_RANGE},
+};
+
+// AVC enum values of the configuration to the HEVC ones; -1 when HEVC has no such value.
+amf_int64 hevc_rate_control(int32_t avc) {
+    switch (avc) {
+        case AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CONSTANT_QP: return AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CONSTANT_QP;
+        case AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR: return AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR;
+        case AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR:
+            return AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR;
+        case AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR:
+            return AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR;
+        default: return -1;
+    }
+}
+
+amf_int64 hevc_quality_preset(int32_t avc) {
+    switch (avc) {
+        case AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED: return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED;
+        case AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED: return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED;
+        case AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY: return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY;
+        default: return -1;
+    }
+}
+
 const Readback kConverterReadback[] = {
     {"output_format", AMF_VIDEO_CONVERTER_OUTPUT_FORMAT},
     {"memory_type", AMF_VIDEO_CONVERTER_MEMORY_TYPE},
@@ -107,7 +158,10 @@ struct RcsAmfEncoder {
         return false;
     }
 
+    bool hevc() const { return config.codec == RCS_AMF_CODEC_HEVC; }
     bool start(ID3D11Device* device, const RcsAmfEncoderConfig& c);
+    bool start_avc(const RcsAmfEncoderConfig& c);
+    bool start_hevc(const RcsAmfEncoderConfig& c);
     amf::AMFSurface* wrap(void* texture, AMF_RESULT& r);
 };
 
@@ -166,8 +220,14 @@ bool RcsAmfEncoder::start(ID3D11Device* device, const RcsAmfEncoderConfig& c) {
     if ((r = converter->Init(amf::AMF_SURFACE_BGRA, c.input_width, c.input_height)) != AMF_OK)
         return fail("converter Init", r);
 
-    if ((r = factory->CreateComponent(context, AMFVideoEncoderVCE_AVC, &encoder)) != AMF_OK)
-        return fail("create encoder", r);
+    if (!(c.codec == RCS_AMF_CODEC_HEVC ? start_hevc(c) : start_avc(c))) return false;
+    if ((r = encoder->Init(amf::AMF_SURFACE_NV12, c.width, c.height)) != AMF_OK) return fail("encoder Init", r);
+    return true;
+}
+
+bool RcsAmfEncoder::start_avc(const RcsAmfEncoderConfig& c) {
+    AMF_RESULT r = factory->CreateComponent(context, AMFVideoEncoderVCE_AVC, &encoder);
+    if (r != AMF_OK) return fail("create encoder", r);
     // Usage first: it resets every other property to the defaults of that usage.
     if (!set(this, encoder, AMF_VIDEO_ENCODER_USAGE, static_cast<amf_int64>(c.usage)) ||
         !set(this, encoder, AMF_VIDEO_ENCODER_PROFILE, static_cast<amf_int64>(c.profile)) ||
@@ -207,7 +267,53 @@ bool RcsAmfEncoder::start(ID3D11Device* device, const RcsAmfEncoderConfig& c) {
     if (c.enforce_hrd >= 0 && !set(this, encoder, AMF_VIDEO_ENCODER_ENFORCE_HRD, c.enforce_hrd != 0)) return false;
     if (c.filler_data >= 0 && !set(this, encoder, AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE, c.filler_data != 0))
         return false;
-    if ((r = encoder->Init(amf::AMF_SURFACE_NV12, c.width, c.height)) != AMF_OK) return fail("encoder Init", r);
+    return true;
+}
+
+bool RcsAmfEncoder::start_hevc(const RcsAmfEncoderConfig& c) {
+    AMF_RESULT r = factory->CreateComponent(context, AMFVideoEncoder_HEVC, &encoder);
+    if (r != AMF_OK) return fail("create HEVC encoder", r);
+    amf_int64 rate_control = hevc_rate_control(c.rate_control);
+    if (rate_control < 0) return fail("rate control has no HEVC equivalent", AMF_INVALID_ARG);
+    // Usage first, as for AVC. Main profile, Main tier: 8-bit 4:2:0 like the NV12 from the converter. No B-frames on
+    // this hardware for HEVC; every IDR carries VPS, SPS and PPS.
+    if (!set(this, encoder, AMF_VIDEO_ENCODER_HEVC_USAGE, static_cast<amf_int64>(c.usage)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_PROFILE, static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_TIER, static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_TIER_MAIN)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD, rate_control) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, static_cast<amf_int64>(c.bitrate)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE, static_cast<amf_int64>(c.bitrate)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_FRAMERATE, ::AMFConstructRate(static_cast<amf_uint32>(c.fps), 1)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, static_cast<amf_int64>(c.idr_period)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, static_cast<amf_int64>(1)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE,
+             static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_IDR_ALIGNED)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_QUERY_TIMEOUT, static_cast<amf_int64>(c.query_timeout_ms)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_OUTPUT_COLOR_PROFILE,
+             static_cast<amf_int64>(AMF_VIDEO_CONVERTER_COLOR_PROFILE_709)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_OUTPUT_TRANSFER_CHARACTERISTIC,
+             static_cast<amf_int64>(AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_OUTPUT_COLOR_PRIMARIES,
+             static_cast<amf_int64>(AMF_COLOR_PRIMARIES_BT709)) ||
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_NOMINAL_RANGE,
+             static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_NOMINAL_RANGE_STUDIO)))
+        return false;
+    if (c.vbv_bits > 0 &&
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_VBV_BUFFER_SIZE, static_cast<amf_int64>(c.vbv_bits)))
+        return false;
+    if (c.quality_preset >= 0) {
+        amf_int64 preset = hevc_quality_preset(c.quality_preset);
+        if (preset < 0) return fail("quality preset has no HEVC equivalent", AMF_INVALID_ARG);
+        if (!set(this, encoder, AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET, preset)) return false;
+    }
+    if (c.vbaq >= 0 && !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ, c.vbaq != 0)) return false;
+    if (c.max_au_bits > 0 &&
+        !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_MAX_AU_SIZE, static_cast<amf_int64>(c.max_au_bits)))
+        return false;
+    if (c.enforce_hrd >= 0 && !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_ENFORCE_HRD, c.enforce_hrd != 0))
+        return false;
+    if (c.filler_data >= 0 && !set(this, encoder, AMF_VIDEO_ENCODER_HEVC_FILLER_DATA_ENABLE, c.filler_data != 0))
+        return false;
     return true;
 }
 
@@ -268,7 +374,11 @@ extern "C" int32_t rcs_amf_encoder_submit(RcsAmfEncoder* e, void* d3d11_texture,
         info->convert_ms = now_ms() - t0;
         info->output_memory = converted->GetMemoryType();
         converted->SetPts(pts);
-        if (force_idr) {
+        if (force_idr && e->hevc()) {
+            converted->SetProperty(AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE,
+                                   static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_PICTURE_TYPE_IDR));
+            converted->SetProperty(AMF_VIDEO_ENCODER_HEVC_INSERT_HEADER, true);
+        } else if (force_idr) {
             converted->SetProperty(AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE,
                                    static_cast<amf_int64>(AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR));
             converted->SetProperty(AMF_VIDEO_ENCODER_INSERT_SPS, true);
@@ -321,7 +431,9 @@ extern "C" int32_t rcs_amf_encoder_query(RcsAmfEncoder* e, RcsAmfPacket* packet)
         packet->pts = e->current->GetPts();
         packet->memory = e->current->GetMemoryType();
         amf::AMFVariant type;
-        packet->output_type = e->current->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &type) == AMF_OK
+        // Both enums put IDR first, so 0 means IDR for either codec.
+        const wchar_t* type_name = e->hevc() ? AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE : AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE;
+        packet->output_type = e->current->GetProperty(type_name, &type) == AMF_OK
                                   ? static_cast<int32_t>(type.int64Value)
                                   : -1;
         return RCS_AMF_OK;
@@ -332,8 +444,10 @@ extern "C" int32_t rcs_amf_encoder_query(RcsAmfEncoder* e, RcsAmfPacket* packet)
 }
 
 extern "C" int32_t rcs_amf_encoder_set_bitrate(RcsAmfEncoder* e, int64_t bitrate) {
-    AMF_RESULT r = e->encoder->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, static_cast<amf_int64>(bitrate));
-    if (r == AMF_OK) r = e->encoder->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, static_cast<amf_int64>(bitrate));
+    const wchar_t* target = e->hevc() ? AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE : AMF_VIDEO_ENCODER_TARGET_BITRATE;
+    const wchar_t* peak = e->hevc() ? AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE : AMF_VIDEO_ENCODER_PEAK_BITRATE;
+    AMF_RESULT r = e->encoder->SetProperty(target, static_cast<amf_int64>(bitrate));
+    if (r == AMF_OK) r = e->encoder->SetProperty(peak, static_cast<amf_int64>(bitrate));
     if (r != AMF_OK) return e->fail("set bitrate", r), RCS_AMF_ERROR;
     return RCS_AMF_OK;
 }
@@ -345,10 +459,16 @@ extern "C" char* rcs_amf_encoder_settings(RcsAmfEncoder* e) {
         Json j;
         j.begin_object();
         j.string("runtime_version", e->runtime_version);
+        j.string("codec", e->hevc() ? "hevc" : "avc");
         j.begin_object("encoder");
-        for (const Readback& item : kEncoderReadback) {
+        auto read = [&](const Readback& item) {
             amf::AMFVariant value;
             if (e->encoder->GetProperty(item.name, &value) == AMF_OK) variant(j, item.key, value);
+        };
+        if (e->hevc()) {
+            for (const Readback& item : kHevcReadback) read(item);
+        } else {
+            for (const Readback& item : kEncoderReadback) read(item);
         }
         j.end_object();
         j.begin_object("converter");
