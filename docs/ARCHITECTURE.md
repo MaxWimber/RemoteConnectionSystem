@@ -155,6 +155,7 @@ crates/
   rcs-encode/      трейт Encoder, бэкенды amf и mf
   rcs-input/       трейты InputSink и GamepadBackend, реализации SendInput и ViGEm
   rcs-audio/       WASAPI loopback и кодирование Opus (libopus через крейт opus)
+  rcs-wt/          опыт P9-4: видео по WebTransport (wtransport), только за флагом агента
   rcs-webrtc/      обёртка над выбранной WebRTC-библиотекой
   rcs-agent/       сборка конвейера, сессия WebRTC, поток ввода
   rcs-web/         axum, авторизация, сигналинг, файлы

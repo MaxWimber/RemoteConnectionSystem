@@ -11,6 +11,7 @@ mod pipe;
 mod pipeline;
 mod recovery;
 mod resources;
+mod webtransport;
 
 use std::fs::{self, OpenOptions};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -34,6 +35,8 @@ Usage: rcs-agent [--udp ADDR] [--advertise ADDR,ADDR] [--pipe NAME] [--log DIR]
                  [--simulate-link S:MBPS,S:MBPS] [--simulate-link-queue-ms MS] [--simulate-link-loss PERCENT]
                                                        testing only: a narrow link on the way out, rates repeat
                  [--simulate-amf-failure FRAMES]       testing only: every AMF encoder fails after FRAMES frames
+                 [--webtransport 127.0.0.1:PORT] [--webtransport-url-port PORT]
+                                                       experiment (P9-4): video over WebTransport on loopback
   --rate       adaptive (default) follows the network between the minimum and maximum bitrate (D-027); fixed
                keeps --bitrate-mbps
   --pacing     paced (default) lets video out at 1.1 x the estimate; unpaced sends each frame at once (P8-5)
@@ -61,6 +64,8 @@ struct Options {
     input: input::Mode,
     audio: bool,
     stop_event: Option<String>,
+    webtransport: Option<SocketAddr>,
+    webtransport_url_port: Option<u16>,
 }
 
 /// Input messages waiting for the input thread (D-022).
@@ -93,6 +98,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         input: input::Mode::Record,
         audio: true,
         stop_event: None,
+        webtransport: None,
+        webtransport_url_port: None,
         pipeline: pipeline::Config {
             display: 0,
             backend: Backend::Auto,
@@ -134,6 +141,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
                     _ => return Err(format!("{flag}: on or off")),
                 }
             }
+            "--webtransport" => {
+                options.webtransport = Some(value.parse().map_err(|e| format!("{flag}: {e}"))?)
+            }
+            "--webtransport-url-port" => options.webtransport_url_port = Some(number()? as u16),
             "--log" => options.log = PathBuf::from(value),
             "--encoder" => {
                 options.pipeline.backend =
@@ -286,6 +297,21 @@ fn run(options: Options) -> Result<(), String> {
     // Texts from the browser for the clipboard thread (D-040); a second one waits, more are refused.
     let (clipboard_sender, clipboard_receiver) = sync_channel(CLIPBOARD_QUEUE);
     let clipboard_enabled = Arc::new(AtomicBool::new(false));
+    // The experimental path needs the sink for its hooks; the sink exists once the media server started.
+    let late_sink = Arc::new(std::sync::OnceLock::new());
+    let alt_video = options
+        .webtransport
+        .map(|bind| {
+            webtransport::start(
+                bind,
+                options.webtransport_url_port,
+                options.rate,
+                late_sink.clone(),
+            )
+        })
+        .transpose()
+        .map_err(|e| format!("--webtransport: {e}"))?
+        .map(|w| w as Arc<dyn rcs_webrtc::AltVideo>);
     let server = rcs_webrtc::Server::start(rcs_webrtc::Config {
         bind: options.udp,
         advertise: options.advertise.clone(),
@@ -299,8 +325,10 @@ fn run(options: Options) -> Result<(), String> {
             incoming: clipboard_sender,
             enabled: clipboard_enabled.clone(),
         }),
+        alt_video,
     })
     .map_err(|e| format!("UDP {}: {e}", options.udp))?;
+    let _ = late_sink.set(server.sink());
     info!(udp = %server.local_addr(), advertise = ?options.advertise, pipe = %options.pipe,
         input = options.input.name(), audio = options.audio, adaptive = options.adaptive, paced_video = options.paced_video,
         min_kbps = options.rate.min_bps / 1000, max_kbps = options.rate.max_bps / 1000, "agent started");

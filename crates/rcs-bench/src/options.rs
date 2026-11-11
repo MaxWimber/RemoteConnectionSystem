@@ -30,6 +30,13 @@ pub struct Options {
     pub scenarios: Vec<String>,
     /// Folder with ffmpeg.exe and ffplay.exe when they are not on PATH.
     pub ffmpeg_dir: Option<PathBuf>,
+    /// netsim (P9-4): where the browser sends, where the agent listens, and what spoils the way back.
+    pub listen: Option<String>,
+    pub to: Option<String>,
+    pub link: Option<String>,
+    pub link_queue_ms: u64,
+    pub link_loss: f64,
+    pub outage: Option<String>,
 }
 
 impl Default for Options {
@@ -56,6 +63,12 @@ impl Default for Options {
             kind: None,
             scenarios: Vec::new(),
             ffmpeg_dir: None,
+            listen: None,
+            to: None,
+            link: None,
+            link_queue_ms: 200,
+            link_loss: 0.0,
+            outage: None,
         }
     }
 }
@@ -110,6 +123,14 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                     .collect()
             }
             "--ffmpeg-dir" => options.ffmpeg_dir = Some(PathBuf::from(value)),
+            "--listen" => options.listen = Some(value.clone()),
+            "--to" => options.to = Some(value.clone()),
+            "--link" => options.link = Some(value.clone()),
+            "--link-queue-ms" => options.link_queue_ms = positive(flag, number()?)?.max(1) as u64,
+            "--link-loss" => {
+                options.link_loss = value.parse().map_err(|_| format!("{flag}: percent"))?
+            }
+            "--outage" => options.outage = Some(value.clone()),
             _ => return Err(format!("Unknown option: {flag}")),
         }
     }

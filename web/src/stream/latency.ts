@@ -6,6 +6,7 @@
 // not included.
 
 import { captureTimeFromRtp, type ClockSync } from './clock';
+import { recordShown } from './display-log';
 
 export interface FrameTimes {
   captureToReceive: number | null;
@@ -80,7 +81,9 @@ export class LatencyMeter {
   start(): void {
     if (this.handle !== null || !('requestVideoFrameCallback' in this.video)) return;
     const tick = (_now: number, metadata: VideoFrameCallbackMetadata) => {
-      this.frames.push(frameTimes(metadata as Metadata, this.clock()));
+      const times = frameTimes(metadata as Metadata, this.clock());
+      this.frames.push(times);
+      recordShown(metadata.expectedDisplayTime, times.captureToDisplay, 'webrtc');
       if (this.frames.length > this.window) this.frames.splice(0, this.frames.length - this.window);
       this.handle = this.video.requestVideoFrameCallback(tick);
     };

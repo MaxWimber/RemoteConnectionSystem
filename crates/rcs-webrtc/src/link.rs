@@ -72,7 +72,7 @@ impl LinkTest {
     }
 }
 
-pub(crate) struct Shaper {
+pub struct Shaper {
     test: LinkTest,
     started: Instant,
     queue: VecDeque<(Instant, Vec<u8>, SocketAddr)>,
@@ -82,7 +82,7 @@ pub(crate) struct Shaper {
 }
 
 impl Shaper {
-    pub(crate) fn new(test: LinkTest, now: Instant) -> Self {
+    pub fn new(test: LinkTest, now: Instant) -> Self {
         Self {
             test,
             started: now,
@@ -103,7 +103,7 @@ impl Shaper {
     }
 
     /// Takes a datagram into the queue, or returns false when the queue is full and it is dropped.
-    pub(crate) fn offer(&mut self, now: Instant, data: &[u8], to: SocketAddr) -> bool {
+    pub fn offer(&mut self, now: Instant, data: &[u8], to: SocketAddr) -> bool {
         if self.test.loss > 0.0 && self.uniform() < self.test.loss {
             return false;
         }
@@ -119,7 +119,7 @@ impl Shaper {
     }
 
     /// The next datagram whose time has come.
-    pub(crate) fn due(&mut self, now: Instant) -> Option<(Vec<u8>, SocketAddr)> {
+    pub fn due(&mut self, now: Instant) -> Option<(Vec<u8>, SocketAddr)> {
         if self.queue.front().is_some_and(|f| f.0 <= now) {
             self.queue.pop_front().map(|(_, d, to)| (d, to))
         } else {
@@ -127,7 +127,7 @@ impl Shaper {
         }
     }
 
-    pub(crate) fn next(&self) -> Option<Instant> {
+    pub fn next(&self) -> Option<Instant> {
         self.queue.front().map(|f| f.0)
     }
 }

@@ -42,8 +42,8 @@ mod mode;
 mod rate;
 mod timing;
 
-pub use link::LinkTest;
-use link::Shaper;
+pub use link::{LinkTest, Shaper};
+
 use mode::ModeControl;
 pub use mode::StreamMode;
 pub use rate::{RateControl, RateLimits};
@@ -91,6 +91,24 @@ pub struct Config {
     pub simulate_link: Option<LinkTest>,
     /// Where texts from the browser's clipboard go (D-040). Without it the `clipboard` channel is ignored.
     pub clipboard: Option<ClipboardLink>,
+    /// Experimental video path (P9-4, D-043): when the browser asks for it, frames go there instead of RTP.
+    pub alt_video: Option<Arc<dyn AltVideo>>,
+}
+
+/// A video path beside WebRTC (P9-4, D-043), offered in `hello` and switched on by the browser.
+pub trait AltVideo: Send + Sync {
+    /// What `hello` tells the browser, with a fresh one-time token, or `None` when it cannot be offered.
+    fn offer(&self) -> Option<Value>;
+    /// Takes a frame without waiting; false when it was dropped.
+    fn push(&self, data: Vec<u8>, captured_unix_us: u64, keyframe: bool) -> bool;
+    /// Whether a browser is connected to it now.
+    fn connected(&self) -> bool;
+}
+
+impl std::fmt::Debug for dyn AltVideo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AltVideo")
+    }
 }
 
 /// The network thread's end of the clipboard (D-040).
@@ -195,6 +213,9 @@ pub struct Counters {
     pub audio_bytes_sent: AtomicU64,
     /// Opus packets dropped because the audio queue was full, or nobody was connected.
     pub audio_dropped: AtomicU64,
+    /// Frames handed to the experimental video path, and dropped there (P9-4).
+    pub alt_frames: AtomicU64,
+    pub alt_dropped: AtomicU64,
     /// Whole texts received from the browser and sent to it; their content is never logged.
     pub clipboard_in: AtomicU64,
     pub clipboard_out: AtomicU64,
@@ -248,6 +269,10 @@ struct Shared {
     waker: UdpSocket,
     wake_target: SocketAddr,
     rate: RateShared,
+    /// The experimental video path's own bitrate (P9-4); 0 while it is not in use.
+    target_override: AtomicU32,
+    /// Set while the video of the session goes over the experimental path: only then does its bitrate count.
+    alt_on: AtomicBool,
 }
 
 /// What the rate control decided, for the encoder thread and the statistics; 0 means not known yet.
@@ -410,7 +435,20 @@ impl FrameSink {
 
     /// The bitrate the encoder should use now (D-027). Cheap: one atomic load.
     pub fn target_bitrate(&self) -> u32 {
-        self.shared.rate.target_bps.load(Ordering::Relaxed)
+        match self.shared.target_override.load(Ordering::Relaxed) {
+            v if v > 0 && self.shared.alt_on.load(Ordering::Relaxed) => v,
+            _ => self.shared.rate.target_bps.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The experimental video path sets its own bitrate while it carries the video; 0 gives it back (P9-4).
+    pub fn set_target_override(&self, bps: u32) {
+        self.shared.target_override.store(bps, Ordering::Relaxed);
+    }
+
+    /// Asks the encoder for an IDR.
+    pub fn request_keyframe(&self) {
+        self.shared.keyframe_wanted.store(true, Ordering::Relaxed);
     }
 
     /// Whether a browser is connected and frames are worth encoding.
@@ -439,7 +477,9 @@ impl FrameSink {
 /// A std socket cannot tell the real destination, so with a wildcard bind it is inferred from the source:
 /// loopback for loopback senders, else the advertised address of the same family that is not loopback.
 fn destination_for(local: SocketAddr, advertise: &[SocketAddr], source: SocketAddr) -> SocketAddr {
-    if !local.ip().is_unspecified() {
+    // A specific bind that is also a candidate is the destination. Behind a go-between (`rcs-bench netsim`, P9-4) the
+    // candidate is its address instead, and the datagram counts as sent there.
+    if !local.ip().is_unspecified() && (advertise.is_empty() || advertise.contains(&local)) {
         return local;
     }
     let loopback = source.ip().is_loopback();
@@ -515,6 +555,8 @@ impl Server {
             wake_target: SocketAddr::from((Ipv4Addr::LOCALHOST, local.port())),
             waker,
             rate: RateShared::default(),
+            target_override: AtomicU32::new(0),
+            alt_on: AtomicBool::new(false),
         });
         shared.rate.publish(&RateControl::new(config.rate));
         let (commands, receiver) = sync_channel(8);
@@ -608,6 +650,8 @@ struct Session {
     /// The `clipboard` channel and the text it is receiving (D-040).
     clipboard: Option<ChannelId>,
     clipboard_in: Assembler,
+    /// The browser takes video over the experimental path (P9-4).
+    alt_active: bool,
     connected: bool,
     /// RTP time 0 of the video stream, see `send_frames`.
     epoch: Instant,
@@ -876,6 +920,7 @@ impl NetworkLoop {
             audio: None,
             clipboard: None,
             clipboard_in: Assembler::default(),
+            alt_active: false,
             connected: false,
             epoch: now,
             epoch_unix_ms: unix_ms(SystemTime::now()) - now.elapsed().as_secs_f64() * 1000.0,
@@ -909,6 +954,8 @@ impl NetworkLoop {
         if let Some(link) = &self.config.clipboard {
             link.enabled.store(false, Ordering::Relaxed);
         }
+        self.shared.target_override.store(0, Ordering::Relaxed);
+        self.shared.alt_on.store(false, Ordering::Relaxed);
         if let Some(mut s) = self.session.take() {
             s.rtc.disconnect();
             info!(why, "session ended");
@@ -933,6 +980,23 @@ impl NetworkLoop {
                 .as_ref()
                 .and_then(|s| s.connected.then_some(s.video).flatten());
             let counters = &self.shared.counters;
+            if let (Some(alt), Some(session)) =
+                (self.config.alt_video.as_ref(), self.session.as_ref())
+                && session.connected
+                && session.alt_active
+                && alt.connected()
+            {
+                let captured_unix_us = SystemTime::now()
+                    .checked_sub(frame.captured.elapsed())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_micros() as u64);
+                counters.alt_frames.fetch_add(1, Ordering::Relaxed);
+                if !alt.push(frame.data, captured_unix_us, frame.keyframe) {
+                    counters.alt_dropped.fetch_add(1, Ordering::Relaxed);
+                    self.shared.keyframe_wanted.store(true, Ordering::Relaxed);
+                }
+                continue;
+            }
             match (self.session.as_mut(), ready) {
                 (Some(session), Some((mid, pt))) => {
                     let rtp_time = MediaTime::from_90khz(
@@ -1384,6 +1448,7 @@ fn handle_event(
                     "protocol": 1,
                     "codec": "h264",
                     "audio": session.audio.is_some(),
+                    "webtransport": config.alt_video.as_ref().and_then(|a| a.offer()),
                     "rtp_epoch_ms": session.epoch_unix_ms,
                     "rtp_clock": 90_000,
                 });
@@ -1393,6 +1458,19 @@ fn handle_event(
         Event::ChannelData(data) if Some(data.id) == session.control && !data.binary => {
             if let Some(reply) = control_reply(&data.data, unix_ms(SystemTime::now())) {
                 send_control(session, &reply);
+            } else if let Some(wanted) = parse_transport(&data.data) {
+                let alt = wanted && config.alt_video.is_some();
+                if alt != session.alt_active {
+                    session.alt_active = alt;
+                    shared.alt_on.store(alt, Ordering::Relaxed);
+                    info!(webtransport = alt, "video path");
+                    if !alt {
+                        shared.target_override.store(0, Ordering::Relaxed);
+                    }
+                    shared.keyframe_wanted.store(true, Ordering::Relaxed);
+                }
+            } else if is_keyframe_request(&data.data) {
+                shared.keyframe_wanted.store(true, Ordering::Relaxed);
             } else if let Some(settings) = parse_settings(&data.data, config.rate) {
                 if let Some(max) = settings.max_bps {
                     session.client_max = max;
@@ -1575,6 +1653,21 @@ fn send_control(session: &mut Session, message: &Value) {
 }
 
 /// The answer to a control message, if it needs one. Phase 2 answers `ping` with the server clock.
+/// `{"t":"transport","video":"webtransport"|"webrtc"}`: true for the experimental path (P9-4).
+fn parse_transport(text: &[u8]) -> Option<bool> {
+    let v: Value = serde_json::from_slice(text).ok()?;
+    (v.get("t")?.as_str()? == "transport")
+        .then(|| v.get("video").and_then(Value::as_str) == Some("webtransport"))
+}
+
+/// `{"t":"keyframe"}`: the browser's decoder lost its way on the experimental path.
+fn is_keyframe_request(text: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(text)
+        .ok()
+        .and_then(|v| v.get("t").and_then(Value::as_str).map(|t| t == "keyframe"))
+        .unwrap_or(false)
+}
+
 fn control_reply(text: &[u8], server_ms: f64) -> Option<Value> {
     let message: Value = serde_json::from_slice(text).ok()?;
     match message["t"].as_str()? {
@@ -1786,7 +1879,39 @@ mod tests {
             waker: UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
             wake_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
             rate: RateShared::default(),
+            target_override: AtomicU32::new(0),
+            alt_on: AtomicBool::new(false),
         }
+    }
+
+    #[test]
+    fn the_experimental_bitrate_counts_only_while_its_path_carries_the_video() {
+        let sink = FrameSink {
+            shared: Arc::new(shared()),
+        };
+        sink.shared
+            .rate
+            .target_bps
+            .store(2_000_000, Ordering::Relaxed);
+        sink.set_target_override(50_000_000);
+        assert_eq!(sink.target_bitrate(), 2_000_000);
+        sink.shared.alt_on.store(true, Ordering::Relaxed);
+        assert_eq!(sink.target_bitrate(), 50_000_000);
+    }
+
+    #[test]
+    fn transport_and_keyframe_messages_are_read() {
+        assert_eq!(
+            parse_transport(br#"{"t":"transport","video":"webtransport"}"#),
+            Some(true)
+        );
+        assert_eq!(
+            parse_transport(br#"{"t":"transport","video":"webrtc"}"#),
+            Some(false)
+        );
+        assert_eq!(parse_transport(br#"{"t":"ping"}"#), None);
+        assert!(is_keyframe_request(br#"{"t":"keyframe"}"#));
+        assert!(!is_keyframe_request(br#"{"t":"transport"}"#));
     }
 
     #[test]
@@ -1901,6 +2026,8 @@ mod tests {
         assert_eq!(destination_for(local, &advertise, phone), lan);
         assert_eq!(destination_for(local, &advertise, me), lo);
         assert_eq!(destination_for(lo, &advertise, phone), lo);
+        let netsim: SocketAddr = "127.0.0.1:9543".parse().unwrap();
+        assert_eq!(destination_for(lo, &[netsim], me), netsim);
     }
 
     #[test]
@@ -1919,6 +2046,7 @@ mod tests {
             paced_video: true,
             simulate_link: None,
             clipboard: None,
+            alt_video: None,
         })
         .expect("bind on loopback");
         assert!(server.open("not an sdp".into()).is_err());

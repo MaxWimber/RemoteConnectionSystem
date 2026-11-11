@@ -7,6 +7,7 @@ mod gpu_load;
 mod load;
 mod logging;
 mod matrix;
+mod netsim;
 mod options;
 mod probe;
 mod scenarios;
@@ -24,6 +25,8 @@ Usage:
   rcs-bench scenarios --out DIR [--seconds 300] [--scenarios static,window,video] [--ffmpeg-dir D] [capture options]
   rcs-bench load --out DIR --kind still|window|switch|gpu|game --seconds S [--game-exe X]   screen load, started by scenarios
   rcs-bench avsync --out DIR --seconds S   a square flashes with a click once a second, for «Замер звука» (P9-1)
+  rcs-bench netsim --out DIR --listen ADDR --to ADDR --seconds S [--link S:MBPS,...] [--link-queue-ms MS]
+                   [--link-loss PERCENT] [--outage EVERY_MS:BURST_MS]   UDP go-between that spoils the way back (P9-4)
   rcs-bench matrix --out DIR [--seconds 10] [--scenarios baseline,vbv_1_frame,...] [--ffmpeg-dir D]
                             AMF settings against fixed clips: timings, frame sizes, SSIM and PSNR
   rcs-bench amf-probe|amf-ull --out DIR --adapter N [same options]   child processes of probe and ull";
@@ -48,6 +51,7 @@ fn main() -> ExitCode {
         "scenarios" => scenarios::run(&options),
         "load" => load::run(&options),
         "avsync" => avsync::run(&options),
+        "netsim" => netsim::run(&options),
         "matrix" => matrix::run(&options),
         "amf-probe" => probe::run_amf(&options, probe::AmfProbe::Full),
         "amf-ull" => probe::run_amf(&options, probe::AmfProbe::UltraLowLatency),

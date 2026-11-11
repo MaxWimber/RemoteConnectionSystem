@@ -20,6 +20,7 @@ import {
 } from '../stream/diagnostics';
 import { audioDelayMs, SoundPlayer, type SoundState } from '../stream/audio';
 import { probeAvSync } from '../stream/avsync';
+import { WtVideo } from '../stream/webtransport';
 import { LatencyMeter, type LatencySummary } from '../stream/latency';
 import { StreamSession, type SessionState } from '../stream/session';
 import { summarize, toMap, type StatsMap, type StreamSummary } from '../stream/stats';
@@ -43,6 +44,19 @@ interface WakeLockLike {
   release(): Promise<void>;
 }
 const AGENT_INTERVAL_MS = 2000;
+const VIDEO_PATH_KEY = 'rcs.videoPath';
+
+/** The video path chosen on this browser: WebRTC, or the WebTransport experiment (P9-4), also by `?video=`. */
+function loadVideoPath(): 'webrtc' | 'webtransport' {
+  const fromUrl = new URLSearchParams(location.search).get('video');
+  if (fromUrl === 'webtransport' || fromUrl === 'webrtc') return fromUrl;
+  try {
+    return localStorage.getItem(VIDEO_PATH_KEY) === 'webtransport' ? 'webtransport' : 'webrtc';
+  } catch {
+    return 'webrtc';
+  }
+}
+
 /** Seconds of sound delay samples behind the p50 in the panel. */
 const AUDIO_DELAY_SAMPLES = 30;
 
@@ -89,6 +103,10 @@ export function App({ onSignedOut }: Props) {
   const [soundState, setSoundState] = useState<SoundState>('waiting');
   const audioDelays = useRef<number[]>([]);
   const [clipboardOn, setClipboardOn] = useState(() => loadClipboardSharing());
+  const wtCanvas = useRef<HTMLCanvasElement>(null);
+  const wt = useRef<WtVideo | null>(null);
+  const [videoPath, setVideoPath] = useState(() => loadVideoPath());
+  const [wtActive, setWtActive] = useState(false);
   const gamepads = useRef<GamepadPoller | null>(null);
   const [notice, setNotice] = useState('');
   const screenEl = useRef<HTMLDivElement>(null);
@@ -139,6 +157,27 @@ export function App({ onSignedOut }: Props) {
       log: logEvent,
       stream: (stream) => {
         if (video.current) video.current.srcObject = stream;
+        // A new connection starts on WebRTC; WebTransport comes back with its `hello`.
+        wt.current?.stop();
+        wt.current = null;
+        setWtActive(false);
+      },
+      webtransport: (offer) => {
+        if (loadVideoPath() !== 'webtransport' || !wtCanvas.current) return;
+        wt.current?.stop();
+        const player = new WtVideo(wtCanvas.current, () => s.clock, () => s.requestKeyframe(), logEvent);
+        wt.current = player;
+        (window as unknown as { __rcsWt: WtVideo }).__rcsWt = player;
+        player
+          .start(offer)
+          .then(() => {
+            s.setVideoPath('webtransport');
+            setWtActive(true);
+          })
+          .catch((e: unknown) => {
+            logEvent(`webtransport: ${String(e)}`);
+            setNotice('WebTransport не подключился, видео идёт по WebRTC');
+          });
       },
       audio: (track) => {
         audioDelays.current = [];
@@ -162,6 +201,8 @@ export function App({ onSignedOut }: Props) {
       },
     });
     session.current = s;
+    // For measurements from the console and the test harness (P9-4).
+    (window as unknown as { __rcsSession: StreamSession }).__rcsSession = s;
     s.start();
     if (video.current) {
       meter.current = new LatencyMeter(video.current, () => s.clock);
@@ -427,6 +468,7 @@ export function App({ onSignedOut }: Props) {
   return (
     <div class="screen" ref={screenEl}>
       <video ref={video} class="video" autoplay muted playsInline disablePictureInPicture />
+      <canvas ref={wtCanvas} class="video" hidden={!wtActive} />
       <img ref={cursorImage} class="cursor-overlay" alt="" hidden />
       <textarea
         ref={keyboardField}
@@ -605,6 +647,29 @@ export function App({ onSignedOut }: Props) {
               Замер ввода
             </button>{' '}
             {probe}
+          </div>
+          <div class="limit">
+            <label>
+              путь видео{' '}
+              <select
+                value={videoPath}
+                onChange={(e) => {
+                  const v = (e.currentTarget as HTMLSelectElement).value === 'webtransport' ? 'webtransport' : 'webrtc';
+                  setVideoPath(v);
+                  try {
+                    localStorage.setItem(VIDEO_PATH_KEY, v);
+                  } catch {
+                    // Private mode: the choice lasts until the page closes.
+                  }
+                  // The path is chosen when a connection starts.
+                  session.current?.start();
+                }}
+              >
+                <option value="webrtc">WebRTC</option>
+                <option value="webtransport">WebTransport (опыт)</option>
+              </select>
+            </label>{' '}
+            {videoPath === 'webtransport' && <span class="detail">{wtActive ? 'идёт по WebTransport' : 'сервер не предложил WebTransport'}</span>}
           </div>
           <div class="limit">
             <label>

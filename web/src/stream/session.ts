@@ -3,6 +3,7 @@
 import { ClockSync, sampleFromPong } from './clock';
 import { me } from '../api/auth';
 import { withStereoOpus } from './audio';
+import { isWtOffer, type WtOffer } from './webtransport';
 import { ClipboardSync, loadClipboardSharing, saveClipboardSharing } from '../clipboard/sync';
 import { InputChannels } from '../input/channels';
 import { decodeServer, type ServerMessage as CursorMessage } from '../input/protocol';
@@ -33,6 +34,8 @@ export interface SessionEvents {
   cursor?(message: CursorMessage): void;
   /** The agent's rate control, once a second while video plays (D-029). */
   serverStats?(stats: ServerStats): void;
+  /** The server offers the experimental WebTransport video path in `hello` (P9-4). */
+  webtransport?(offer: WtOffer): void;
   /** Something to show the user for a while; empty clears it (D-040). */
   notice?(text: string): void;
   /** The bitrate limit the server applied, kbit/s. */
@@ -44,12 +47,16 @@ export function backoffMs(attempt: number): number {
   return Math.min(5000, 1000 * 2 ** Math.max(0, attempt));
 }
 
-/** Keeps only H.264 and puts packetization-mode=1 first, which the server sends. */
+/**
+ * Keeps H.264 with packetization-mode=1 first, which the server sends, and RTX: without it the server cannot resend a
+ * lost packet, and with steady loss nearly every frame stays incomplete (found in P9-4, D-044).
+ */
 export function h264First(codecs: RTCRtpCodec[]): RTCRtpCodec[] {
   const h264 = codecs.filter((c) => c.mimeType.toLowerCase() === 'video/h264');
   const mode1 = h264.filter((c) => /packetization-mode=1/.test(c.sdpFmtpLine ?? ''));
   const rest = h264.filter((c) => !mode1.includes(c));
-  return [...mode1, ...rest];
+  const rtx = codecs.filter((c) => c.mimeType.toLowerCase() === 'video/rtx');
+  return [...mode1, ...rest, ...rtx];
 }
 
 export interface HeaderExtension {
@@ -121,6 +128,16 @@ export class StreamSession {
       notice: (text) => this.events.notice?.(text),
       log: (m) => this.events.log(m),
     });
+  }
+
+  /** Moves the video of this connection to WebTransport or back to WebRTC (P9-4). */
+  setVideoPath(path: 'webrtc' | 'webtransport'): void {
+    if (this.control?.readyState === 'open') this.control.send(JSON.stringify({ t: 'transport', video: path }));
+  }
+
+  /** The WebTransport decoder needs an IDR (P9-4). */
+  requestKeyframe(): void {
+    if (this.control?.readyState === 'open') this.control.send(JSON.stringify({ t: 'keyframe' }));
   }
 
   /** The receiver of the sound, for its delay. */
@@ -403,6 +420,7 @@ export class StreamSession {
       } else if (m['t'] === 'hello' && typeof m['rtp_epoch_ms'] === 'number') {
         clock.rtpEpochMs = m['rtp_epoch_ms'];
         if (typeof m['rtp_clock'] === 'number') clock.rtpClock = m['rtp_clock'];
+        if (isWtOffer(m['webtransport'])) this.events.webtransport?.(m['webtransport']);
       } else if (m['t'] === 'pong' && typeof m['id'] === 'number' && typeof m['server_ms'] === 'number') {
         const at = sent.get(m['id']);
         sent.delete(m['id']);

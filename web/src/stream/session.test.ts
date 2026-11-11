@@ -6,15 +6,17 @@ test('reconnect waits grow and stop at five seconds', () => {
   expect([0, 1, 2, 3, 10].map(backoffMs)).toEqual([1000, 2000, 4000, 5000, 5000]);
 });
 
-test('only H.264 is kept, packetization-mode 1 first', () => {
+test('only H.264 and RTX are kept, packetization-mode 1 first', () => {
   const codecs = [
     { mimeType: 'video/VP8', clockRate: 90000 },
+    { mimeType: 'video/rtx', clockRate: 90000 },
     { mimeType: 'video/H264', clockRate: 90000, sdpFmtpLine: 'packetization-mode=0;profile-level-id=42e01f' },
     { mimeType: 'video/H264', clockRate: 90000, sdpFmtpLine: 'packetization-mode=1;profile-level-id=64001f' },
   ];
   const result = h264First(codecs);
-  expect(result).toHaveLength(2);
+  expect(result).toHaveLength(3);
   expect(result[0]?.sdpFmtpLine).toContain('packetization-mode=1');
+  expect(result[2]?.mimeType).toBe('video/rtx');
 });
 
 test('signaling url follows the page scheme and the base path', () => {
