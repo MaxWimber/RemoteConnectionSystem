@@ -9,7 +9,11 @@
 //! starves the encoder and sends even less. So (D-027, both addenda):
 //!
 //! - The target drops on congestion only:
-//!   - `str0m` lowered its estimate (on overuse to 0.85 of the acknowledged rate) and it is now under what goes out;
+//!   - `str0m` lowered its estimate (on overuse to 0.85 of the acknowledged rate) and it is now under what goes out,
+//!     while the encoder spends at least half its target, or the RTT shows a queue, or heavy loss. On a quiet picture
+//!     a mobile network trips the delay detector of `str0m` with its jitter and stalls alone: every 20-30 s the
+//!     estimate fell from 12-21 Mbit/s to 0.85 of the 1 Mbit/s sent, with the RTT where it was, and the target sat
+//!     at the minimum in 720p (D-047). Such a decrease only holds the target;
 //!   - the RTT grew by `RTT_RISE` while more goes out than the estimate, before `str0m` lowered it, or while the
 //!     target is above the estimate: on a narrow link LCVBR peaks and IDR frames over it sit in its queue (P8-5);
 //!   - heavy loss while the encoder sends at least half its target: down to what still gets through. Loss on a quiet
@@ -35,8 +39,9 @@ const UP_EVERY: Duration = Duration::from_secs(1);
 /// No growth for this long after the target dropped.
 const HOLD_AFTER_DROP: Duration = Duration::from_secs(2);
 /// Loss in receiver reports above this cuts the target; between `LOSS_HOLD` and it, the target holds.
-const LOSS_CUT: f32 = 0.10;
-const LOSS_HOLD: f32 = 0.02;
+/// A mobile network loses 3-7% at any rate, and RTX repairs that (D-044), so up to 5% the target may climb (D-047).
+pub(crate) const LOSS_CUT: f32 = 0.10;
+pub(crate) const LOSS_HOLD: f32 = 0.05;
 const LOSS_CUT_FACTOR: f64 = 0.8;
 /// Loss cuts only while at least this share of the target goes out: then the link may not carry what is sent.
 const LOSS_BUSY: f64 = 0.5;
@@ -164,8 +169,16 @@ impl RateControl {
         let estimate = estimate_bps as f64;
         let settled = now.duration_since(first) >= SETTLE;
         let fell = before.is_none_or(|b| estimate < f64::from(b) * FELL);
-        if settled && fell && estimate < self.sent_bps(now) * UNDER_SENT {
-            self.lower(now, estimate * SHARE, estimate);
+        let sent = self.sent_bps(now);
+        if settled && fell && estimate < sent * UNDER_SENT {
+            let busy = sent >= f64::from(self.target) * LOSS_BUSY;
+            let lossy = self.loss.is_some_and(|l| l > LOSS_CUT);
+            if busy || lossy || self.queue_builds() {
+                self.lower(now, estimate * SHARE, estimate);
+            } else {
+                // A quiet picture and no other sign: the jitter of the link, not a queue. Hold for a while.
+                self.last_drop = Some(now);
+            }
             return;
         }
         self.rise(now);
@@ -232,6 +245,15 @@ impl RateControl {
                 next = next.min(delivered);
             }
             self.lower(now, next, next);
+            return;
+        }
+        // Heavy loss while the estimate is already under what goes out: a narrow link with a short queue, which
+        // shows in loss and not in the RTT. The estimate fell before this report came, so it is checked here too.
+        if loss.is_some_and(|l| l > LOSS_CUT)
+            && let Some(estimate) = self.estimate.map(f64::from)
+            && estimate < sent * UNDER_SENT
+        {
+            self.lower(now, estimate * SHARE, estimate);
             return;
         }
         // A queue builds while more goes out than the estimate, and `str0m` has not lowered it (yet). Or the target
@@ -325,21 +347,87 @@ mod tests {
     #[test]
     fn a_quiet_picture_does_not_drag_the_target_down() {
         let (mut c, t) = settled();
+        c.on_report(t, Some(0.0), Some(Duration::from_millis(30)));
         busy(&mut c, t, 4);
         c.on_estimate(t, mbps(6));
         assert!(
             c.target() >= 30 * MBPS,
             "the estimate only follows the 4 Mbit/s sent"
         );
-        // The link really narrows: the estimate falls under what goes out.
+        // The estimate falls under what goes out, but nothing else says the link narrowed: it only holds.
         c.on_estimate(t, mbps(3));
+        assert!(c.target() >= 30 * MBPS);
+        // The link really narrows: a queue shows in the RTT.
+        let at = t + Duration::from_secs(1);
+        busy(&mut c, at, 4);
+        c.on_report(at, Some(0.0), Some(Duration::from_millis(150)));
         assert_eq!(c.target(), 8 * MBPS);
+    }
+
+    #[test]
+    fn jitter_on_a_quiet_picture_holds_but_does_not_cut() {
+        // From the phone on mobile internet (D-047): 12 Mbit/s target, 1.1 Mbit/s sent, the estimate falls from
+        // 18.6 to 0.8 with 4.9% loss and the RTT at 40 ms of 30.
+        let (mut c, t) = settled();
+        c.limits.min_bps = 2 * MBPS;
+        c.on_report(t, Some(0.0), Some(Duration::from_millis(30)));
+        c.on_estimate(t, mbps(18) + 600_000);
+        c.target = 12 * MBPS;
+        let at = t + Duration::from_secs(1);
+        c.on_sent(at - Duration::from_millis(900), 70_000);
+        c.on_sent(at - Duration::from_millis(400), 70_000);
+        c.on_report(at, Some(0.049), Some(Duration::from_millis(40)));
+        c.on_estimate(at, 800_000);
+        assert_eq!(c.target(), 12 * MBPS, "no cut");
+        c.on_tick(at + UP_EVERY);
+        assert_eq!(c.target(), 12 * MBPS, "but no climb right after");
+        // The same fall with heavy loss is congestion.
+        let at = at + Duration::from_secs(3);
+        c.on_sent(at - Duration::from_millis(900), 70_000);
+        c.on_sent(at - Duration::from_millis(400), 70_000);
+        c.on_estimate(at, mbps(5));
+        c.on_report(at, Some(0.15), Some(Duration::from_millis(40)));
+        c.on_estimate(at, 700_000);
+        assert_eq!(c.target(), 2 * MBPS);
+    }
+
+    #[test]
+    fn heavy_loss_after_a_held_fall_cuts_to_the_estimate() {
+        // A 3 Mbit/s link with a 30 ms queue (D-047): the estimate falls under the 5.8 Mbit/s sent first, the loss
+        // report comes a second later.
+        let (mut c, t) = settled();
+        c.limits.min_bps = 2 * MBPS;
+        c.on_report(t, Some(0.0), Some(Duration::from_millis(2)));
+        c.on_estimate(t, mbps(18));
+        let at = t + Duration::from_secs(1);
+        busy(&mut c, at, 6);
+        c.on_estimate(at, 3_100_000);
+        assert!(c.target() >= 30 * MBPS, "held: not busy, no loss yet");
+        let at = at + Duration::from_secs(1);
+        busy(&mut c, at, 6);
+        c.on_report(at, Some(0.177), Some(Duration::from_millis(20)));
+        assert_eq!(c.target(), (3.1e6 * SHARE) as u32);
+    }
+
+    #[test]
+    fn mobile_loss_lets_the_target_climb() {
+        let (mut c, t) = settled();
+        c.target = 10 * MBPS;
+        c.estimate = Some(40 * MBPS);
+        c.on_report(t, Some(0.04), Some(Duration::from_millis(40)));
+        c.on_tick(t + UP_EVERY);
+        assert!(c.target() > 10 * MBPS, "4% loss climbs");
+        let before = c.target();
+        c.on_report(t + UP_EVERY, Some(0.07), Some(Duration::from_millis(40)));
+        c.on_tick(t + UP_EVERY * 3);
+        assert_eq!(c.target(), before, "7% holds");
     }
 
     #[test]
     fn after_congestion_a_quiet_picture_climbs_only_a_little_for_a_while() {
         let (mut c, t) = settled();
-        busy(&mut c, t, 10);
+        // The encoder spends most of its target: the fall is congestion.
+        busy(&mut c, t, 20);
         c.on_estimate(t, mbps(6));
         assert_eq!(c.target(), 8 * MBPS);
         // Quiet: 2 Mbit/s sent, no estimate above it. The ceiling is 1.2 x 8 Mbit/s.
@@ -413,9 +501,9 @@ mod tests {
         c.on_report(t, Some(0.2), Some(Duration::from_millis(20)));
         assert_eq!(c.target(), 24 * MBPS);
         let at = t + Duration::from_secs(10);
-        c.on_report(at, Some(0.05), None);
+        c.on_report(at, Some(0.06), None);
         c.on_estimate(at, mbps(100));
-        assert_eq!(c.target(), 24 * MBPS, "5% loss holds");
+        assert_eq!(c.target(), 24 * MBPS, "6% loss holds");
         c.on_report(at, Some(0.0), None);
         c.on_estimate(at, mbps(100));
         assert!(c.target() > 24 * MBPS);
@@ -596,7 +684,8 @@ mod tests {
     #[test]
     fn a_probed_estimate_lifts_the_target_at_once() {
         let (mut c, t) = settled();
-        busy(&mut c, t, 10);
+        // The encoder spends most of its target: the fall is congestion.
+        busy(&mut c, t, 20);
         c.on_estimate(t, mbps(3));
         assert_eq!(c.target(), 8 * MBPS);
         // Right after the drop only up to the ceiling, 1.2 x 8 Mbit/s: the estimate may be a stale one.

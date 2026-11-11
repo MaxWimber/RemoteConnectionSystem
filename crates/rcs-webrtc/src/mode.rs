@@ -61,9 +61,11 @@ impl StreamMode {
 /// A target under this for `WEAK_AFTER` turns «Слабая сеть» on.
 const WEAK_BELOW: u32 = 5_000_000;
 const WEAK_AFTER: Duration = Duration::from_secs(5);
-/// An estimate this high, with loss up to `BACK_LOSS`, for `BACK_AFTER` turns it off again.
+/// An estimate this high for `BACK_AFTER`, with loss up to `BACK_LOSS` on average over that time, turns it off
+/// again. The loss is the one that still lets the target climb. On a mobile network 3-7% is always there and single
+/// reports jump from 0 to 10%, so the average counts, not each report (D-047).
 const BACK_ABOVE: u32 = 15_000_000;
-const BACK_LOSS: f32 = 0.02;
+const BACK_LOSS: f32 = crate::rate::LOSS_HOLD;
 const BACK_AFTER: Duration = Duration::from_secs(10);
 /// The least time between two automatic changes.
 const MIN_STAY: Duration = Duration::from_secs(20);
@@ -75,6 +77,8 @@ pub struct ModeControl {
     active: StreamMode,
     low_since: Option<Instant>,
     high_since: Option<Instant>,
+    /// Loss reports since `high_since`: their sum and count.
+    high_loss: (f32, u32),
     changed_at: Instant,
 }
 
@@ -86,6 +90,7 @@ impl ModeControl {
             active: mode,
             low_since: None,
             high_since: None,
+            high_loss: (0.0, 0),
             changed_at: now,
         }
     }
@@ -137,12 +142,31 @@ impl ModeControl {
         // In «Слабая сеть» by itself: back once the link has room for the chosen mode again.
         self.low_since = None;
         let room = estimate_bps.unwrap_or(0).min(cap_bps);
-        if room < BACK_ABOVE || loss.is_some_and(|l| l > BACK_LOSS) {
+        if room < BACK_ABOVE {
             self.high_since = None;
             return false;
         }
-        let since = *self.high_since.get_or_insert(now);
-        if settled && now.duration_since(since) >= BACK_AFTER {
+        if self.high_since.is_none() {
+            self.high_since = Some(now);
+            self.high_loss = (0.0, 0);
+        }
+        if let Some(l) = loss {
+            self.high_loss.0 += l;
+            self.high_loss.1 += 1;
+        }
+        let since = self.high_since.unwrap_or(now);
+        if now.duration_since(since) < BACK_AFTER {
+            return false;
+        }
+        let (sum, n) = self.high_loss;
+        let mean = if n > 0 { sum / n as f32 } else { 0.0 };
+        if mean > BACK_LOSS {
+            // A lossy stretch: count again from here.
+            self.high_since = Some(now);
+            self.high_loss = (0.0, 0);
+            return false;
+        }
+        if settled {
             self.switch(now, self.chosen);
             return true;
         }
@@ -230,8 +254,29 @@ mod tests {
         let mut m = ModeControl::new(t0, StreamMode::Game);
         let (t, _) = run(&mut m, t0, 30, 2, 3, 0.0);
         assert_eq!(m.active(), StreamMode::Weak);
-        let (_, back) = run(&mut m, t, 40, 12, 20, 0.05);
-        assert!(!back, "loss above 2%");
+        let (t, back) = run(&mut m, t, 40, 12, 20, 0.07);
+        assert!(!back, "loss above 5%");
+        let (_, back) = run(&mut m, t, 40, 12, 20, 0.04);
+        assert!(back, "mobile loss of 4% lets 1080p back");
+    }
+
+    #[test]
+    fn jumpy_mobile_loss_counts_on_average() {
+        // From the phone (D-047): reports jump between 0 and 10% around 4%.
+        let t0 = Instant::now();
+        let mut m = ModeControl::new(t0, StreamMode::Game);
+        let (mut t, _) = run(&mut m, t0, 30, 2, 3, 0.0);
+        assert_eq!(m.active(), StreamMode::Weak);
+        let losses = [
+            0.022, 0.039, 0.025, 0.097, 0.036, 0.10, 0.0, 0.0, 0.027, 0.062, 0.0, 0.05,
+        ];
+        let mut back = false;
+        for l in losses {
+            t += Duration::from_secs(1);
+            back |= m.on_rate(t, 12 * MBPS, Some(21 * MBPS), Some(l), 30 * MBPS);
+        }
+        assert!(back, "4% on average");
+        assert_eq!(m.active(), StreamMode::Game);
     }
 
     #[test]

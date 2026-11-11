@@ -37,6 +37,10 @@ pub struct Options {
     pub link_queue_ms: u64,
     pub link_loss: f64,
     pub outage: Option<String>,
+    /// netsim: one-way delay to the browser, its variation and stalls, as on a mobile network.
+    pub delay_ms: u64,
+    pub jitter_ms: u64,
+    pub stall: Option<String>,
 }
 
 impl Default for Options {
@@ -69,6 +73,9 @@ impl Default for Options {
             link_queue_ms: 200,
             link_loss: 0.0,
             outage: None,
+            delay_ms: 0,
+            jitter_ms: 0,
+            stall: None,
         }
     }
 }
@@ -131,6 +138,9 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                 options.link_loss = value.parse().map_err(|_| format!("{flag}: percent"))?
             }
             "--outage" => options.outage = Some(value.clone()),
+            "--delay-ms" => options.delay_ms = positive(flag, number()?)? as u64,
+            "--jitter-ms" => options.jitter_ms = positive(flag, number()?)? as u64,
+            "--stall" => options.stall = Some(value.clone()),
             _ => return Err(format!("Unknown option: {flag}")),
         }
     }
