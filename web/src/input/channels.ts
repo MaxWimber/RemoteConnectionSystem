@@ -8,6 +8,7 @@ import {
   type ClientMessage,
   type GamepadState,
   type ServerMessage,
+  type TouchPoint,
 } from './protocol';
 
 /** Over this much waiting data a mouse move is dropped: the next one carries the newer position anyway. */
@@ -22,6 +23,7 @@ export class InputChannels {
   private relativeSum = { dx: 0, dy: 0 };
   private cursorSeq: number | null = null;
   private padSeq = [0, 0, 0, 0];
+  private touchSeq = 0;
 
   /** `onServer` gets the server's pointer positions, newest only: input-fast is unordered. */
   constructor(pc: RTCPeerConnection, onServer?: (m: ServerMessage) => void) {
@@ -61,6 +63,12 @@ export class InputChannels {
     const seq = nextSeq(this.padSeq[pad] ?? 0);
     this.padSeq[pad] = seq;
     this.sendFast({ type: 'gamepad_state', seq, pad, ...state });
+  }
+
+  /** Touch points on input-fast (P11-1): a lost datagram holds nothing back, the next one has newer places. */
+  sendTouchFast(points: TouchPoint[]): void {
+    this.touchSeq = nextSeq(this.touchSeq);
+    this.sendFast({ type: 'touch_fast', seq: this.touchSeq, points });
   }
 
   send(m: ClientMessage): void {

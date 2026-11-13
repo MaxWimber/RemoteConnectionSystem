@@ -27,6 +27,8 @@ Usage:
   rcs-bench avsync --out DIR --seconds S   a square flashes with a click once a second, for «Замер звука» (P9-1)
   rcs-bench netsim --out DIR --listen ADDR --to ADDR --seconds S [--link S:MBPS,...] [--link-queue-ms MS]
                    [--link-loss PERCENT] [--outage EVERY_MS:BURST_MS]   UDP go-between that spoils the way back (P9-4)
+                   [--delay-ms MS] [--jitter-ms MS] [--stall EVERY_MS:HOLD_MS]   delay to the browser (D-047)
+                   [--up-loss PERCENT] [--up-delay-ms MS] [--up-jitter-ms MS]   the way to the agent (P11-1)
   rcs-bench matrix --out DIR [--seconds 10] [--scenarios baseline,vbv_1_frame,...] [--ffmpeg-dir D]
                             AMF settings against fixed clips: timings, frame sizes, SSIM and PSNR
   rcs-bench amf-probe|amf-ull --out DIR --adapter N [same options]   child processes of probe and ull";

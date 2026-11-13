@@ -68,19 +68,40 @@ body,
   opacity: 0.75;
 }
 
+/* The folded panel (P11-2): a handle placed by Toolbar.tsx, its center at left/top. */
 .toolbar {
   position: absolute;
-  top: 8px;
-  right: 8px;
-  display: flex;
-  gap: 6px;
-  opacity: 0.35;
+  width: 0;
+  height: 0;
+  z-index: 5;
+}
+
+.toolbar-handle {
+  position: absolute;
+  left: -18px;
+  top: -18px;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  opacity: 0.4;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
   transition: opacity 0.2s;
 }
 
-.toolbar:hover,
-.toolbar:focus-within {
+.toolbar-handle:hover,
+.toolbar-handle:focus-visible,
+.toolbar-handle.open {
   opacity: 1;
+}
+
+.toolbar-buttons {
+  position: absolute;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  width: max-content;
 }
 
 button {

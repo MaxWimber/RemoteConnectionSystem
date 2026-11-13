@@ -1,6 +1,9 @@
 // Touch on Android (P4-8): the fingers go to Windows as real touches (InjectTouchInput), so Windows' own touch
 // gestures apply, and the phone's keyboard types through a hidden field. The touchpad mode was removed at the
 // user's request (D-022).
+//
+// Moves go on input-fast only, downs and ups on both channels (P11-1, D-048): on a mobile network a lost datagram
+// held every later touch on the ordered input-reliable back, and a late up made a swipe a press-and-hold.
 
 import type { InputChannels } from './channels';
 import { contentBox, normalized } from './pointer';
@@ -17,21 +20,27 @@ export function textChange(before: string, after: string): { deletes: number; in
   return { deletes: [...before.slice(common)].length, insert: after.slice(common) };
 }
 
-/** Small contact ids for the protocol: the lowest free one for each browser pointer. */
+/** At most this many fingers at once, as Windows takes. */
+const MAX_FINGERS = 10;
+
+/**
+ * Contact ids for the protocol: each new finger gets the next id of 0..255, so a late copy of an old finger's
+ * message on the other channel never meets a new finger with the same id (D-048).
+ */
 export class ContactIds {
   private ids = new Map<number, number>();
+  private next = 0;
 
   take(pointerId: number): number | undefined {
     const known = this.ids.get(pointerId);
     if (known !== undefined) return known;
+    if (this.ids.size >= MAX_FINGERS) return undefined;
     const used = new Set(this.ids.values());
-    for (let id = 0; id < 10; id += 1) {
-      if (!used.has(id)) {
-        this.ids.set(pointerId, id);
-        return id;
-      }
-    }
-    return undefined;
+    while (used.has(this.next)) this.next = (this.next + 1) & 0xff;
+    const id = this.next;
+    this.next = (this.next + 1) & 0xff;
+    this.ids.set(pointerId, id);
+    return id;
   }
 
   get(pointerId: number): number | undefined {
@@ -49,7 +58,10 @@ export class ContactIds {
 
 export class TouchController {
   private ids = new ContactIds();
+  /** Moves since the last frame, newest place of each finger. */
   private pending = new Map<number, TouchPoint>();
+  /** Ups sent this frame, sent once more on input-fast with the next frame. */
+  private ups: TouchPoint[] = [];
   private frame = 0;
   private offs: (() => void)[] = [];
   private text = '';
@@ -91,6 +103,7 @@ export class TouchController {
     window.cancelAnimationFrame(this.frame);
     this.frame = 0;
     this.pending.clear();
+    this.ups = [];
     this.ids.clear();
   }
 
@@ -102,24 +115,39 @@ export class TouchController {
     if (phase === 'up' || phase === 'cancel') this.ids.free(e.pointerId);
     const box = contentBox(this.video.getBoundingClientRect(), this.video.videoWidth, this.video.videoHeight);
     const { x, y } = normalized(box, e.clientX, e.clientY);
-    const earlier = this.pending.get(id);
-    // A finger that went down in this frame stays a down until it is sent.
-    const kept: TouchPhase = earlier?.phase === 'down' && phase === 'move' ? 'down' : phase;
-    this.pending.set(id, { id, phase: kept, x, y });
-    // Moves are merged up to one message per frame; downs and ups go at once.
+    const point: TouchPoint = { id, phase, x, y };
     if (phase === 'move') {
-      if (this.frame === 0) this.frame = window.requestAnimationFrame(() => this.flush());
-    } else {
-      this.flush();
+      // Moves are merged up to one message per frame.
+      this.pending.set(id, point);
+      this.schedule();
+      return;
+    }
+    // Downs and ups go at once, after the moves waiting before them.
+    this.pending.delete(id);
+    this.flush();
+    const c = this.channels();
+    if (!c?.open) return;
+    c.sendTouchFast([point]);
+    c.send({ type: 'touch', points: [point] });
+    if (phase !== 'down') {
+      this.ups.push(point);
+      this.schedule();
     }
   }
 
+  private schedule(): void {
+    if (this.frame === 0) this.frame = window.requestAnimationFrame(() => this.flush());
+  }
+
+  /** Sends the merged moves and repeats the last frame's ups, both on input-fast. */
   private flush(): void {
     window.cancelAnimationFrame(this.frame);
     this.frame = 0;
     const c = this.channels();
-    if (c?.open && this.pending.size > 0) c.send({ type: 'touch', points: [...this.pending.values()] });
+    const points = [...this.ups, ...this.pending.values()];
+    this.ups = [];
     this.pending.clear();
+    if (c?.open && points.length > 0) c.sendTouchFast(points);
   }
 
   private sendKey(code: string): void {

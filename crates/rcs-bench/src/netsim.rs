@@ -6,6 +6,9 @@
 //! delay, a variation that changes every `JITTER_SLOT` and stalls that hold everything for a while and then let it
 //! through at once. Nothing is lost there and the order stays.
 //!
+//! The way to the agent, where input goes, can lose datagrams at random and delay them with a variation, in its own
+//! delay stage without stalls (P11-1).
+//!
 //! The browser sends to `--listen`; the go-between forwards to `--to` from a socket of its own and sends the answers
 //! back to the last browser address it heard from. One browser at a time. Counters go to `netsim.json`.
 
@@ -35,6 +38,7 @@ struct Counters {
     dropped_outage: u64,
     dropped_link: u64,
     stalled: u64,
+    dropped_up: u64,
 }
 
 /// The delay stage: base delay, jitter, stalls; keeps the order.
@@ -193,6 +197,16 @@ pub fn run(options: &Options) -> Result<(), String> {
             started,
         )
     });
+    let mut up = (options.up_loss > 0.0 || options.up_delay_ms > 0 || options.up_jitter_ms > 0)
+        .then(|| {
+            Delay::new(
+                Duration::from_millis(options.up_delay_ms),
+                Duration::from_millis(options.up_jitter_ms),
+                None,
+                started,
+            )
+        });
+    let up_loss = options.up_loss / 100.0;
     let mut browser: Option<SocketAddr> = None;
     let mut buffer = vec![0u8; BUFFER];
     let mut c = Counters::default();
@@ -203,6 +217,14 @@ pub fn run(options: &Options) -> Result<(), String> {
                 Ok((n, from)) => {
                     busy = true;
                     browser = Some(from);
+                    if let Some(u) = up.as_mut() {
+                        if u.uniform() < up_loss {
+                            c.dropped_up += 1;
+                        } else {
+                            u.push(Instant::now(), buffer[..n].to_vec(), to);
+                        }
+                        continue;
+                    }
                     c.to_server += 1;
                     let _ = server_side.send(&buffer[..n]);
                 }
@@ -253,6 +275,13 @@ pub fn run(options: &Options) -> Result<(), String> {
                 let _ = browser_side.send_to(&data, dest);
             }
         }
+        if let Some(u) = up.as_mut() {
+            while let Some((data, _)) = u.pop(Instant::now()) {
+                busy = true;
+                c.to_server += 1;
+                let _ = server_side.send(&data);
+            }
+        }
         if let Some(d) = delay.as_mut() {
             while let Some((data, dest)) = d.pop(Instant::now()) {
                 busy = true;
@@ -276,6 +305,10 @@ pub fn run(options: &Options) -> Result<(), String> {
         "jitter_ms": options.jitter_ms,
         "stall": options.stall,
         "stalled": c.stalled,
+        "up_loss_percent": options.up_loss,
+        "up_delay_ms": options.up_delay_ms,
+        "up_jitter_ms": options.up_jitter_ms,
+        "dropped_up": c.dropped_up,
         "seconds": options.seconds,
         "to_server": c.to_server,
         "to_browser": c.to_browser,

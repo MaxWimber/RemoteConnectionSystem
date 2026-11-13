@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const MOUSE_MOVE_ABSOLUTE: u8 = 0x01;
 pub const MOUSE_MOVE_RELATIVE: u8 = 0x02;
 pub const GAMEPAD_STATE: u8 = 0x03;
+pub const TOUCH_FAST: u8 = 0x04;
 pub const KEY: u8 = 0x10;
 pub const MOUSE_BUTTON: u8 = 0x11;
 pub const WHEEL: u8 = 0x12;
@@ -198,6 +199,11 @@ pub enum ClientMessage {
     Touch {
         points: TouchPoints,
     },
+    /// The same points on `input-fast` with a `seq` (P11-1): moves only here, downs and ups here and in `Touch`.
+    TouchFast {
+        seq: u16,
+        points: TouchPoints,
+    },
     ReleaseAll,
     Text {
         text: String,
@@ -222,6 +228,38 @@ fn i16_at(b: &[u8], at: usize) -> i16 {
 
 fn i32_at(b: &[u8], at: usize) -> i32 {
     i32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+/// `count` touch records of 6 bytes from `at`, the whole rest of the message.
+fn touch_points(b: &[u8], at: usize, bad: ParseError) -> Result<TouchPoints, ParseError> {
+    let count = usize::from(*b.get(at).ok_or(bad)?);
+    if count == 0 || count > MAX_TOUCH_POINTS || b.len() != at + 1 + 6 * count {
+        return Err(bad);
+    }
+    let mut list = [TouchPoints::EMPTY; MAX_TOUCH_POINTS];
+    for (i, p) in list.iter_mut().take(count).enumerate() {
+        let r = at + 1 + 6 * i;
+        *p = TouchPoint {
+            id: b[r],
+            phase: TouchPhase::from_wire(b[r + 1]).ok_or(bad)?,
+            x: u16_at(b, r + 2),
+            y: u16_at(b, r + 4),
+        };
+    }
+    Ok(TouchPoints {
+        len: count as u8,
+        points: list,
+    })
+}
+
+fn encode_points(points: &TouchPoints, out: &mut Vec<u8>) {
+    out.push(points.len);
+    for p in points.as_slice() {
+        out.push(p.id);
+        out.push(p.phase.wire());
+        out.extend_from_slice(&p.x.to_le_bytes());
+        out.extend_from_slice(&p.y.to_le_bytes());
+    }
 }
 
 fn bool_at(b: &[u8], at: usize) -> Option<bool> {
@@ -295,27 +333,16 @@ impl ClientMessage {
                     dy: i16_at(b, 3),
                 }
             }
-            TOUCH => {
-                let count = usize::from(*b.get(1).ok_or(bad)?);
-                if count == 0 || count > MAX_TOUCH_POINTS {
+            TOUCH => Self::Touch {
+                points: touch_points(b, 1, bad)?,
+            },
+            TOUCH_FAST => {
+                if b.len() < 4 {
                     return Err(bad);
                 }
-                exact(2 + 6 * count)?;
-                let mut list = [TouchPoints::EMPTY; MAX_TOUCH_POINTS];
-                for (i, p) in list.iter_mut().take(count).enumerate() {
-                    let at = 2 + 6 * i;
-                    *p = TouchPoint {
-                        id: b[at],
-                        phase: TouchPhase::from_wire(b[at + 1]).ok_or(bad)?,
-                        x: u16_at(b, at + 2),
-                        y: u16_at(b, at + 4),
-                    };
-                }
-                Self::Touch {
-                    points: TouchPoints {
-                        len: count as u8,
-                        points: list,
-                    },
+                Self::TouchFast {
+                    seq: u16_at(b, 1),
+                    points: touch_points(b, 3, bad)?,
                 }
             }
             RELEASE_ALL => {
@@ -384,13 +411,12 @@ impl ClientMessage {
             }
             Self::Touch { points } => {
                 out.push(TOUCH);
-                out.push(points.len);
-                for p in points.as_slice() {
-                    out.push(p.id);
-                    out.push(p.phase.wire());
-                    out.extend_from_slice(&p.x.to_le_bytes());
-                    out.extend_from_slice(&p.y.to_le_bytes());
-                }
+                encode_points(points, out);
+            }
+            Self::TouchFast { seq, points } => {
+                out.push(TOUCH_FAST);
+                out.extend_from_slice(&seq.to_le_bytes());
+                encode_points(points, out);
             }
             Self::ReleaseAll => out.push(RELEASE_ALL),
             Self::Text { text } => {

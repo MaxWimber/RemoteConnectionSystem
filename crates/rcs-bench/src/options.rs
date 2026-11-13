@@ -41,6 +41,10 @@ pub struct Options {
     pub delay_ms: u64,
     pub jitter_ms: u64,
     pub stall: Option<String>,
+    /// netsim: the way to the agent, where input goes (P11-1): random loss, one-way delay and its variation.
+    pub up_loss: f64,
+    pub up_delay_ms: u64,
+    pub up_jitter_ms: u64,
 }
 
 impl Default for Options {
@@ -76,6 +80,9 @@ impl Default for Options {
             delay_ms: 0,
             jitter_ms: 0,
             stall: None,
+            up_loss: 0.0,
+            up_delay_ms: 0,
+            up_jitter_ms: 0,
         }
     }
 }
@@ -141,6 +148,11 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             "--delay-ms" => options.delay_ms = positive(flag, number()?)? as u64,
             "--jitter-ms" => options.jitter_ms = positive(flag, number()?)? as u64,
             "--stall" => options.stall = Some(value.clone()),
+            "--up-loss" => {
+                options.up_loss = value.parse().map_err(|_| format!("{flag}: percent"))?
+            }
+            "--up-delay-ms" => options.up_delay_ms = positive(flag, number()?)? as u64,
+            "--up-jitter-ms" => options.up_jitter_ms = positive(flag, number()?)? as u64,
             _ => return Err(format!("Unknown option: {flag}")),
         }
     }

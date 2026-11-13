@@ -35,6 +35,7 @@ import {
   type StreamMode,
 } from '../stream/server-stats';
 import { appTitle } from './title';
+import { Toolbar } from './Toolbar';
 
 const STATS_INTERVAL_MS = 1000;
 /** A phone or tablet: no mouse, so touches and the screen keyboard. */
@@ -486,7 +487,7 @@ export function App({ onSignedOut }: Props) {
         </div>
       )}
       {notice && <div class="notice">{notice}</div>}
-      <div class="toolbar" aria-label={appTitle}>
+      <Toolbar label={appTitle} video={video}>
         <button onClick={fullscreen} title="Полный экран">⛶</button>
         <button
           onClick={() => session.current?.input?.send({ type: 'special', code: 1 })}
@@ -539,7 +540,7 @@ export function App({ onSignedOut }: Props) {
         <button onClick={() => setShowStats(!showStats)} title="Статистика">ℹ</button>
         <button onClick={() => void saveDiagnostics()} title="Скачать диагностику">⤓</button>
         <button onClick={() => void signOut()} title="Выйти">⏻</button>
-      </div>
+      </Toolbar>
       {filesShown && <FileManager base={import.meta.env.BASE_URL} uploads={uploads} onClose={() => setFilesShown(false)} />}
       {showStats && (
         <div class="stats">

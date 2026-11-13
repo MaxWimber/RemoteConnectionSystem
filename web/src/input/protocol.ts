@@ -39,6 +39,7 @@ export type ClientMessage =
   | { type: 'mouse_button'; button: MouseButton; down: boolean }
   | { type: 'wheel'; dx: number; dy: number }
   | { type: 'touch'; points: TouchPoint[] }
+  | { type: 'touch_fast'; seq: number; points: TouchPoint[] }
   | { type: 'release_all' }
   | { type: 'text'; text: string }
   | { type: 'special'; code: number };
@@ -113,12 +114,15 @@ export function encodeClient(m: ClientMessage): Uint8Array {
       v.setInt16(3, m.dy, true);
       return b;
     }
-    case 'touch': {
+    case 'touch':
+    case 'touch_fast': {
       const points = m.points.slice(0, MAX_TOUCH_POINTS);
-      const [b, v] = make(2 + 6 * points.length, 0x13);
-      b[1] = points.length;
+      const head = m.type === 'touch' ? 1 : 3;
+      const [b, v] = make(head + 1 + 6 * points.length, m.type === 'touch' ? 0x13 : 0x04);
+      if (m.type === 'touch_fast') v.setUint16(1, m.seq, true);
+      b[head] = points.length;
       points.forEach((p, i) => {
-        const at = 2 + 6 * i;
+        const at = head + 1 + 6 * i;
         v.setUint8(at, p.id);
         v.setUint8(at + 1, PHASES.indexOf(p.phase));
         v.setUint16(at + 2, p.x, true);

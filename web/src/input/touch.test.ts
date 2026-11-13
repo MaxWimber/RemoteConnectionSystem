@@ -2,15 +2,23 @@ import { describe, expect, it } from 'vitest';
 import { ContactIds, textChange } from './touch';
 
 describe('contact ids', () => {
-  it('reuses the lowest free id and runs out after ten', () => {
+  it('gives each new finger the next id and runs out after ten at once', () => {
     const ids = new ContactIds();
     expect(ids.take(101)).toBe(0);
     expect(ids.take(102)).toBe(1);
     expect(ids.take(101)).toBe(0);
     ids.free(101);
-    expect(ids.take(103)).toBe(0);
+    // A freed id does not come back soon: a late copy of its messages must not meet a new finger (D-048).
+    expect(ids.take(103)).toBe(2);
     for (let p = 200; p < 208; p += 1) ids.take(p);
     expect(ids.take(999)).toBeUndefined();
+    ids.clear();
+    // After 255 the ids wrap, skipping those in use.
+    for (let p = 0; p < 300; p += 1) {
+      ids.take(p);
+      ids.free(p);
+    }
+    expect(ids.take(5000)).toBe((11 + 300) % 256);
   });
 });
 

@@ -11,6 +11,8 @@ mod pipe;
 mod pipeline;
 mod recovery;
 mod resources;
+mod touch_merge;
+mod touch_timing;
 mod webtransport;
 
 use std::fs::{self, OpenOptions};

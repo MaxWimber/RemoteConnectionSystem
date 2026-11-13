@@ -1,7 +1,7 @@
 //! Direct touch through `InjectTouchInput` (P4-9).
 //!
 //! Windows wants every contact that is down in each injected frame, and cancels a contact that is not updated for a
-//! while. [`Contacts`] keeps the contacts that are down and builds those frames; it is pure, so tests check it.
+//! while. The client numbers fingers 0..=255 (P11-1); Windows gets the lowest free pointer id of 0..10 instead. [`Contacts`] keeps the contacts that are down and builds those frames; it is pure, so tests check it.
 //! [`TouchInjector`] sends them and repeats the last frame while fingers rest.
 
 use std::time::{Duration, Instant};
@@ -29,6 +29,7 @@ const CONTACT_RADIUS: i32 = 4;
 /// One contact in an injected frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Contact {
+    /// The Windows pointer id, 0..MAX_CONTACTS.
     pub id: u8,
     pub x: i32,
     pub y: i32,
@@ -38,10 +39,10 @@ pub struct Contact {
 
 const HELD: u32 = POINTER_FLAG_INRANGE.0 | POINTER_FLAG_INCONTACT.0;
 
-/// The contacts that are down, in desktop pixels.
+/// The contacts that are down, in desktop pixels: the client's id, the Windows pointer id, the place.
 #[derive(Debug, Default, Clone)]
 pub struct Contacts {
-    down: Vec<(u8, i32, i32)>,
+    down: Vec<(u8, u8, i32, i32)>,
 }
 
 impl Contacts {
@@ -56,46 +57,43 @@ impl Contacts {
         for p in points {
             let (x, y) = geometry.pixel(p.x, p.y);
             let known = self.down.iter().position(|c| c.0 == p.id);
-            let flags = match (p.phase, known) {
+            let (slot, flags) = match (p.phase, known) {
                 (TouchPhase::Down, None) if self.down.len() < MAX_CONTACTS => {
-                    self.down.push((p.id, x, y));
-                    POINTER_FLAG_DOWN.0 | HELD
+                    let slot = (0..MAX_CONTACTS as u8)
+                        .find(|s| !self.down.iter().any(|c| c.1 == *s))
+                        .unwrap_or(0);
+                    self.down.push((p.id, slot, x, y));
+                    (slot, POINTER_FLAG_DOWN.0 | HELD)
                 }
                 (TouchPhase::Move, Some(i)) => {
-                    self.down[i] = (p.id, x, y);
-                    POINTER_FLAG_UPDATE.0 | HELD
+                    let slot = self.down[i].1;
+                    self.down[i] = (p.id, slot, x, y);
+                    (slot, POINTER_FLAG_UPDATE.0 | HELD)
                 }
-                (TouchPhase::Up, Some(i)) => {
-                    self.down.remove(i);
-                    POINTER_FLAG_UP.0
-                }
-                (TouchPhase::Cancel, Some(i)) => {
-                    self.down.remove(i);
-                    POINTER_FLAG_UP.0 | POINTER_FLAG_CANCELED.0
-                }
+                (TouchPhase::Up, Some(i)) => (self.down.remove(i).1, POINTER_FLAG_UP.0),
+                (TouchPhase::Cancel, Some(i)) => (
+                    self.down.remove(i).1,
+                    POINTER_FLAG_UP.0 | POINTER_FLAG_CANCELED.0,
+                ),
                 _ => continue,
             };
-            if let Some(c) = out.iter_mut().find(|c| c.id == p.id) {
+            let contact = Contact {
+                id: slot,
+                x,
+                y,
+                flags,
+            };
+            if let Some(c) = out.iter_mut().find(|c| c.id == slot) {
                 // A down and an up of the same finger in one message: inject the latest.
-                *c = Contact {
-                    id: p.id,
-                    x,
-                    y,
-                    flags,
-                };
+                *c = contact;
             } else {
-                out.push(Contact {
-                    id: p.id,
-                    x,
-                    y,
-                    flags,
-                });
+                out.push(contact);
             }
         }
         if out.is_empty() {
             return;
         }
-        for &(id, x, y) in &self.down {
+        for &(_, id, x, y) in &self.down {
             if !out.iter().any(|c| c.id == id) {
                 out.push(Contact {
                     id,
@@ -110,7 +108,7 @@ impl Contacts {
     /// The frame that keeps resting contacts alive.
     pub fn keep_alive(&self, out: &mut Vec<Contact>) {
         out.clear();
-        out.extend(self.down.iter().map(|&(id, x, y)| Contact {
+        out.extend(self.down.iter().map(|&(_, id, x, y)| Contact {
             id,
             x,
             y,
@@ -121,7 +119,7 @@ impl Contacts {
     /// The frame that lifts every contact, emptied.
     pub fn release(&mut self, out: &mut Vec<Contact>) {
         out.clear();
-        out.extend(self.down.drain(..).map(|(id, x, y)| Contact {
+        out.extend(self.down.drain(..).map(|(_, id, x, y)| Contact {
             id,
             x,
             y,
@@ -241,29 +239,33 @@ mod tests {
         assert_eq!(
             f,
             [Contact {
-                id: 1,
+                id: 0,
                 x: 0,
                 y: 0,
                 flags: POINTER_FLAG_DOWN.0 | HELD
             }]
         );
         // A second finger: the first one is reported too, as an update where it was.
-        c.apply(&[p(2, TouchPhase::Down, 65535, 65535)], &G, &mut f);
+        c.apply(&[p(200, TouchPhase::Down, 65535, 65535)], &G, &mut f);
         assert_eq!(f.len(), 2);
         assert_eq!(
             (f[0].id, f[0].x, f[0].flags),
-            (2, 1919, POINTER_FLAG_DOWN.0 | HELD)
+            (1, 1919, POINTER_FLAG_DOWN.0 | HELD)
         );
         assert_eq!(
             (f[1].id, f[1].x, f[1].flags),
-            (1, 0, POINTER_FLAG_UPDATE.0 | HELD)
+            (0, 0, POINTER_FLAG_UPDATE.0 | HELD)
         );
         c.apply(&[p(1, TouchPhase::Move, 32768, 0)], &G, &mut f);
-        assert_eq!((f[0].id, f[0].x), (1, 960));
+        assert_eq!((f[0].id, f[0].x), (0, 960));
         c.apply(&[p(1, TouchPhase::Up, 32768, 0)], &G, &mut f);
-        assert_eq!((f[0].id, f[0].flags), (1, POINTER_FLAG_UP.0));
-        assert_eq!((f[1].id, f[1].flags), (2, POINTER_FLAG_UPDATE.0 | HELD));
-        c.apply(&[p(2, TouchPhase::Cancel, 0, 0)], &G, &mut f);
+        assert_eq!((f[0].id, f[0].flags), (0, POINTER_FLAG_UP.0));
+        assert_eq!((f[1].id, f[1].flags), (1, POINTER_FLAG_UPDATE.0 | HELD));
+        // The freed Windows id 0 goes to the next finger.
+        c.apply(&[p(7, TouchPhase::Down, 0, 0)], &G, &mut f);
+        assert_eq!(f[0].id, 0);
+        c.apply(&[p(7, TouchPhase::Up, 0, 0)], &G, &mut f);
+        c.apply(&[p(200, TouchPhase::Cancel, 0, 0)], &G, &mut f);
         assert_eq!(f[0].flags, POINTER_FLAG_UP.0 | POINTER_FLAG_CANCELED.0);
         assert!(c.is_empty());
     }

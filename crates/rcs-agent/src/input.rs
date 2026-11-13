@@ -21,10 +21,14 @@ use rcs_input::gamepad::{
 use rcs_input::sendinput::{Geometry, SendInputSink};
 use rcs_input::{InputError, InputEvent, InputSink, RecordingSink};
 use rcs_protocol::input::{
-    ClientMessage, GamepadState, SPECIAL_CTRL_ALT_DEL, SeqFilter, ServerMessage,
+    ClientMessage, GamepadState, SPECIAL_CTRL_ALT_DEL, SeqFilter, ServerMessage, TouchPoint,
+    TouchPoints,
 };
 use rcs_webrtc::{FrameSink, InputMessage};
 use tracing::{debug, info, warn};
+
+use crate::touch_merge::TouchMerge;
+use crate::touch_timing::TouchTiming;
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
 };
@@ -34,6 +38,8 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_
 const POLL: Duration = Duration::from_millis(20);
 /// How often the thread checks which desktop takes input (P6-4).
 const DESKTOP_CHECK: Duration = Duration::from_millis(200);
+/// How often the touch timing of a session is written while touches come (P11-1).
+const TOUCH_LOG: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -83,6 +89,14 @@ struct Session {
     relative: SeqFilter,
     /// The sums of the last relative move applied; the sums start at zero with the session.
     sums: (i32, i32),
+    /// `seq` of `TouchFast`, and the two touch channels merged into one (P11-1).
+    touch_fast: SeqFilter,
+    merge: TouchMerge,
+    /// The points of the message being applied that the sink gets.
+    touch_points: Vec<TouchPoint>,
+    touch: TouchTiming,
+    /// When the touch timing was written, and how many messages it had then.
+    touch_logged: Option<(Instant, u64)>,
 }
 
 impl Session {
@@ -98,6 +112,8 @@ impl Session {
 #[derive(Debug, PartialEq, Eq)]
 enum Action<'a> {
     Event(InputEvent<'a>),
+    /// Touch points from `input-fast` (true) or `input-reliable`, still to be merged.
+    Touch(bool, &'a TouchPoints),
     Gamepad(&'a GamepadState),
     /// Ctrl+Alt+Del through the supervisor (P6-7).
     SecureAttention,
@@ -182,7 +198,14 @@ fn action<'a>(session: &mut Session, message: &'a ClientMessage) -> Action<'a> {
             down: *down,
         }),
         ClientMessage::Wheel { dx, dy } => Action::Event(InputEvent::Wheel { dx: *dx, dy: *dy }),
-        ClientMessage::Touch { points } => Action::Event(InputEvent::Touch(points.as_slice())),
+        ClientMessage::Touch { points } => Action::Touch(false, points),
+        ClientMessage::TouchFast { seq, points } => {
+            if session.touch_fast.accept(*seq) {
+                Action::Touch(true, points)
+            } else {
+                Action::Stale
+            }
+        }
         ClientMessage::Text { text } => Action::Event(InputEvent::Text(text)),
         ClientMessage::ReleaseAll => Action::ReleaseAll,
         ClientMessage::GamepadState(g) => Action::Gamepad(g),
@@ -191,6 +214,25 @@ fn action<'a>(session: &mut Session, message: &'a ClientMessage) -> Action<'a> {
         } => Action::SecureAttention,
         ClientMessage::Special { .. } => Action::Ignored,
     }
+}
+
+/// How touch messages arrived in a media session so far, if any came since the last time (P11-1).
+fn log_touch(session: &mut Session) {
+    let t = &session.touch;
+    if t.messages == 0 || session.touch_logged.is_some_and(|(_, n)| n == t.messages) {
+        return;
+    }
+    session.touch_logged = Some((Instant::now(), t.messages));
+    info!(
+        gestures = t.gestures,
+        messages = t.messages,
+        gaps_over_50ms = t.gaps[0],
+        gaps_over_100ms = t.gaps[1],
+        gaps_over_250ms = t.gaps[2],
+        max_gap_ms = t.max_gap.as_secs_f64() * 1000.0,
+        late_ups = t.late_ups,
+        "touch timing"
+    );
 }
 
 /// The primary monitor, for when the capture has not reported its monitor yet.
@@ -295,6 +337,7 @@ impl Thread {
                     } else {
                         if m.session != session.number {
                             // A new browser session: nothing from the old one stays down, and its seq starts over.
+                            log_touch(&mut session);
                             self.end_session(&mut out);
                             session = Session::new(m.session);
                             if self.mode == Mode::SendInput {
@@ -316,6 +359,7 @@ impl Thread {
             }
             let ended = session.number != 0 && self.live.load(Ordering::Relaxed) != session.number;
             if ended {
+                log_touch(&mut session);
                 session = Session::default();
                 self.end_session(&mut out);
                 held_anything = false;
@@ -323,6 +367,7 @@ impl Thread {
             if self.release.swap(false, Ordering::Relaxed) {
                 if held_anything {
                     self.release_all(&mut out);
+                    session.merge.clear();
                 }
                 held_anything = false;
             }
@@ -336,6 +381,25 @@ impl Thread {
             Action::Event(event) => {
                 self.stats.events.fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = out.sink.handle(&event) {
+                    self.note_error(&e);
+                }
+            }
+            Action::Touch(fast, points) => {
+                session
+                    .merge
+                    .filter(fast, points.as_slice(), &mut session.touch_points);
+                if session.touch_points.is_empty() {
+                    self.stats.stale.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                let now = Instant::now();
+                session.touch.on_touch(now, &session.touch_points);
+                let (at, _) = *session.touch_logged.get_or_insert((now, 0));
+                if now.duration_since(at) >= TOUCH_LOG {
+                    log_touch(session);
+                }
+                self.stats.events.fetch_add(1, Ordering::Relaxed);
+                if let Err(e) = out.sink.handle(&InputEvent::Touch(&session.touch_points)) {
                     self.note_error(&e);
                 }
             }
@@ -353,10 +417,14 @@ impl Thread {
                     out.last_sas = Some(Instant::now());
                     // Keys held for the old screen would stay down on the secure one.
                     self.release_all(out);
+                    session.merge.clear();
                     request_sas();
                 }
             }
-            Action::ReleaseAll => self.release_all(out),
+            Action::ReleaseAll => {
+                self.release_all(out);
+                session.merge.clear();
+            }
             Action::Stale => {
                 self.stats.stale.fetch_add(1, Ordering::Relaxed);
             }
