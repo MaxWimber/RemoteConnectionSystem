@@ -7,6 +7,7 @@ import type { ComponentChildren, RefObject } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 
 import { contentBox } from '../input/pointer';
+import { Icon } from './icons';
 import { HANDLE_SIZE, handleCenter, loadPlace, savePlace, type Place } from './toolbar-place';
 
 /** A move this long in CSS pixels turns a tap on the handle into a drag. */
@@ -93,7 +94,7 @@ export function Toolbar({ label, video, children }: Props) {
         onPointerCancel={() => (drag.current = null)}
         onClick={onClick}
       >
-        ☰
+        <Icon name="menu" />
       </button>
       {open && (
         <div

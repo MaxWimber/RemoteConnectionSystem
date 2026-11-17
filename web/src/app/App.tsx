@@ -34,10 +34,13 @@ import {
   type ServerStats,
   type StreamMode,
 } from '../stream/server-stats';
+import { Icon, type IconName } from './icons';
 import { appTitle } from './title';
 import { Toolbar } from './Toolbar';
 
 const STATS_INTERVAL_MS = 1000;
+/** `?debug` adds the stream figures, the probes and the diagnostics download to the panel (D-050). */
+const debug = new URLSearchParams(location.search).has('debug');
 /** A phone or tablet: no mouse, so touches and the screen keyboard. */
 const touchDevice = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
 
@@ -66,7 +69,7 @@ const soundTitle: Record<SoundState, string> = {
   waiting: 'Звук включится после касания или щелчка',
   playing: 'Выключить звук',
 };
-const soundIcon: Record<SoundState, string> = { off: '🔇', waiting: '🔈', playing: '🔊' };
+const soundIcon: Record<SoundState, IconName> = { off: 'sound-off', waiting: 'sound-waiting', playing: 'sound-on' };
 
 function median(values: number[]): number | null {
   if (values.length === 0) return null;
@@ -122,7 +125,7 @@ export function App({ onSignedOut }: Props) {
   const agentStatus = useRef<unknown>(null);
   const [state, setState] = useState<SessionState>('idle');
   const [detail, setDetail] = useState<string>('');
-  const [showStats, setShowStats] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [summary, setSummary] = useState<StreamSummary | null>(null);
   const [latency, setLatency] = useState<LatencySummary | null>(null);
   const [serverStats, setServerStats] = useState<ServerStats | null>(null);
@@ -287,7 +290,7 @@ export function App({ onSignedOut }: Props) {
   }, []);
 
   useEffect(() => {
-    if (!showStats) return;
+    if (!showSettings) return;
     const load = async () => {
       try {
         const r = await fetch(`${import.meta.env.BASE_URL}api/status`, { cache: 'no-store' });
@@ -299,7 +302,7 @@ export function App({ onSignedOut }: Props) {
     void load();
     const id = window.setInterval(load, AGENT_INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [showStats]);
+  }, [showSettings]);
 
   // Keep the phone's screen on while the picture plays (P4-10).
   useEffect(() => {
@@ -488,17 +491,19 @@ export function App({ onSignedOut }: Props) {
       )}
       {notice && <div class="notice">{notice}</div>}
       <Toolbar label={appTitle} video={video}>
-        <button onClick={fullscreen} title="Полный экран">⛶</button>
+        <button onClick={fullscreen} title="Полный экран">
+          <Icon name="fullscreen" />
+        </button>
         <button
           onClick={() => session.current?.input?.send({ type: 'special', code: 1 })}
           title="Ctrl+Alt+Del: экран безопасности Windows"
         >
-          🔐
+          <Icon name="secure" />
         </button>
         {touchDevice ? (
           <>
             <button onClick={() => touch.current?.showKeyboard()} title="Клавиатура">
-              ⌨
+              <Icon name="keyboard" />
             </button>
             <button
               onClick={() => {
@@ -508,19 +513,19 @@ export function App({ onSignedOut }: Props) {
               }}
               title={padShown ? 'Скрыть экранный геймпад' : 'Экранный геймпад'}
             >
-              🎮
+              <Icon name="gamepad" />
             </button>
           </>
         ) : (
           <button onClick={() => input.current?.capturePointer()} title="Захватить мышь для игр (Esc отпускает)">
-            🖱
+            <Icon name="mouse" />
           </button>
         )}
         <button
           onClick={() => setFilesShown(!filesShown)}
           title={sending.count > 0 ? `Файлы: загружается ${sending.count}` : 'Файлы'}
         >
-          📁
+          <Icon name="files" />
           {sending.count > 0 && (
             <span class="files-badge">{sending.size > 0 ? Math.floor((sending.sent / sending.size) * 100) : 0}%</span>
           )}
@@ -530,20 +535,36 @@ export function App({ onSignedOut }: Props) {
           title={soundTitle[soundState]}
           aria-pressed={soundState !== 'off'}
         >
-          {soundIcon[soundState]}
+          <Icon name={soundIcon[soundState]} />
         </button>
         {clipboardOn && (
           <button onClick={() => void pasteToServer()} title="Вставить текст из буфера обмена на сервер">
-            📋
+            <Icon name="paste" />
           </button>
         )}
-        <button onClick={() => setShowStats(!showStats)} title="Статистика">ℹ</button>
-        <button onClick={() => void saveDiagnostics()} title="Скачать диагностику">⤓</button>
-        <button onClick={() => void signOut()} title="Выйти">⏻</button>
+        <button onClick={() => setShowSettings(!showSettings)} title="Настройки">
+          <Icon name="settings" />
+        </button>
+        {debug && (
+          <button onClick={() => void saveDiagnostics()} title="Скачать диагностику">
+            <Icon name="download" />
+          </button>
+        )}
+        <button onClick={() => void signOut()} title="Выйти">
+          <Icon name="sign-out" />
+        </button>
       </Toolbar>
       {filesShown && <FileManager base={import.meta.env.BASE_URL} uploads={uploads} onClose={() => setFilesShown(false)} />}
-      {showStats && (
-        <div class="stats">
+      {showSettings && (
+        <div class={debug ? 'stats' : 'stats settings'} data-local-keys>
+          <div class="settings-head">
+            <span>Настройки</span>
+            <button onClick={() => setShowSettings(false)} title="Закрыть">
+              <Icon name="close" />
+            </button>
+          </div>
+          {debug && (
+            <>
           <div>
             {summary?.width ?? '—'}×{summary?.height ?? '—'} · {fmt(summary?.fps ?? null, 0)} к/с ·{' '}
             {fmt(summary?.bitrateMbps ?? null)} Мбит/с
@@ -577,6 +598,8 @@ export function App({ onSignedOut }: Props) {
             {serverStats?.loss == null ? '—' : `${(serverStats.loss * 100).toFixed(1)}%`} · RTT{' '}
             {fmt(serverStats?.rttMs ?? null)} мс
           </div>
+            </>
+          )}
           <div class="limit">
             <label>
               режим{' '}
@@ -626,6 +649,22 @@ export function App({ onSignedOut }: Props) {
               </span>
             )}
           </div>
+          <div class="limit">
+            <label>
+              <input
+                type="checkbox"
+                checked={clipboardOn}
+                onChange={(e) => {
+                  const on = (e.currentTarget as HTMLInputElement).checked;
+                  setClipboardOn(on);
+                  session.current?.setClipboardSharing(on);
+                }}
+              />{' '}
+              общий буфер обмена с сервером (текст до 1 МБ)
+            </label>
+          </div>
+          {debug && (
+            <>
           <div class="detail">
             {summary?.decoder ?? '—'}
             {summary?.powerEfficientDecoder ? ' (аппаратный)' : ''} · {summary?.codec ?? '—'}
@@ -672,20 +711,6 @@ export function App({ onSignedOut }: Props) {
             </label>{' '}
             {videoPath === 'webtransport' && <span class="detail">{wtActive ? 'идёт по WebTransport' : 'сервер не предложил WebTransport'}</span>}
           </div>
-          <div class="limit">
-            <label>
-              <input
-                type="checkbox"
-                checked={clipboardOn}
-                onChange={(e) => {
-                  const on = (e.currentTarget as HTMLInputElement).checked;
-                  setClipboardOn(on);
-                  session.current?.setClipboardSharing(on);
-                }}
-              />{' '}
-              общий буфер обмена с сервером (текст до 1 МБ)
-            </label>
-          </div>
           <div class="probe">
             <button onClick={() => void runAvProbe()} title="Нужно окно rcs-bench avsync на сервере">
               Замер звука
@@ -700,6 +725,8 @@ export function App({ onSignedOut }: Props) {
           )}
           {cursor.current && (
             <div class="detail">{cursor.current.describe()}</div>
+          )}
+            </>
           )}
         </div>
       )}

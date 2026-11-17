@@ -193,8 +193,57 @@ button {
 }
 
 .stats .probe,
-.stats .limit {
+.stats .limit,
+.stats .settings-head {
   pointer-events: auto;
+}
+
+/* Line icons of the panel (D-050). */
+.icon {
+  display: block;
+  width: 20px;
+  height: 20px;
+  margin: auto;
+}
+
+button:has(> .icon) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 8px;
+}
+
+/* Without ?debug the panel holds only the settings: readable and all of it clickable. */
+.stats.settings {
+  max-width: min(360px, calc(100% - 32px));
+  padding: 10px 12px;
+  background: rgba(20, 20, 20, 0.92);
+  border: 1px solid #444;
+  font: 14px/1.6 system-ui, sans-serif;
+  pointer-events: auto;
+}
+
+.stats.settings .limit {
+  margin-top: 6px;
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-weight: 600;
+}
+
+.settings-head button {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+}
+
+.settings-head .icon {
+  width: 16px;
+  height: 16px;
 }
 
 .stats .limit select {
